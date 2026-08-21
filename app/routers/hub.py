@@ -52,6 +52,63 @@ async def available() -> dict:
     return await catalog.loadable_models()
 
 
+# --- datasets -----------------------------------------------------------
+# The same four operations the model side offers, against /api/datasets.
+
+@router.get("/datasets/search")
+async def dataset_search(
+    q: str = "",
+    author: str | None = None,
+    sort: str = "downloads",
+    limit: int = Query(30, le=100),
+) -> dict:
+    try:
+        return {"results": await hf.search(
+            q, author=author, sort=sort, limit=limit, repo_type="dataset"
+        )}
+    except hf.HubError as exc:
+        raise _http(exc) from None
+
+
+@router.get("/datasets/local")
+async def dataset_local() -> dict:
+    """Datasets already in the shared cache."""
+    payload = await hf.local_models()
+    repos = [repo for repo in payload.get("repos", []) if repo.get("repo_type") == "dataset"]
+    return {**payload, "repos": repos, "size_on_disk": sum(r["size_on_disk"] for r in repos)}
+
+
+@router.post("/datasets/download")
+async def dataset_download(payload: DownloadIn) -> dict:
+    try:
+        job_id = await hf.submit_download(
+            payload.repo_id,
+            revision=payload.revision,
+            allow_patterns=payload.allow_patterns,
+            ignore_patterns=payload.ignore_patterns,
+            repo_type="dataset",
+        )
+    except hf.HubError as exc:
+        raise _http(exc) from None
+    return {"job_id": job_id}
+
+
+@router.delete("/datasets/local/{repo_id:path}")
+async def dataset_delete(repo_id: str) -> dict:
+    try:
+        return await hf.delete_local(repo_id, "dataset")
+    except hf.HubError as exc:
+        raise _http(exc) from None
+
+
+@router.get("/datasets/{repo_id:path}")
+async def dataset_detail(repo_id: str, revision: str = "main") -> dict:
+    try:
+        return await hf.dataset_detail(repo_id, revision)
+    except hf.HubError as exc:
+        raise _http(exc) from None
+
+
 @router.get("/local")
 async def local() -> dict:
     return await hf.local_models()

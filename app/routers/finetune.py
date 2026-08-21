@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from app import finetune as svc
-from app import jobs, servers, vllm_spec
+from app import hf, jobs, servers, vllm_spec
 from app.config import settings
 
 router = APIRouter(prefix="/finetune", tags=["finetune"])
@@ -93,7 +93,27 @@ def _recent(limit: int) -> list[dict]:
 
 @router.get("/datasets")
 async def datasets() -> dict:
-    return await asyncio.to_thread(svc.list_datasets)
+    """Uploads, loose files in the dataset directory, and Hub datasets already
+    pulled into the shared cache — the three places a training set can come
+    from, in one list."""
+    local, cached = await asyncio.gather(
+        asyncio.to_thread(svc.list_datasets),
+        hf.local_models(),
+    )
+    hub = [
+        {
+            "repo_id": repo["repo_id"],
+            "source": "hub",
+            "reference": repo["repo_id"],
+            "size_bytes": repo["size_on_disk"],
+            "nb_files": repo["nb_files"],
+            "last_modified": repo["last_modified"],
+            "path": repo["path"],
+        }
+        for repo in cached.get("repos", [])
+        if repo.get("repo_type") == "dataset"
+    ]
+    return {**local, "cached": hub, "cache_ok": bool(cached.get("ok"))}
 
 
 @router.post("/datasets/upload", status_code=201)

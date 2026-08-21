@@ -153,11 +153,13 @@ class JsonTqdm(vanilla_tqdm):
         super().close()
 
 
-def plan(repo_id: str, revision: str, patterns: dict) -> dict | None:
+def plan(repo_id: str, revision: str, repo_type: str, patterns: dict) -> dict | None:
     """Price the pull before starting it, so percentages mean something."""
     if "dry_run" not in inspect.signature(snapshot_download).parameters:
         return None
-    files = snapshot_download(repo_id, revision=revision, dry_run=True, **patterns)
+    files = snapshot_download(
+        repo_id, revision=revision, repo_type=repo_type, dry_run=True, **patterns
+    )
     return {
         "files_total": len(files),
         "total_bytes": sum(f.file_size for f in files if f.will_download),
@@ -170,6 +172,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Download a HuggingFace repo into the cache")
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--repo-type", default="model", choices=("model", "dataset"))
     parser.add_argument("--allow", action="append", default=[], metavar="GLOB")
     parser.add_argument("--ignore", action="append", default=[], metavar="GLOB")
     parser.add_argument("--max-workers", type=int, default=8)
@@ -184,7 +187,7 @@ def main() -> int:
     try:
         reporter.phase = "planning"
         reporter.publish(force=True)
-        estimate = plan(args.repo_id, args.revision, patterns)
+        estimate = plan(args.repo_id, args.revision, args.repo_type, patterns)
         if estimate:
             reporter.plan_bytes = estimate["total_bytes"]
             reporter.files_total = estimate["files_total"]
@@ -197,6 +200,7 @@ def main() -> int:
         path = snapshot_download(
             args.repo_id,
             revision=args.revision,
+            repo_type=args.repo_type,
             tqdm_class=JsonTqdm,
             max_workers=args.max_workers,
             **patterns,
@@ -212,6 +216,7 @@ def main() -> int:
         RESULT_MARKER,
         {
             "repo_id": args.repo_id,
+            "repo_type": args.repo_type,
             "revision": args.revision,
             "path": path,
             "downloaded_bytes": reporter.downloaded,

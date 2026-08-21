@@ -46,7 +46,19 @@ SORT_ALIASES = {"trending": "trendingScore", "updated": "lastModified", "created
 # One path component, no leading dot: that also rules out "..", which matters
 # because this string ends up naming a directory a root container deletes.
 _REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?")
-_CACHE_DIR = re.compile(r"models--[A-Za-z0-9._-]+")
+_CACHE_DIR = re.compile(r"(?:models|datasets)--[A-Za-z0-9._-]+")
+
+# The Hub mirrors its whole API under /api/models and /api/datasets, and
+# huggingface_hub mirrors the cache layout the same way, so one code path serves
+# both once the segment and the directory prefix are parameters.
+REPO_TYPES = {"model": ("models", "models--"), "dataset": ("datasets", "datasets--")}
+
+
+def _repo_type(repo_type: str) -> tuple[str, str]:
+    try:
+        return REPO_TYPES[repo_type]
+    except KeyError:
+        raise HubError(f"unknown repo type '{repo_type}'", 400) from None
 _NEXT_LINK = re.compile(r'<([^>]+)>;\s*rel="next"')
 _RATE_RESET = re.compile(r"t=(\d+)")
 
@@ -151,11 +163,14 @@ async def search(
     sort: str = "downloads",
     limit: int = 30,
     gated: bool | None = None,
+    repo_type: str = "model",
 ) -> list[dict]:
+    segment, _prefix = _repo_type(repo_type)
+    dataset = repo_type == "dataset"
     params: list[tuple[str, str]] = [("limit", str(max(1, min(limit, 100))))]
     if query:
         params.append(("search", query))
-    if pipeline_tag:
+    if pipeline_tag and not dataset:
         params.append(("pipeline_tag", pipeline_tag))
     if author:
         params.append(("author", author))
@@ -164,25 +179,27 @@ async def search(
     if sort:
         params.append(("sort", SORT_ALIASES.get(sort, sort)))
         params.append(("direction", "-1"))
-    params += [("expand[]", field) for field in SEARCH_EXPAND]
+    params += [("expand[]", field) for field in SEARCH_EXPAND if not dataset]
 
-    response = await _get("/api/models", params, label="model search")
+    response = await _get(f"/api/{segment}", params, label=f"{repo_type} search")
     payload = response.json()
     return [_normalise(item) for item in payload] if isinstance(payload, list) else []
 
 
 # --- detail & sizing ----------------------------------------------------
 
-async def _model_info(repo_id: str, revision: str) -> dict:
-    path = f"/api/models/{repo_id}"
+async def _model_info(repo_id: str, revision: str, repo_type: str = "model") -> dict:
+    segment, _prefix = _repo_type(repo_type)
+    path = f"/api/{segment}/{repo_id}"
     if revision != "main":
         path += f"/revision/{revision}"
     return (await _get(path, label=repo_id)).json()
 
 
-async def _tree(repo_id: str, revision: str) -> list[dict]:
+async def _tree(repo_id: str, revision: str, repo_type: str = "model") -> list[dict]:
     """Every file in a revision, following the Hub's cursor pagination."""
-    url: str | None = f"/api/models/{repo_id}/tree/{revision}"
+    segment, _prefix = _repo_type(repo_type)
+    url: str | None = f"/api/{segment}/{repo_id}/tree/{revision}"
     params: Any = {"recursive": "true", "limit": "1000"}
     entries: list[dict] = []
     while url and len(entries) < 20000:
@@ -222,13 +239,16 @@ def _files(tree: list[dict]) -> list[dict]:
     return sorted(out, key=lambda f: f["path"])
 
 
-def _blob_dir(repo_id: str) -> Path:
-    return settings.hf_cache / "hub" / f"models--{repo_id.replace('/', '--')}" / "blobs"
+def _blob_dir(repo_id: str, repo_type: str = "model") -> Path:
+    _segment, prefix = _repo_type(repo_type)
+    return settings.hf_cache / "hub" / f"{prefix}{repo_id.replace('/', '--')}" / "blobs"
 
 
-def _cached_bytes(repo_id: str, files: list[dict]) -> tuple[int, int]:
+def _cached_bytes(
+    repo_id: str, files: list[dict], repo_type: str = "model"
+) -> tuple[int, int]:
     """How much of a revision is already on disk, by blob presence."""
-    blobs = _blob_dir(repo_id)
+    blobs = _blob_dir(repo_id, repo_type)
     if not blobs.is_dir():
         return 0, 0
     total = count = 0
@@ -239,8 +259,10 @@ def _cached_bytes(repo_id: str, files: list[dict]) -> tuple[int, int]:
     return total, count
 
 
-def _estimate(repo_id: str, files: list[dict], total_bytes: int) -> dict:
-    cached_bytes, cached_files = _cached_bytes(repo_id, files)
+def _estimate(
+    repo_id: str, files: list[dict], total_bytes: int, repo_type: str = "model"
+) -> dict:
+    cached_bytes, cached_files = _cached_bytes(repo_id, files, repo_type)
     return {
         "total_bytes": total_bytes,
         "cached_bytes": cached_bytes,
@@ -251,16 +273,19 @@ def _estimate(repo_id: str, files: list[dict], total_bytes: int) -> dict:
     }
 
 
-async def estimate_download(repo_id: str, revision: str = "main") -> dict:
+async def estimate_download(
+    repo_id: str, revision: str = "main", repo_type: str = "model"
+) -> dict:
     """What a pull would cost: treesize as the headline, minus local blobs."""
     check_repo_id(repo_id)
+    segment, _prefix = _repo_type(repo_type)
     size, tree = await asyncio.gather(
-        _get(f"/api/models/{repo_id}/treesize/{revision}", label=repo_id),
-        _tree(repo_id, revision),
+        _get(f"/api/{segment}/{repo_id}/treesize/{revision}", label=repo_id),
+        _tree(repo_id, revision, repo_type),
     )
     total = int((size.json() or {}).get("size") or 0)
     files = _files(tree)
-    return await asyncio.to_thread(_estimate, repo_id, files, total)
+    return await asyncio.to_thread(_estimate, repo_id, files, total, repo_type)
 
 
 def _config_summary(raw: dict) -> dict:
@@ -373,6 +398,111 @@ async def model_detail(repo_id: str, revision: str = "main") -> dict:
 
 # --- the local cache ----------------------------------------------------
 
+# The datasets-server exposes the parsed shape of a dataset — configs, splits,
+# column names and a few real rows. That is the dataset equivalent of a model's
+# architecture and context length: it is what decides whether a fine-tune can
+# use the thing at all.
+DATASETS_SERVER = "https://datasets-server.huggingface.co"
+
+# Column names the fine-tuning worker knows how to read.
+TEXT_COLUMNS = ("text", "content", "output", "completion", "response")
+CHAT_COLUMNS = ("messages", "conversations", "conversation", "chat")
+
+
+async def _datasets_server(path: str, params: dict) -> dict:
+    """Best-effort: not every dataset is auto-converted, and that is not an error."""
+    try:
+        response = await _get(f"{DATASETS_SERVER}{path}", params, label=params.get("dataset", ""))
+        return response.json() or {}
+    except HubError:
+        return {}
+
+
+def _training_shape(columns: list[dict]) -> dict:
+    """Whether the fine-tuning worker could read this, and via which column.
+
+    Order matters. A pre-rendered `text` column beats the instruction/output
+    pair that usually sits beside it, but where there is no `text` the pair is
+    the real content — picking `output` alone would train on answers with the
+    questions thrown away.
+    """
+    names = {column["name"] for column in columns}
+
+    chat = next((name for name in CHAT_COLUMNS if name in names), "")
+    if chat:
+        return {"level": "ok", "format": "messages", "field": chat,
+                "note": f"conversational rows in '{chat}'; the tokenizer's chat template applies."}
+
+    if "text" in names:
+        return {"level": "ok", "format": "text", "field": "text",
+                "note": "a pre-rendered 'text' column — train on it directly."}
+
+    if {"instruction", "output"} <= names:
+        return {"level": "warn", "format": "instruction", "field": "instruction",
+                "note": ("instruction/output columns and no pre-rendered 'text'. Render the pair "
+                         "into one field before training, or only the answers are learned.")}
+
+    other = next((name for name in TEXT_COLUMNS if name in names), "")
+    if other:
+        return {"level": "warn", "format": "text", "field": other,
+                "note": f"'{other}' looks like the content column, but check it is the whole row."}
+
+    return {"level": "warn", "format": "", "field": "",
+            "note": "no column this recognises; choose the text field by hand after pulling."}
+
+
+async def dataset_detail(repo_id: str, revision: str = "main") -> dict:
+    """A dataset the way the model page describes a model: what it is, what it
+    costs, and whether it can actually be trained on."""
+    check_repo_id(repo_id)
+    info, tree, estimate, splits = await asyncio.gather(
+        _model_info(repo_id, revision, "dataset"),
+        _tree(repo_id, revision, "dataset"),
+        estimate_download(repo_id, revision, "dataset"),
+        _datasets_server("/splits", {"dataset": repo_id}),
+    )
+
+    entries = [
+        {"config": item.get("config"), "split": item.get("split")}
+        for item in (splits.get("splits") or [])
+    ]
+    columns: list[dict] = []
+    rows: list[dict] = []
+    if entries:
+        first = entries[0]
+        preview = await _datasets_server(
+            "/first-rows",
+            {"dataset": repo_id, "config": first["config"], "split": first["split"]},
+        )
+        columns = [
+            {"name": f.get("name"), "type": ((f.get("type") or {}).get("dtype")
+                                             or (f.get("type") or {}).get("_type") or "")}
+            for f in (preview.get("features") or [])
+        ]
+        rows = [item.get("row") or {} for item in (preview.get("rows") or [])][:3]
+
+    return {
+        "id": info.get("id") or repo_id,
+        "repo_type": "dataset",
+        "revision": revision,
+        "sha": info.get("sha", ""),
+        "gated": info.get("gated", False),
+        "private": info.get("private", False),
+        "tags": info.get("tags", []),
+        "downloads": info.get("downloads", 0),
+        "likes": info.get("likes", 0),
+        "updated": info.get("lastModified", ""),
+        "files": _files(tree),
+        "total_bytes": estimate["total_bytes"],
+        "estimate": estimate,
+        "configs": sorted({e["config"] for e in entries if e["config"]}),
+        "splits": entries,
+        "columns": columns,
+        "sample_rows": rows,
+        "training": _training_shape(columns),
+    }
+
+
 def _snapshot_kind(path: Path) -> str:
     """A snapshot is only servable if it carries a real config.json."""
     try:
@@ -442,7 +572,7 @@ async def local_models() -> dict:
     return await asyncio.to_thread(_scan)
 
 
-def cache_dir_for(repo_id: str) -> Path:
+def cache_dir_for(repo_id: str, repo_type: str = "model") -> Path:
     """Resolve a repo id to its cache directory, or refuse.
 
     Whatever this returns is handed to `rm -rf` in a root container, so it has
@@ -450,8 +580,9 @@ def cache_dir_for(repo_id: str) -> Path:
     a traversal attempt must never survive this function.
     """
     check_repo_id(repo_id)
+    _segment, prefix = _repo_type(repo_type)
     hub = (settings.hf_cache / "hub").resolve()
-    name = f"models--{repo_id.replace('/', '--')}"
+    name = f"{prefix}{repo_id.replace('/', '--')}"
     if not _CACHE_DIR.fullmatch(name):
         raise HubError(f"'{repo_id}' does not name a cache directory.", 400)
     directory = (hub / name).resolve()
@@ -462,8 +593,8 @@ def cache_dir_for(repo_id: str) -> Path:
     return directory
 
 
-async def delete_local(repo_id: str) -> dict:
-    directory = await asyncio.to_thread(cache_dir_for, repo_id)
+async def delete_local(repo_id: str, repo_type: str = "model") -> dict:
+    directory = await asyncio.to_thread(cache_dir_for, repo_id, repo_type)
     freed = await asyncio.to_thread(_dir_size, directory)
     code, out, err = await docker_ctl.run_capture(
         image=settings.vllm_image,
@@ -527,15 +658,18 @@ async def submit_download(
     revision: str = "main",
     allow_patterns: list[str] | None = None,
     ignore_patterns: list[str] | None = None,
+    repo_type: str = "model",
 ) -> str:
     check_repo_id(repo_id)
+    _repo_type(repo_type)
     existing = await asyncio.to_thread(_running_download, repo_id)
     if existing:
         # Two containers writing one repo's blobs interleave badly, and the
         # cache lock is inside the container, not across containers.
         raise HubError(f"'{repo_id}' is already downloading in job {existing}.", 409)
 
-    command = ["-u", "/worker/hf_download.py", "--repo-id", repo_id, "--revision", revision]
+    command = ["-u", "/worker/hf_download.py", "--repo-id", repo_id, "--revision", revision,
+               "--repo-type", repo_type]
     for pattern in allow_patterns or []:
         command += ["--allow", pattern]
     for pattern in ignore_patterns or []:
@@ -554,7 +688,7 @@ async def submit_download(
 
     spec = jobs.JobSpec(
         kind="download",
-        title=f"Download {repo_id}",
+        title=f"Download {repo_id}" + (" (dataset)" if repo_type == "dataset" else ""),
         image=settings.vllm_image,
         command=command,
         env=env,
@@ -566,6 +700,7 @@ async def submit_download(
         entrypoint="python",
         meta={
             "repo_id": repo_id,
+            "repo_type": repo_type,
             "revision": revision,
             "allow_patterns": allow_patterns or [],
             "ignore_patterns": ignore_patterns or [],
