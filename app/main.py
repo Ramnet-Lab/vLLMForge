@@ -127,7 +127,13 @@ if settings.web_dir.exists():
         return FileResponse(settings.web_dir / "index.html")
 
     @app.get("/{path:path}", include_in_schema=False)
-    async def spa(path: str) -> FileResponse:
+    async def spa(path: str):
+        # The catch-all exists so a deep link like /serve loads the shell, but
+        # it must not swallow a mistyped API route: returning the HTML shell
+        # there surfaces as a JSON parse error in the browser instead of the
+        # 404 that would actually explain the problem.
+        if path == "api" or path.startswith("api/"):
+            return JSONResponse({"detail": f"no such endpoint: /{path}"}, status_code=404)
         candidate = settings.web_dir / path
         if candidate.is_file():
             return FileResponse(candidate)

@@ -112,3 +112,21 @@ def test_a_later_entry_wins_over_an_earlier_one():
     progress = {"loss_history": [[4, 9.9], [4, 1.1]]}
     jobs._dedupe_series(progress)
     assert progress["loss_history"] == [[4, 1.1]]
+
+
+def test_a_mistyped_api_route_is_a_json_404_not_the_spa_shell():
+    # The catch-all that serves the shell for deep links must not swallow
+    # /api/*: an HTML body there reaches the browser as a JSON parse error
+    # instead of the 404 that would explain what went wrong.
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        missing = client.get("/api/definitely-not-a-route")
+        assert missing.status_code == 404
+        assert missing.headers["content-type"].startswith("application/json")
+
+        deep_link = client.get("/serve")
+        assert deep_link.status_code == 200
+        assert deep_link.headers["content-type"].startswith("text/html")
