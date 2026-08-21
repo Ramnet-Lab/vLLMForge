@@ -235,8 +235,12 @@ class JobManager:
         last_publish = 0.0
         last_transient_write = 0.0
         try:
+            # `--since` bounds the replay on its own. Pairing it with `--tail 0`
+            # suppressed all history regardless, so everything the container
+            # printed while the dashboard was down — the @@RESULT@@ line
+            # included — was dropped, and then the container was removed.
             async for line, transient in docker_ctl.stream_logs(
-                container, tail=0 if since else "all", since=since
+                container, tail="all", since=since
             ):
                 if not line.strip():
                     continue

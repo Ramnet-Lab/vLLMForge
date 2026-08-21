@@ -311,3 +311,49 @@ def gpu_memory_utilization(params: dict[str, Any]) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+_SIZE_SUFFIX = {"k": 10 ** 3, "m": 10 ** 6, "g": 10 ** 9, "t": 10 ** 12,
+                "ki": 2 ** 10, "mi": 2 ** 20, "gi": 2 ** 30, "ti": 2 ** 40}
+
+
+def parse_size(value: Any) -> int | None:
+    """vLLM's human-readable byte sizes: 25.6k, 100G, 8Gi, or a plain integer."""
+    if value in (None, "", "auto"):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().rstrip("Bb")
+    for suffix, scale in sorted(_SIZE_SUFFIX.items(), key=lambda kv: -len(kv[0])):
+        if text.lower().endswith(suffix):
+            try:
+                return int(float(text[: -len(suffix)]) * scale)
+            except ValueError:
+                return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def footprint_bytes(params: dict[str, Any], total_bytes: int, *, default_util: float) -> int:
+    """A floor on the host memory a launch with these parameters will take.
+
+    The utilisation fraction is not the whole story. --kv-cache-memory sizes the
+    KV cache explicitly and *overrides* the fraction, so a config can pair a
+    tiny util with a huge cache and look free. --cpu-offload-gb moves weights to
+    system RAM, which on a unified-memory part is the same pool. Both are added
+    here so the guard cannot be walked past.
+    """
+    util = gpu_memory_utilization(params)
+    engine = int((default_util if util is None else util) * total_bytes)
+
+    kv = parse_size(params.get("kv_cache_memory_bytes") or params.get("kv_cache_memory"))
+    if kv is not None:
+        engine = max(engine, kv)
+
+    try:
+        offload = float(params.get("cpu_offload_gb") or 0)
+    except (TypeError, ValueError):
+        offload = 0.0
+    return engine + int(offload * 1024 ** 3)

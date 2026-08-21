@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from app import docker_ctl, vllm_spec
 from app.config import settings
@@ -34,7 +35,24 @@ from app.telemetry import read_gpu_processes, read_meminfo
 GIB = 1024 ** 3
 
 UTIL_FLAG = re.compile(r"--gpu[-_]memory[-_]utilization(?:=(\S+))?")
-KV_BYTES_FLAG = re.compile(r"--kv[-_]cache[-_]memory(?:[-_]bytes)?(?:=|$)")
+KV_BYTES_FLAG = re.compile(r"--kv[-_]cache[-_]memory(?:[-_]bytes)?(?:=(\S+))?$")
+OFFLOAD_FLAG = re.compile(r"--cpu[-_]offload[-_]gb(?:=(\S+))?$")
+
+
+def flag_value(command: list[str] | None, pattern: re.Pattern[str]) -> str | None:
+    """The value of a flag in a container's argv, whether joined by = or spaced."""
+    if not command:
+        return None
+    for index, token in enumerate(command):
+        match = pattern.fullmatch(token)
+        if not match:
+            continue
+        if match.group(1) is not None:
+            return match.group(1)
+        if index + 1 < len(command):
+            return command[index + 1]
+        return None
+    return None
 
 
 def default_util() -> float:
@@ -48,20 +66,33 @@ def default_util() -> float:
 
 def parse_util(command: list[str] | None) -> float | None:
     """Pull --gpu-memory-utilization out of a container's argv."""
-    if not command:
+    try:
+        return float(flag_value(command, UTIL_FLAG))
+    except (TypeError, ValueError):
         return None
-    for index, token in enumerate(command):
-        match = UTIL_FLAG.fullmatch(token) or UTIL_FLAG.match(token)
-        if not match:
-            continue
-        raw = match.group(1)
-        if raw is None and index + 1 < len(command):
-            raw = command[index + 1]
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
-    return None
+
+
+def command_params(command: list[str] | None) -> dict[str, Any]:
+    """The memory-relevant flags of a running container, shaped like stored args.
+
+    Reading them back out of the argv means a hand-launched container is
+    accounted exactly the way a managed one is.
+    """
+    params: dict[str, Any] = {}
+    util = parse_util(command)
+    if util is not None:
+        params["gpu_memory_utilization"] = util
+    kv = flag_value(command, KV_BYTES_FLAG)
+    if kv is not None:
+        params["kv_cache_memory_bytes"] = kv
+    offload = flag_value(command, OFFLOAD_FLAG)
+    if offload is not None:
+        params["cpu_offload_gb"] = offload
+    return params
+
+
+def footprint(params: dict[str, Any], total_bytes: int) -> int:
+    return vllm_spec.footprint_bytes(params, total_bytes, default_util=default_util())
 
 
 def is_vllm_command(command: list[str] | None) -> bool:
@@ -91,12 +122,14 @@ class Budget:
     tenants: list[Tenant] = field(default_factory=list)
 
     @property
-    def committed_util(self) -> float:
-        return sum(t.util for t in self.tenants)
+    def committed_bytes(self) -> int:
+        # Summed in bytes, not fractions: a tenant using --kv-cache-memory or
+        # --cpu-offload-gb takes memory its utilisation fraction never mentions.
+        return sum(t.bytes_committed for t in self.tenants)
 
     @property
-    def committed_bytes(self) -> int:
-        return int(self.committed_util * self.total_bytes)
+    def committed_util(self) -> float:
+        return self.committed_bytes / self.total_bytes if self.total_bytes else 0.0
 
     @property
     def occupied_bytes(self) -> int:
@@ -210,39 +243,52 @@ async def current_budget(exclude: str | None = None) -> Budget:
         if not is_vllm_command(info.command):
             continue
 
-        util = parse_util(info.command)
+        params = command_params(info.command)
+        util = params.get("gpu_memory_utilization")
         implicit = util is None
-        note = ""
+        notes = []
         if implicit:
             # A serve command with no --gpu-memory-utilization is not free: vLLM
             # applies its own default, which on this host is over 100 GiB.
             util = fallback
-            note = f"no --gpu-memory-utilization set, so vLLM uses its default of {fallback:g}"
-        if any(KV_BYTES_FLAG.match(token) for token in info.command or ()):
-            note = (
-                "uses --kv-cache-memory, which overrides the utilisation fraction; "
-                "the measured figure is the one to trust"
+            notes.append(
+                f"no --gpu-memory-utilization set, so vLLM uses its default of {fallback:g}"
             )
+        if "kv_cache_memory_bytes" in params:
+            notes.append("--kv-cache-memory overrides the utilisation fraction")
+        if "cpu_offload_gb" in params:
+            notes.append("--cpu-offload-gb lands in the same unified pool")
 
         budget.tenants.append(
             Tenant(
                 name=name,
                 util=util,
                 managed=name.startswith(settings.container_prefix),
-                bytes_committed=int(util * budget.total_bytes),
+                bytes_committed=footprint(params, budget.total_bytes),
                 implicit=implicit,
-                note=note,
+                note="; ".join(notes),
             )
         )
     return budget
 
 
-async def check_launch(util: float | None, *, replacing: str | None = None) -> Verdict:
-    """Decide whether a launch at `util` is safe right now."""
+async def check_launch(
+    util: float | None,
+    *,
+    replacing: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> Verdict:
+    """Decide whether a launch is safe right now.
+
+    Pass `params` — the whole stored argument dict — wherever it is available:
+    the utilisation fraction alone does not describe what a config will take.
+    """
     budget = await current_budget(exclude=replacing)
     payload = budget.as_dict()
     fallback = default_util()
 
+    if util is None and params:
+        util = vllm_spec.gpu_memory_utilization(params)
     if util is None:
         util = fallback
         preface = (
@@ -251,7 +297,19 @@ async def check_launch(util: float | None, *, replacing: str | None = None) -> V
     else:
         preface = ""
 
-    requested_bytes = int(util * budget.total_bytes)
+    requested_bytes = footprint({**(params or {}), "gpu_memory_utilization": util},
+                                budget.total_bytes)
+    if params and requested_bytes > int(util * budget.total_bytes):
+        preface += (
+            "This config also sets "
+            + " and ".join(
+                flag for flag, key in (
+                    ("--kv-cache-memory", "kv_cache_memory_bytes"),
+                    ("--cpu-offload-gb", "cpu_offload_gb"),
+                ) if key in params
+            )
+            + ", so its real footprint is larger than the fraction implies. "
+        )
     projected_bytes = budget.occupied_bytes + requested_bytes
     projected = projected_bytes / budget.total_bytes if budget.total_bytes else 0.0
     headroom_after = budget.total_bytes - projected_bytes

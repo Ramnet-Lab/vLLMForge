@@ -131,3 +131,28 @@ def test_the_watchdog_recognises_exactly_what_the_launch_guard_does():
     command = ["vllm", "serve", "m", "--gpu-memory-utilization", "0.5"]
     assert safety.is_vllm_command(command)
     assert safety.parse_util(command) == 0.5
+
+
+@pytest.mark.asyncio
+async def test_the_implicit_default_holder_is_killed_first(fake):
+    # A container with no --gpu-memory-utilization is holding vLLM's own
+    # default — about 112 GiB here — and ranking it by a fraction of 0.0 put
+    # the biggest offender at the back of the queue.
+    fake({
+        "vllm-declared": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.52"],
+        "vllm-implicit": ["vllm", "serve", "m"],
+    })
+    assert [name for name, _ in await memguard._candidates()] == ["vllm-implicit", "vllm-declared"]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_kv_cache_outranks_a_small_fraction(fake):
+    fake({
+        "vllm-small-frac-big-kv": [
+            "vllm", "serve", "m", "--gpu-memory-utilization", "0.02",
+            "--kv-cache-memory", "90G",
+        ],
+        "vllm-mid": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.30"],
+    })
+    ranked = [name for name, _ in await memguard._candidates()]
+    assert ranked[0] == "vllm-small-frac-big-kv"

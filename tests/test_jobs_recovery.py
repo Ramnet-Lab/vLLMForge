@@ -99,8 +99,9 @@ async def test_reattach_resumes_from_where_the_log_stopped(orphan, monkeypatch):
     await jobs.manager.reconcile()
     await asyncio.sleep(0.05)
 
-    # Asking for the whole log again would duplicate every line already on disk
-    # and re-feed every entry to the progress parser.
-    assert asked.get("since"), "reattach must resume from a cursor, not replay"
-    assert asked.get("tail") == 0
+    # The cursor is what bounds the replay. Pairing it with --tail 0 suppressed
+    # all history regardless, silently dropping everything the container printed
+    # while the dashboard was down.
+    assert asked.get("since"), "reattach must resume from a cursor"
+    assert asked.get("tail") == "all", "--since alone bounds it; --tail 0 drops the outage"
     await jobs.manager.shutdown()

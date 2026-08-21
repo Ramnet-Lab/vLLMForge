@@ -24,6 +24,11 @@ from app import db, docker_ctl, events, hf, safety, vllm_spec
 from app.config import settings
 
 JSON_FIELDS = ("args", "env")
+
+# Measuring the budget and creating the container have to happen together.
+# Two starts that each measure before the other has launched will both be
+# admitted, and the pool is then over-committed by design rather than accident.
+LAUNCH_LOCK = asyncio.Lock()
 HEALTH_TIMEOUT = 2.0
 DEFAULT_PORT_RANGE = range(8010, 8100)
 
@@ -195,22 +200,25 @@ async def start(server_id: int, *, force: bool = False) -> dict:
         raise KeyError(server_id)
 
     name = container_name(server)
-    util = vllm_spec.gpu_memory_utilization(server.get("args") or {})
-    verdict = await safety.check_launch(util, replacing=name)
-    if not verdict.ok and not force:
-        return {"started": False, "safety": verdict.as_dict()}
+    args = server.get("args") or {}
+    util = vllm_spec.gpu_memory_utilization(args)
 
-    await docker_ctl.remove(name, force=True)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-    await docker_ctl.run_detached(
-        name=name,
-        image=server.get("image") or settings.vllm_image,
-        command=build_command(server),
-        env=build_env(server),
-        mounts=_mounts(),
-        gpu=True,
-        network="host",
-    )
+    async with LAUNCH_LOCK:
+        verdict = await safety.check_launch(util, replacing=name, params=args)
+        if not verdict.ok and not force:
+            return {"started": False, "safety": verdict.as_dict()}
+
+        await docker_ctl.remove(name, force=True)
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        await docker_ctl.run_detached(
+            name=name,
+            image=server.get("image") or settings.vllm_image,
+            command=build_command(server),
+            env=build_env(server),
+            mounts=_mounts(),
+            gpu=True,
+            network="host",
+        )
     db.execute("UPDATE servers SET last_started_at = ? WHERE id = ?", (db.now(), server_id))
     await events.broker.publish(events.SERVERS, {"type": "started", "id": server_id})
     return {"started": True, "safety": verdict.as_dict(), "container": name}

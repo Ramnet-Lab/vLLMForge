@@ -35,8 +35,14 @@ def history() -> list[dict]:
 
 
 async def _candidates() -> list[tuple[str, float]]:
-    """Running vLLM containers with the largest committed util first."""
-    out: list[tuple[str, float]] = []
+    """Running vLLM containers, biggest real footprint first.
+
+    Ranking on the utilisation fraction alone put the worst offender last: a
+    container with no --gpu-memory-utilization collapsed to 0.0, when in fact
+    vLLM had applied its own default and it was holding more than any of them.
+    """
+    total = read_meminfo().total_bytes or 1
+    out: list[tuple[str, float, int]] = []
     for row in await docker_ctl.ps(all_containers=False):
         name = str(row.get("Names", ""))
         if not name:
@@ -44,8 +50,15 @@ async def _candidates() -> list[tuple[str, float]]:
         state = await docker_ctl.state(name)
         if not state.running or not safety.is_vllm_command(state.command):
             continue
-        out.append((name, safety.parse_util(state.command) or 0.0))
-    return sorted(out, key=lambda item: item[1], reverse=True)
+        params = safety.command_params(state.command)
+        util = params.get("gpu_memory_utilization")
+        out.append((
+            name,
+            safety.default_util() if util is None else float(util),
+            safety.footprint(params, total),
+        ))
+    ranked = sorted(out, key=lambda item: item[2], reverse=True)
+    return [(name, util) for name, util, _bytes in ranked]
 
 
 async def watch() -> None:

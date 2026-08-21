@@ -148,3 +148,75 @@ def test_kv_cache_memory_override_is_recognised():
     assert safety.KV_BYTES_FLAG.match("--kv-cache-memory")
     assert safety.KV_BYTES_FLAG.match("--kv-cache-memory-bytes=123")
     assert not safety.KV_BYTES_FLAG.match("--kv-cache-dtype")
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("25.6k", 25600), ("100G", 100_000_000_000), ("8Gi", 8589934592),
+     (12345, 12345), ("auto", None), (None, None), ("nonsense", None)],
+)
+def test_human_readable_sizes(raw, expected):
+    from app import vllm_spec
+
+    assert vllm_spec.parse_size(raw) == expected
+
+
+def test_flags_that_bypass_the_fraction_are_counted():
+    from app import vllm_spec
+
+    plain = vllm_spec.footprint_bytes({"gpu_memory_utilization": 0.02}, TOTAL, default_util=0.92)
+    assert plain == pytest.approx(0.02 * TOTAL, rel=0.01)
+
+    # --kv-cache-memory sizes the cache explicitly and overrides the fraction,
+    # so pairing it with a tiny util used to look almost free.
+    with_kv = vllm_spec.footprint_bytes(
+        {"gpu_memory_utilization": 0.02, "kv_cache_memory_bytes": "90G"}, TOTAL, default_util=0.92
+    )
+    assert with_kv >= 90_000_000_000
+
+    # --cpu-offload-gb lands in the same unified pool on this part.
+    with_offload = vllm_spec.footprint_bytes(
+        {"gpu_memory_utilization": 0.1, "cpu_offload_gb": 40}, TOTAL, default_util=0.92
+    )
+    assert with_offload == pytest.approx(0.1 * TOTAL + 40 * GIB, rel=0.01)
+
+
+@pytest.mark.parametrize(
+    "command,key,value",
+    [
+        (["vllm", "serve", "m", "--kv-cache-memory", "90G"], "kv_cache_memory_bytes", "90G"),
+        (["vllm", "serve", "m", "--kv-cache-memory-bytes=8Gi"], "kv_cache_memory_bytes", "8Gi"),
+        (["vllm", "serve", "m", "--cpu-offload-gb", "40"], "cpu_offload_gb", "40"),
+        (["vllm", "serve", "m", "--gpu-memory-utilization=0.4"], "gpu_memory_utilization", 0.4),
+    ],
+)
+def test_a_running_container_is_read_back_the_way_a_stored_config_is(command, key, value):
+    assert safety.command_params(command)[key] == value
+
+
+@pytest.mark.asyncio
+async def test_a_huge_explicit_kv_cache_cannot_walk_past_the_guard(monkeypatch):
+    async def fake(exclude=None):
+        return budget([])
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+
+    sneaky = {"gpu_memory_utilization": 0.02, "kv_cache_memory_bytes": "90G"}
+    verdict = await safety.check_launch(0.02, params=sneaky)
+    assert not verdict.ok, "0.02 with a 90G explicit cache is not a 2.4 GiB launch"
+    assert "--kv-cache-memory" in verdict.message
+
+    honest = await safety.check_launch(0.02, params={"gpu_memory_utilization": 0.02})
+    assert honest.ok
+
+
+def test_tenants_are_summed_in_bytes_not_fractions():
+    b = budget([])
+    b.tenants = [
+        safety.Tenant(name="a", util=0.02, managed=False, bytes_committed=90 * GIB),
+        safety.Tenant(name="b", util=0.10, managed=False, bytes_committed=12 * GIB),
+    ]
+    # Summing the declared fractions would report 0.12 of the machine committed
+    # while 102 GiB of it was actually spoken for.
+    assert b.committed_bytes == 102 * GIB
+    assert b.committed_util > 0.8
