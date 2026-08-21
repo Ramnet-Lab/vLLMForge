@@ -7,7 +7,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app import db, hf
+from app import catalog, db, hf
 
 router = APIRouter(prefix="/hub", tags=["hub"])
 
@@ -43,6 +43,13 @@ async def search(
     except hf.HubError as exc:
         raise _http(exc) from None
     return {"models": models, "query": q}
+
+
+@router.get("/available")
+async def available() -> dict:
+    """Everything on this box that a model picker can offer: cached repos plus
+    the merged outputs of finished Heretic and fine-tuning runs."""
+    return await catalog.loadable_models()
 
 
 @router.get("/local")

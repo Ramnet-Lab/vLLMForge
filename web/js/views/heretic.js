@@ -38,7 +38,8 @@ export async function render(container, ctx) {
     config: {},
     schema: null,
     status: null,
-    local: [],
+    catalog: { groups: [], count: 0 },
+    customModel: false,
     jobs: [],
     verdict: null,
     checkSeq: 0,
@@ -50,7 +51,7 @@ export async function render(container, ctx) {
     refs: {},
   };
   shell(container);
-  await Promise.all([loadSchema(), loadStatus(), loadLocal(), loadJobs()]);
+  await Promise.all([loadSchema(), loadStatus(), loadCatalog(), loadJobs()]);
   view.busClose = stream('/jobs/stream/all', { job: onJobEvent, image: () => loadStatus() });
   runCheck();
 }
@@ -81,7 +82,7 @@ function shell(container) {
         h('h1', null, 'Heretic'),
         h('p', null, BLURB)),
       h('div', { class: 'page-actions' },
-        h('button', { class: 'btn-sm', onClick: () => { loadLocal(); loadJobs(); loadStatus(); } },
+        h('button', { class: 'btn-sm', onClick: () => { loadCatalog(); loadJobs(); loadStatus(); } },
           'Refresh'))),
     refs.status,
     refs.run,
@@ -193,61 +194,113 @@ async function loadSchema() {
   renderActions();
 }
 
-async function loadLocal() {
+async function loadCatalog() {
   try {
-    const payload = await get('/hub/local');
+    const payload = await get('/hub/available');
     if (!view) return;
-    view.local = payload.ok
-      ? (payload.repos || []).filter((repo) => repo.repo_type === 'model')
-      : [];
-    if (!payload.ok) toast(`Local cache: ${payload.error}`, { level: 'warn' });
+    view.catalog = payload;
+    if (!payload.cache_ok && payload.cache_error) {
+      toast(`Local cache: ${payload.cache_error}`, { level: 'warn' });
+    }
   } catch (error) {
     toast(error.message, { level: 'warn' });
   }
   renderModelPicker();
 }
 
+// A sentinel for the "Other" option. Not a null byte: browsers may replace one
+// in an attribute value with U+FFFD, and the equality check would then never fire.
+const CUSTOM = '__llmd_other__';
+
+function catalogEntries() {
+  return view.catalog.groups.flatMap((group) => group.items);
+}
+
 function renderModelPicker() {
   if (!view.schema) return;
+
+  const entries = catalogEntries();
+  const current = view.config.model || '';
+  // A value that is not in the catalogue — a Hub id that has never been pulled,
+  // or the schema default after that model was deleted — has to stay selectable,
+  // so the picker falls back to the free-text branch rather than silently
+  // resetting to whatever happens to be first in the list.
+  const known = entries.some((entry) => entry.value === current);
+  if (current && !known) view.customModel = true;
+
   const hint = h('div', { class: 'help' });
-  const input = h('input', {
+
+  const custom = h('input', {
     type: 'text',
-    list: 'heretic-local-models',
-    value: view.config.model || '',
-    placeholder: 'Qwen/Qwen3-4B-Instruct-2507 or /home/user/models/outputs/...',
+    list: 'heretic-model-ids',
+    value: known ? '' : current,
+    placeholder: 'Qwen/Qwen3-4B-Instruct-2507 or /home/user/models/outputs/…',
     onInput: (event) => {
       view.config.model = event.target.value.trim();
-      cacheHint(hint, view.config.model);
+      modelHint(hint);
       scheduleCheck();
       renderActions();
     },
   });
-  cacheHint(hint, view.config.model || '');
+
+  const select = h('select', {
+    onChange: (event) => {
+      const value = event.target.value;
+      view.customModel = value === CUSTOM;
+      view.config.model = view.customModel ? custom.value.trim() : value;
+      renderModelPicker();
+      scheduleCheck();
+      renderActions();
+    },
+  },
+  entries.length
+    ? view.catalog.groups.map((group) => h('optgroup', { label: group.label },
+        group.items.map((entry) => h('option', {
+          value: entry.value,
+          selected: !view.customModel && entry.value === current,
+          title: entry.note || entry.value,
+        }, entry.detail ? `${entry.label} — ${entry.detail}` : entry.label))))
+    : h('option', { value: CUSTOM, disabled: true }, 'nothing on this box yet'),
+  h('option', { value: CUSTOM, selected: view.customModel || !entries.length },
+    'Other — a Hub id or a path…'));
+
+  modelHint(hint);
 
   mount(view.refs.model,
     field('Model', h('div', { class: 'stack' },
-      input,
-      h('datalist', { id: 'heretic-local-models' },
-        view.local.map((repo) => h('option', { value: repo.repo_id }))),
+      h('div', { class: 'hx-picker' },
+        select,
+        h('button', {
+          class: 'btn-sm',
+          title: 'Re-read the cache and finished runs',
+          onClick: async (event) => {
+            event.currentTarget.disabled = true;
+            await loadCatalog();
+          },
+        }, 'Refresh')),
+      view.customModel || !entries.length ? custom : null,
+      h('datalist', { id: 'heretic-model-ids' },
+        entries.map((entry) => h('option', { value: entry.value }))),
       hint), {
       flag: 'model',
-      help: 'Anything the container can load: a Hub id, or a directory under the outputs mount '
-        + '(an earlier Heretic or fine-tune result). Models that set auto_map need '
-        + 'trust_remote_code, which transformers asks for on stdin — a detached container has no '
-        + 'terminal to answer with, so those cannot be abliterated here at all.',
+      help: 'Cached models and the merged output of earlier Heretic and fine-tuning runs. '
+        + 'Anything else — a Hub id that has not been pulled, or a path the container can see — '
+        + 'goes under "Other"; an uncached Hub id is downloaded when the run starts. Models that '
+        + 'set auto_map need trust_remote_code, which transformers asks for on stdin — a detached '
+        + 'container has no terminal to answer with, so those cannot be abliterated here at all.',
     }));
 }
 
-function cacheHint(node, value) {
-  const repo = view.local.find((entry) => entry.repo_id === value);
-  mount(node, repo
-    ? `cached · ${bytes(repo.size_on_disk)} on disk`
-    : value.startsWith('/')
-      ? 'local path · must be visible inside the container'
-      : value
-        ? 'not in the local cache — the run downloads it first'
-        : `${view.local.length} models cached locally`);
+function modelHint(node) {
+  const value = view.config.model || '';
+  const entry = catalogEntries().find((item) => item.value === value);
+  if (entry) return mount(node, entry.note ? `${entry.detail} · ${entry.note}` : entry.detail);
+  if (!value) return mount(node, `${view.catalog.count} model(s) available on this box`);
+  return mount(node, value.startsWith('/')
+    ? 'local path · must be visible inside the container'
+    : 'not cached — the run downloads it first');
 }
+
 
 function renderForm() {
   const fields = view.schema.fields.filter((spec) => spec.name !== 'model');
@@ -700,6 +753,9 @@ function chosenPoint(points, progress, px, py) {
 /* --- styles -------------------------------------------------------------- */
 
 const CSS = `
+.hx-picker { display: flex; gap: 8px; align-items: center; }
+.hx-picker select { flex: 1; min-width: 0; }
+
 .hx-notes { margin: 6px 0 0; padding-left: 18px; }
 .hx-notes li { margin-bottom: 3px; }
 .hx-transient {
