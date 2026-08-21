@@ -21,63 +21,11 @@ import sys
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.sampling_spec import extract
+
 WANTED = ("ChatCompletionRequest", "CompletionRequest")
-
-
-def resolve(schema: dict, components: dict, depth: int = 0) -> dict:
-    """Flatten a property's type into something a form renderer can use."""
-    if depth > 4:
-        return {"type": "json"}
-
-    if "$ref" in schema:
-        name = schema["$ref"].rsplit("/", 1)[-1]
-        target = components.get(name, {})
-        return {"type": "json", "ref": name, "properties": sorted(target.get("properties", {}))}
-
-    if "anyOf" in schema:
-        options = [resolve(s, components, depth + 1) for s in schema["anyOf"]]
-        concrete = [o for o in options if o.get("type") not in (None, "null")]
-        base = concrete[0] if concrete else {"type": "string"}
-        return {**base, "nullable": any(o.get("type") == "null" for o in options)}
-
-    kind = schema.get("type", "string")
-    out: dict = {"type": kind}
-    if kind == "array":
-        out["items"] = resolve(schema.get("items", {}), components, depth + 1).get("type", "string")
-    if "enum" in schema:
-        out["enum"] = schema["enum"]
-    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
-        if key in schema:
-            out[key] = schema[key]
-    return out
-
-
-def extract(spec: dict) -> dict:
-    components = spec.get("components", {}).get("schemas", {})
-    out: dict = {"paths": sorted(spec.get("paths", {})), "requests": {}}
-    for name in WANTED:
-        model = components.get(name)
-        if not model:
-            continue
-        fields = {}
-        for field, definition in model.get("properties", {}).items():
-            entry = resolve(definition, components)
-            if "default" in definition:
-                entry["default"] = definition["default"]
-            if definition.get("description"):
-                entry["description"] = definition["description"][:400]
-            fields[field] = entry
-        out["requests"][name] = {
-            "fields": fields,
-            "required": model.get("required", []),
-        }
-    structured = components.get("StructuredOutputsParams")
-    if structured:
-        out["structured_outputs"] = {
-            field: resolve(definition, components)
-            for field, definition in structured.get("properties", {}).items()
-        }
-    return out
 
 
 def main() -> None:

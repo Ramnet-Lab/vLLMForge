@@ -14,12 +14,71 @@ import time
 from functools import lru_cache
 from typing import Any
 
-import httpx
-
 from app.config import settings
 
 CACHE_TTL = 300.0
 _cache: dict[str, tuple[float, dict]] = {}
+
+WANTED_REQUESTS = ("ChatCompletionRequest", "CompletionRequest")
+
+
+def resolve(schema: dict, components: dict, depth: int = 0) -> dict:
+    """Flatten a property's type into something a form renderer can use."""
+    if depth > 4:
+        return {"type": "json"}
+
+    if "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        target = components.get(name, {})
+        return {"type": "json", "ref": name, "properties": sorted(target.get("properties", {}))}
+
+    if "anyOf" in schema:
+        options = [resolve(s, components, depth + 1) for s in schema["anyOf"]]
+        concrete = [o for o in options if o.get("type") not in (None, "null")]
+        base = concrete[0] if concrete else {"type": "string"}
+        return {**base, "nullable": any(o.get("type") == "null" for o in options)}
+
+    kind = schema.get("type", "string")
+    out: dict = {"type": kind}
+    if kind == "array":
+        out["items"] = resolve(schema.get("items", {}), components, depth + 1).get("type", "string")
+    if "enum" in schema:
+        out["enum"] = schema["enum"]
+    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        if key in schema:
+            out[key] = schema[key]
+    return out
+
+
+def extract(spec: dict) -> dict:
+    components = spec.get("components", {}).get("schemas", {})
+    out: dict = {"paths": sorted(spec.get("paths", {})), "requests": {}}
+    for name in WANTED_REQUESTS:
+        model = components.get(name)
+        if not model:
+            continue
+        fields = {}
+        for field, definition in model.get("properties", {}).items():
+            entry = resolve(definition, components)
+            if "default" in definition:
+                entry["default"] = definition["default"]
+            if definition.get("description"):
+                entry["description"] = definition["description"][:400]
+            fields[field] = entry
+        out["requests"][name] = {
+            "fields": fields,
+            "required": model.get("required", []),
+        }
+    structured = components.get("StructuredOutputsParams")
+    if structured:
+        out["structured_outputs"] = {
+            field: resolve(definition, components)
+            for field, definition in structured.get("properties", {}).items()
+        }
+    return out
+
+
+
 
 # Controls promoted to the main panel, in the order they belong there. The rest
 # stay reachable under "All parameters".
@@ -103,12 +162,15 @@ def fallback() -> dict:
 
 async def fetch(base_url: str) -> dict:
     """Read a server's schema, memoised briefly so a chatty UI is cheap."""
+    # httpx is imported here rather than at module scope so that
+    # tools/gen_sampling_schema.py can reuse extract() with nothing but the
+    # standard library, the way the other generator already does.
+    import httpx
+
     now = time.monotonic()
     hit = _cache.get(base_url)
     if hit and now - hit[0] < CACHE_TTL:
         return hit[1]
-
-    from tools.gen_sampling_schema import extract  # local import: tool code, not runtime code
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
