@@ -1,0 +1,40 @@
+[project]
+name = "llm-dashboard"
+version = "0.1.0"
+description = "vLLM serving, HuggingFace model pulls, Unsloth fine-tuning and Heretic decensoring behind one UI"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.9,<3",
+    "huggingface_hub>=1.0",
+    "PyYAML>=6",
+    "python-multipart>=0.0.20",
+    "sse-starlette>=2.1",
+]
+
+[project.scripts]
+llm-dashboard = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "tools*"]
+
+[tool.setuptools.package-data]
+app = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]  # FastAPI's Depends()/Query() defaults are the idiom here
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

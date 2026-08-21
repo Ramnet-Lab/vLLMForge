@@ -1,0 +1,648 @@
+{
+ "paths": [
+  "/detokenize",
+  "/generative_scoring",
+  "/health",
+  "/inference/v1/generate",
+  "/invocations",
+  "/is_scaling_elastic_ep",
+  "/load",
+  "/metrics",
+  "/ping",
+  "/scale_elastic_ep",
+  "/tokenize",
+  "/v1/chat/completions",
+  "/v1/chat/completions/batch",
+  "/v1/chat/completions/derender",
+  "/v1/chat/completions/render",
+  "/v1/completions",
+  "/v1/completions/derender",
+  "/v1/completions/render",
+  "/v1/messages",
+  "/v1/messages/count_tokens",
+  "/v1/models",
+  "/v1/responses",
+  "/v1/responses/{response_id}",
+  "/v1/responses/{response_id}/cancel",
+  "/version"
+ ],
+ "requests": {
+  "ChatCompletionRequest": {
+   "fields": {
+    "messages": {
+     "type": "array",
+     "items": "json"
+    },
+    "model": {
+     "type": "string",
+     "nullable": true
+    },
+    "frequency_penalty": {
+     "type": "number",
+     "nullable": true,
+     "default": 0.0
+    },
+    "logit_bias": {
+     "type": "object",
+     "nullable": true
+    },
+    "logprobs": {
+     "type": "boolean",
+     "nullable": true,
+     "default": false
+    },
+    "top_logprobs": {
+     "type": "integer",
+     "nullable": true,
+     "default": 0
+    },
+    "max_tokens": {
+     "type": "integer",
+     "nullable": true
+    },
+    "max_completion_tokens": {
+     "type": "integer",
+     "nullable": true
+    },
+    "n": {
+     "type": "integer",
+     "nullable": true,
+     "default": 1
+    },
+    "presence_penalty": {
+     "type": "number",
+     "nullable": true,
+     "default": 0.0
+    },
+    "response_format": {
+     "type": "json",
+     "ref": "ResponseFormat",
+     "properties": [
+      "json_schema",
+      "type"
+     ],
+     "nullable": true
+    },
+    "seed": {
+     "type": "integer",
+     "minimum": -9.223372036854776e+18,
+     "maximum": 9.223372036854776e+18,
+     "nullable": true
+    },
+    "stop": {
+     "type": "string",
+     "nullable": true,
+     "default": []
+    },
+    "stream": {
+     "type": "boolean",
+     "nullable": true,
+     "default": false
+    },
+    "stream_options": {
+     "type": "json",
+     "ref": "StreamOptions",
+     "properties": [
+      "continuous_usage_stats",
+      "include_usage"
+     ],
+     "nullable": true
+    },
+    "temperature": {
+     "type": "number",
+     "nullable": true
+    },
+    "top_p": {
+     "type": "number",
+     "nullable": true
+    },
+    "tools": {
+     "type": "array",
+     "items": "json",
+     "nullable": true
+    },
+    "tool_choice": {
+     "type": "string",
+     "nullable": true,
+     "default": "none"
+    },
+    "reasoning_effort": {
+     "type": "string",
+     "enum": [
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+     ],
+     "nullable": true,
+     "description": "Constrains effort on reasoning for reasoning models. Currently supported values are none, minimal, low, medium, high, xhigh, and max. Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response. Note that 'max' is specific to the DeepSeek V4 series and is not part of the standard OpenAI API specification."
+    },
+    "thinking_token_budget": {
+     "type": "integer",
+     "nullable": true
+    },
+    "include_reasoning": {
+     "type": "boolean",
+     "default": true
+    },
+    "parallel_tool_calls": {
+     "type": "boolean",
+     "nullable": true,
+     "default": true
+    },
+    "user": {
+     "type": "string",
+     "nullable": true
+    },
+    "use_beam_search": {
+     "type": "boolean",
+     "default": false
+    },
+    "top_k": {
+     "type": "integer",
+     "nullable": true
+    },
+    "min_p": {
+     "type": "number",
+     "nullable": true
+    },
+    "repetition_penalty": {
+     "type": "number",
+     "nullable": true
+    },
+    "length_penalty": {
+     "type": "number",
+     "default": 1.0
+    },
+    "stop_token_ids": {
+     "type": "array",
+     "items": "integer",
+     "nullable": true,
+     "default": []
+    },
+    "include_stop_str_in_output": {
+     "type": "boolean",
+     "default": false
+    },
+    "ignore_eos": {
+     "type": "boolean",
+     "default": false
+    },
+    "min_tokens": {
+     "type": "integer",
+     "default": 0
+    },
+    "skip_special_tokens": {
+     "type": "boolean",
+     "default": true
+    },
+    "spaces_between_special_tokens": {
+     "type": "boolean",
+     "default": true
+    },
+    "truncate_prompt_tokens": {
+     "type": "integer",
+     "minimum": -1.0,
+     "maximum": 9.223372036854776e+18,
+     "nullable": true
+    },
+    "truncation_side": {
+     "type": "string",
+     "enum": [
+      "left",
+      "right"
+     ],
+     "nullable": true,
+     "description": "Which side to truncate from when truncate_prompt_tokens is active. 'right' keeps the first N tokens. 'left' keeps the last N tokens."
+    },
+    "prompt_logprobs": {
+     "type": "integer",
+     "nullable": true
+    },
+    "allowed_token_ids": {
+     "type": "array",
+     "items": "integer",
+     "nullable": true
+    },
+    "bad_words": {
+     "type": "array",
+     "items": "string"
+    },
+    "echo": {
+     "type": "boolean",
+     "default": false,
+     "description": "If true, the new message will be prepended with the last message if they belong to the same role."
+    },
+    "add_generation_prompt": {
+     "type": "boolean",
+     "default": true,
+     "description": "If true, the generation prompt will be added to the chat template. This is a parameter used by chat template in tokenizer config of the model."
+    },
+    "continue_final_message": {
+     "type": "boolean",
+     "default": false,
+     "description": "If this is set, the chat will be formatted so that the final message in the chat is open-ended, without any EOS tokens. The model will continue this message rather than starting a new one. This allows you to \"prefill\" part of the model's response for it. Cannot be used at the same time as `add_generation_prompt`."
+    },
+    "add_special_tokens": {
+     "type": "boolean",
+     "default": false,
+     "description": "If true, special tokens (e.g. BOS) will be added to the prompt on top of what is added by the chat template. For most models, the chat template takes care of adding the special tokens so this should be set to false (as is the default)."
+    },
+    "documents": {
+     "type": "array",
+     "items": "object",
+     "nullable": true,
+     "description": "A list of dicts representing documents that will be accessible to the model if it is performing RAG (retrieval-augmented generation). If the template does not support RAG, this argument will have no effect. We recommend that each document should be a dict containing \"title\" and \"text\" keys."
+    },
+    "chat_template": {
+     "type": "string",
+     "nullable": true,
+     "description": "A Jinja template to use for this conversion. As of transformers v4.44, default chat template is no longer allowed, so you must provide a chat template if the tokenizer does not define one."
+    },
+    "chat_template_kwargs": {
+     "type": "object",
+     "nullable": true,
+     "description": "Additional keyword args to pass to the template renderer. Will be accessible by the chat template."
+    },
+    "media_io_kwargs": {
+     "type": "object",
+     "nullable": true,
+     "description": "Additional kwargs to pass to the media IO connectors, keyed by modality. Merged with engine-level media_io_kwargs."
+    },
+    "mm_processor_kwargs": {
+     "type": "object",
+     "nullable": true,
+     "description": "Additional kwargs to pass to the HF processor."
+    },
+    "structured_outputs": {
+     "type": "json",
+     "ref": "StructuredOutputsParams",
+     "properties": [
+      "_backend",
+      "_backend_was_auto",
+      "choice",
+      "disable_additional_properties",
+      "disable_any_whitespace",
+      "grammar",
+      "json",
+      "json_object",
+      "regex",
+      "structural_tag",
+      "whitespace_pattern"
+     ],
+     "nullable": true,
+     "description": "Additional kwargs for structured outputs"
+    },
+    "priority": {
+     "type": "integer",
+     "minimum": -9.223372036854776e+18,
+     "maximum": 9.223372036854776e+18,
+     "default": 0,
+     "description": "The priority of the request (lower means earlier handling; default: 0). Any priority other than 0 will raise an error if the served model does not use priority scheduling."
+    },
+    "request_id": {
+     "type": "string",
+     "description": "The request_id related to this request. If the caller does not set it, a random_uuid will be generated. This id is used through out the inference process and return in response."
+    },
+    "return_tokens_as_token_ids": {
+     "type": "boolean",
+     "nullable": true,
+     "description": "If specified with 'logprobs', tokens are represented  as strings of the form 'token_id:{token_id}' so that tokens that are not JSON-encodable can be identified."
+    },
+    "return_token_ids": {
+     "type": "boolean",
+     "nullable": true,
+     "description": "If specified, the result will include token IDs alongside the generated text. In streaming mode, prompt_token_ids is included only in the first chunk, and token_ids contains the delta tokens for each chunk. This is useful for debugging or when you need to map generated text back to input tokens."
+    },
+    "return_prompt_text": {
+     "type": "boolean",
+     "nullable": true,
+     "description": "If true, the response will include ``prompt_text`` containing the prompt string produced by chat templating. In streaming mode it is sent only on the first chunk. This is useful for inspecting exactly what was fed into the model."
+    },
+    "cache_salt": {
+     "type": "string",
+     "nullable": true,
+     "description": "If specified, the prefix cache will be salted with the provided string to prevent an attacker to guess prompts in multi-user environments. The salt should be random, protected from access by 3rd parties, and long enough to be unpredictable (e.g., 43 characters base64-encoded, corresponding to 256 bit)."
+    },
+    "kv_transfer_params": {
+     "type": "object",
+     "nullable": true,
+     "description": "KVTransfer parameters used for disaggregated serving."
+    },
+    "vllm_xargs": {
+     "type": "object",
+     "nullable": true,
+     "description": "Additional request parameters with (list of) string or numeric values, used by custom extensions."
+    },
+    "repetition_detection": {
+     "type": "json",
+     "ref": "RepetitionDetectionParams",
+     "properties": [
+      "max_pattern_size",
+      "min_count",
+      "min_pattern_size"
+     ],
+     "nullable": true,
+     "description": "Parameters for detecting repetitive N-gram patterns in output tokens. If such repetition is detected, generation will be ended early. LLMs can sometimes generate repetitive, unhelpful token patterns, stopping only when they hit the maximum output length (e.g. 'abcdabcdabcd...' or '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior and terminate early, saving time and tokens."
+    }
+   },
+   "required": [
+    "messages"
+   ]
+  },
+  "CompletionRequest": {
+   "fields": {
+    "model": {
+     "type": "string",
+     "nullable": true
+    },
+    "prompt": {
+     "type": "array",
+     "items": "integer",
+     "nullable": true
+    },
+    "echo": {
+     "type": "boolean",
+     "nullable": true,
+     "default": false
+    },
+    "frequency_penalty": {
+     "type": "number",
+     "nullable": true,
+     "default": 0.0
+    },
+    "logit_bias": {
+     "type": "object",
+     "nullable": true
+    },
+    "logprobs": {
+     "type": "integer",
+     "nullable": true
+    },
+    "max_tokens": {
+     "type": "integer",
+     "nullable": true,
+     "default": 16
+    },
+    "n": {
+     "type": "integer",
+     "default": 1
+    },
+    "presence_penalty": {
+     "type": "number",
+     "nullable": true,
+     "default": 0.0
+    },
+    "seed": {
+     "type": "integer",
+     "minimum": -9.223372036854776e+18,
+     "maximum": 9.223372036854776e+18,
+     "nullable": true
+    },
+    "stop": {
+     "type": "string",
+     "nullable": true,
+     "default": []
+    },
+    "stream": {
+     "type": "boolean",
+     "nullable": true,
+     "default": false
+    },
+    "stream_options": {
+     "type": "json",
+     "ref": "StreamOptions",
+     "properties": [
+      "continuous_usage_stats",
+      "include_usage"
+     ],
+     "nullable": true
+    },
+    "suffix": {
+     "type": "string",
+     "nullable": true
+    },
+    "temperature": {
+     "type": "number",
+     "nullable": true
+    },
+    "top_p": {
+     "type": "number",
+     "nullable": true
+    },
+    "user": {
+     "type": "string",
+     "nullable": true
+    },
+    "use_beam_search": {
+     "type": "boolean",
+     "default": false
+    },
+    "top_k": {
+     "type": "integer",
+     "nullable": true
+    },
+    "min_p": {
+     "type": "number",
+     "nullable": true
+    },
+    "repetition_penalty": {
+     "type": "number",
+     "nullable": true
+    },
+    "length_penalty": {
+     "type": "number",
+     "default": 1.0
+    },
+    "stop_token_ids": {
+     "type": "array",
+     "items": "integer",
+     "nullable": true,
+     "default": []
+    },
+    "include_stop_str_in_output": {
+     "type": "boolean",
+     "default": false
+    },
+    "ignore_eos": {
+     "type": "boolean",
+     "default": false
+    },
+    "min_tokens": {
+     "type": "integer",
+     "default": 0
+    },
+    "skip_special_tokens": {
+     "type": "boolean",
+     "default": true
+    },
+    "spaces_between_special_tokens": {
+     "type": "boolean",
+     "default": true
+    },
+    "truncate_prompt_tokens": {
+     "type": "integer",
+     "minimum": -1.0,
+     "maximum": 9.223372036854776e+18,
+     "nullable": true
+    },
+    "truncation_side": {
+     "type": "string",
+     "enum": [
+      "left",
+      "right"
+     ],
+     "nullable": true,
+     "description": "Which side to truncate from when truncate_prompt_tokens is active. 'right' keeps the first N tokens. 'left' keeps the last N tokens."
+    },
+    "allowed_token_ids": {
+     "type": "array",
+     "items": "integer",
+     "nullable": true
+    },
+    "prompt_logprobs": {
+     "type": "integer",
+     "nullable": true
+    },
+    "prompt_embeds": {
+     "type": "string",
+     "nullable": true
+    },
+    "add_special_tokens": {
+     "type": "boolean",
+     "default": true,
+     "description": "If true (the default), special tokens (e.g. BOS) will be added to the prompt."
+    },
+    "response_format": {
+     "type": "json",
+     "ref": "ResponseFormat",
+     "properties": [
+      "json_schema",
+      "type"
+     ],
+     "nullable": true,
+     "description": "Similar to chat completion, this parameter specifies the format of output. Only {'type': 'json_object'}, {'type': 'json_schema'}, {'type': 'structural_tag'}, or {'type': 'text' } is supported."
+    },
+    "structured_outputs": {
+     "type": "json",
+     "ref": "StructuredOutputsParams",
+     "properties": [
+      "_backend",
+      "_backend_was_auto",
+      "choice",
+      "disable_additional_properties",
+      "disable_any_whitespace",
+      "grammar",
+      "json",
+      "json_object",
+      "regex",
+      "structural_tag",
+      "whitespace_pattern"
+     ],
+     "nullable": true,
+     "description": "Additional kwargs for structured outputs"
+    },
+    "priority": {
+     "type": "integer",
+     "minimum": -9.223372036854776e+18,
+     "maximum": 9.223372036854776e+18,
+     "default": 0,
+     "description": "The priority of the request (lower means earlier handling; default: 0). Any priority other than 0 will raise an error if the served model does not use priority scheduling."
+    },
+    "request_id": {
+     "type": "string",
+     "description": "The request_id related to this request. If the caller does not set it, a random_uuid will be generated. This id is used through out the inference process and return in response."
+    },
+    "return_tokens_as_token_ids": {
+     "type": "boolean",
+     "nullable": true,
+     "description": "If specified with 'logprobs', tokens are represented  as strings of the form 'token_id:{token_id}' so that tokens that are not JSON-encodable can be identified."
+    },
+    "return_token_ids": {
+     "type": "boolean",
+     "nullable": true,
+     "description": "If specified, the result will include token IDs alongside the generated text. In streaming mode, prompt_token_ids is included only in the first chunk, and token_ids contains the delta tokens for each chunk. This is useful for debugging or when you need to map generated text back to input tokens."
+    },
+    "cache_salt": {
+     "type": "string",
+     "nullable": true,
+     "description": "If specified, the prefix cache will be salted with the provided string to prevent an attacker to guess prompts in multi-user environments. The salt should be random, protected from access by 3rd parties, and long enough to be unpredictable (e.g., 43 characters base64-encoded, corresponding to 256 bit)."
+    },
+    "kv_transfer_params": {
+     "type": "object",
+     "nullable": true,
+     "description": "KVTransfer parameters used for disaggregated serving."
+    },
+    "vllm_xargs": {
+     "type": "object",
+     "nullable": true,
+     "description": "Additional request parameters with string or numeric values, used by custom extensions."
+    },
+    "repetition_detection": {
+     "type": "json",
+     "ref": "RepetitionDetectionParams",
+     "properties": [
+      "max_pattern_size",
+      "min_count",
+      "min_pattern_size"
+     ],
+     "nullable": true,
+     "description": "Parameters for detecting repetitive N-gram patterns in output tokens. If such repetition is detected, generation will be ended early. LLMs can sometimes generate repetitive, unhelpful token patterns, stopping only when they hit the maximum output length (e.g. 'abcdabcdabcd...' or '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior and terminate early, saving time and tokens."
+    },
+    "thinking_token_budget": {
+     "type": "integer",
+     "nullable": true,
+     "description": "Maximum number of tokens allowed for thinking operations (reasoning models). Non-negative integer sets the limit; -1 means unlimited (treated as unset)."
+    }
+   },
+   "required": []
+  }
+ },
+ "structured_outputs": {
+  "json": {
+   "type": "string",
+   "nullable": true
+  },
+  "regex": {
+   "type": "string",
+   "nullable": true
+  },
+  "choice": {
+   "type": "array",
+   "items": "string",
+   "nullable": true
+  },
+  "grammar": {
+   "type": "string",
+   "nullable": true
+  },
+  "json_object": {
+   "type": "boolean",
+   "nullable": true
+  },
+  "disable_any_whitespace": {
+   "type": "boolean"
+  },
+  "disable_additional_properties": {
+   "type": "boolean"
+  },
+  "whitespace_pattern": {
+   "type": "string",
+   "nullable": true
+  },
+  "structural_tag": {
+   "type": "string",
+   "nullable": true
+  },
+  "_backend": {
+   "type": "string",
+   "nullable": true
+  },
+  "_backend_was_auto": {
+   "type": "boolean"
+  }
+ }
+}

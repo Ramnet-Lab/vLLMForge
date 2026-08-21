@@ -1,0 +1,10 @@
+# Every one of these ships a prebuilt aarch64 wheel, so `pip install` needs no
+# compiler on a DGX Spark. Regenerate with: pip install --only-binary=:all: -r requirements.txt
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34
+httpx>=0.28
+pydantic>=2.9,<3
+huggingface_hub>=1.0
+PyYAML>=6
+python-multipart>=0.0.20
+sse-starlette>=2.1
