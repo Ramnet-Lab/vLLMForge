@@ -372,7 +372,8 @@ async def check_job(estimate_bytes: int, *, label: str) -> Verdict:
             ok=True,
             level="warn",
             message=(
-                f"{label} needs roughly {_gib(estimate_bytes)} against {_gib(budget.available_bytes)} "
+                f"{label} needs roughly {_gib(estimate_bytes)} against "
+                f"{_gib(budget.available_bytes)} "
                 "available. The estimate is approximate and peak usage happens at save time, when "
                 "the base model is reloaded to merge — leave room."
             ),

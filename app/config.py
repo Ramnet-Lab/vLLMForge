@@ -69,7 +69,9 @@ class Settings:
     container_prefix: str = field(default_factory=lambda: _env("LLMD_CONTAINER_PREFIX", "llmd-"))
 
     # --- credentials ------------------------------------------------------
-    hf_token: str = field(default_factory=lambda: _env("LLMD_HF_TOKEN", os.environ.get("HF_TOKEN", "")))
+    hf_token: str = field(
+        default_factory=lambda: _env("LLMD_HF_TOKEN", os.environ.get("HF_TOKEN", ""))
+    )
 
     # --- host memory safety ----------------------------------------------
     # GPU memory IS host memory on GB10. A gpu-memory-utilization that looks
@@ -135,7 +137,9 @@ class Settings:
         }
 
     def ensure_dirs(self) -> None:
-        for path in (self.state_dir, self.log_dir, self.upload_dir, self.output_dir, self.dataset_dir):
+        for path in (
+            self.state_dir, self.log_dir, self.upload_dir, self.output_dir, self.dataset_dir
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 

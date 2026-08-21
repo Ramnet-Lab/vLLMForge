@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import urllib.request
+from pathlib import Path
 
 WANTED = ("ChatCompletionRequest", "CompletionRequest")
 
@@ -89,11 +90,11 @@ def main() -> None:
     source = args.file or (args.url.rstrip("/") + "/openapi.json")
     try:
         if args.file:
-            spec = json.loads(open(args.file, encoding="utf-8").read())
+            spec = json.loads(Path(args.file).read_text(encoding="utf-8"))
         else:
             with urllib.request.urlopen(source, timeout=30) as response:
                 spec = json.load(response)
-    except Exception as exc:  # noqa: BLE001 - a CLI tool should just say why
+    except Exception as exc:
         sys.exit(f"could not read {source}: {exc}")
 
     payload = extract(spec)

@@ -173,7 +173,7 @@ async def run_capture(
     )
     try:
         return await asyncio.wait_for(_run(argv, check=False), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise DockerError(argv, -1, f"timed out after {timeout}s") from None
 
 
@@ -344,7 +344,7 @@ async def stream_logs(
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
 
 

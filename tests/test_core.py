@@ -89,3 +89,26 @@ def test_output_dir_is_sanitised():
     path = jobs.output_dir("abc123", "org/model:weird name")
     assert path.name.startswith("org-model-weird-name")
     assert path.is_dir()
+
+
+def test_replayed_series_collapse_by_identity():
+    # A reattached job re-reads part of its log, so accumulating series must not
+    # grow a second copy of every entry.
+    progress = {
+        "loss_history": [[1, 2.5], [2, 2.8], [1, 2.5], [2, 2.8], [3, 1.9]],
+        "trials": [{"trial": 1, "kl": 0.1}, {"trial": 1, "kl": 0.1}, {"trial": 2, "kl": 0.2}],
+        "log_lines": ["a", "b", "a"],
+        "step": 3,
+    }
+    jobs._dedupe_series(progress)
+    assert progress["loss_history"] == [[1, 2.5], [2, 2.8], [3, 1.9]]
+    assert progress["trials"] == [{"trial": 1, "kl": 0.1}, {"trial": 2, "kl": 0.2}]
+    # A plain list that is not a series is left alone.
+    assert progress["log_lines"] == ["a", "b", "a"]
+    assert progress["step"] == 3
+
+
+def test_a_later_entry_wins_over_an_earlier_one():
+    progress = {"loss_history": [[4, 9.9], [4, 1.1]]}
+    jobs._dedupe_series(progress)
+    assert progress["loss_history"] == [[4, 1.1]]

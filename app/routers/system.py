@@ -104,7 +104,7 @@ async def images() -> dict:
     return {
         "required": [
             {"role": role, "tag": tag, "present": ok}
-            for (role, tag), ok in zip(wanted.items(), present)
+            for (role, tag), ok in zip(wanted.items(), present, strict=True)
         ],
         "containers": len(local),
     }

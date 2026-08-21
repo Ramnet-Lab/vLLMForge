@@ -75,7 +75,9 @@ async def endpoints() -> dict:
 
 
 @router.get("/params")
-async def params(endpoint_id: str | None = None, url: str | None = None, kind: str = "chat") -> dict:
+async def params(
+    endpoint_id: str | None = None, url: str | None = None, kind: str = "chat"
+) -> dict:
     """Parameter form for one endpoint, generated from its own OpenAPI schema."""
     try:
         base = await resolve(endpoint_id, url)

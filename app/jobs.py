@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import re
 import time
 import uuid
@@ -113,7 +114,8 @@ class JobManager:
         job_id = uuid.uuid4().hex[:12]
         container = settings.container_name(spec.kind, job_id)
         db.execute(
-            "INSERT INTO jobs (id, kind, title, status, spec, result, progress, container_name, created_at)"
+            "INSERT INTO jobs (id, kind, title, status, spec, result, progress, container_name,"
+            " created_at)"
             " VALUES (?, ?, ?, ?, ?, '{}', '{}', ?, ?)",
             (
                 job_id,
@@ -181,14 +183,33 @@ class JobManager:
         self._update(job_id, status=RUNNING, started_at=db.now())
         await self._follow(job_id, spec.kind, container)
 
-    async def _follow(self, job_id: str, kind: str, container: str) -> None:
+    def _resume_cursor(self, job_id: str) -> str | None:
+        """Where to resume a container's output after the dashboard restarted.
+
+        The log file's mtime is the moment we last ingested a line, so asking
+        docker for everything since then avoids replaying — and re-parsing —
+        output we already have. A few seconds of overlap is deliberate: a
+        handful of duplicated lines is a far better failure than a silently
+        lost tail.
+        """
+        path = db.log_path(job_id)
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        moment = dt.datetime.fromtimestamp(path.stat().st_mtime - 5, tz=dt.UTC)
+        return moment.isoformat().replace("+00:00", "Z")
+
+    async def _follow(
+        self, job_id: str, kind: str, container: str, *, since: str | None = None
+    ) -> None:
         """Tail a running container to completion and record its outcome."""
         parser = _parsers.get(kind)
         progress: dict[str, Any] = (self.get(job_id) or {}).get("progress") or {}
         last_publish = 0.0
         last_transient_write = 0.0
         try:
-            async for line, transient in docker_ctl.stream_logs(container, tail="all"):
+            async for line, transient in docker_ctl.stream_logs(
+                container, tail=0 if since else "all", since=since
+            ):
                 if not line.strip():
                     continue
                 now = time.monotonic()
@@ -208,6 +229,7 @@ class JobManager:
                     update = parser(line, progress)
                     if update:
                         progress.update(update)
+                        _dedupe_series(progress)
                         if now - last_publish > 0.4:
                             last_publish = now
                             self._update(job_id, progress=progress)
@@ -287,13 +309,14 @@ class JobManager:
         for row in db.query("SELECT * FROM jobs WHERE status IN (?, ?)", (RUNNING, PENDING)):
             job_id, kind, container = row["id"], row["kind"], row["container_name"]
             state = await docker_ctl.state(container or "")
+            since = self._resume_cursor(job_id)
             if state.running:
                 self._append(job_id, "[dashboard] reattached after restart")
-                task = asyncio.create_task(self._follow(job_id, kind, container))
+                task = asyncio.create_task(self._follow(job_id, kind, container, since=since))
                 self._tasks[job_id] = task
                 task.add_done_callback(lambda _t, jid=job_id: self._tasks.pop(jid, None))
             elif state.exists:
-                await self._follow(job_id, kind, container)
+                await self._follow(job_id, kind, container, since=since)
             else:
                 self._update(
                     job_id,
@@ -307,6 +330,42 @@ class JobManager:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+
+# A series entry identifies itself by one of these when it is a dict.
+SERIES_KEYS = ("step", "trial", "index")
+
+
+def _dedupe_series(progress: dict[str, Any]) -> None:
+    """Keep accumulating series honest across a replayed reattach.
+
+    Parsers build up series — loss_history as [step, value] pairs, trials as
+    dicts carrying a trial number — and a resumed log can hand them the same
+    entries twice. The manager owns replay, so it owns making replay idempotent
+    rather than asking every parser to defend against it. Later entries win, so
+    a corrected value replaces the earlier one.
+    """
+    for key, value in progress.items():
+        if not isinstance(value, list) or not value:
+            continue
+        is_history = key.endswith("_history")
+        identified = [
+            entry for entry in value
+            if isinstance(entry, dict) and any(k in entry for k in SERIES_KEYS)
+        ]
+        if not is_history and len(identified) != len(value):
+            continue
+
+        by_id: dict[Any, Any] = {}
+        for position, entry in enumerate(value):
+            if isinstance(entry, dict):
+                ident = next((entry[k] for k in SERIES_KEYS if k in entry), position)
+            elif isinstance(entry, (list, tuple)) and entry:
+                ident = entry[0]
+            else:
+                ident = position
+            by_id[ident] = entry
+        progress[key] = list(by_id.values())
 
 
 def _first_error(lines: list[str]) -> str:

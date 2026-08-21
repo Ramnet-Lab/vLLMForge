@@ -61,13 +61,13 @@ def test_the_utils_of_co_resident_engines_add_up():
 
 def test_the_value_that_locked_this_machine_is_refused():
     b = budget([])
-    assert 0.80 > b.max_util, "0.80 alone must not fit; it hard-locked this host once"
+    assert b.max_util < 0.80, "0.80 alone must not fit; it hard-locked this host once"
 
 
 def test_the_validated_configuration_fits():
     b = budget([])
-    assert 0.52 + 0.16 <= b.max_util
-    assert 0.57 <= b.max_util
+    assert b.max_util >= 0.52 + 0.16
+    assert b.max_util >= 0.57
 
 
 @pytest.mark.asyncio

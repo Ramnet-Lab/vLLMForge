@@ -120,7 +120,7 @@ async def _nvidia_smi(args: list[str], timeout: float = 5.0) -> str:
             stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         return ""
     return out.decode(errors="replace")
 
@@ -146,7 +146,8 @@ async def read_gpu() -> dict:
         return {}
     parts = [p.strip() for p in line.split(",")]
     gpu = {}
-    for name, raw in zip(GPU_FIELDS, parts):
+    # A short row means nvidia-smi omitted trailing fields; take what came back.
+    for name, raw in zip(GPU_FIELDS, parts, strict=False):
         value = _coerce(name, raw)
         if value is not None:
             gpu[name.replace(".", "_")] = value
@@ -164,7 +165,8 @@ async def read_gpu_processes() -> list[GpuProcess]:
         if len(parts) < 2:
             continue
         try:
-            procs.append(GpuProcess(pid=int(parts[0]), used_bytes=int(float(parts[1])) * 1024 * 1024))
+            used_mib = int(float(parts[1]))
+            procs.append(GpuProcess(pid=int(parts[0]), used_bytes=used_mib * 1024 * 1024))
         except ValueError:
             continue
     return procs
@@ -190,7 +192,11 @@ async def snapshot(containers: list | None = None) -> dict:
     )
     load, cpus = read_load()
     snap = Snapshot(
-        memory={**asdict(memory), "used_bytes": memory.used_bytes, "used_fraction": memory.used_fraction},
+        memory={
+            **asdict(memory),
+            "used_bytes": memory.used_bytes,
+            "used_fraction": memory.used_fraction,
+        },
         gpu=gpu,
         gpu_processes=[asdict(p) for p in procs],
         load=load,

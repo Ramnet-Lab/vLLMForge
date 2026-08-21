@@ -60,7 +60,9 @@ FEATURED: list[dict[str, Any]] = [
     {
         "id": "parallel",
         "title": "Parallelism",
-        "blurb": "One GPU per Spark, so prefer pipeline parallel across nodes over tensor parallel.",
+        "blurb": (
+            "One GPU per Spark, so prefer pipeline parallel across nodes over tensor parallel."
+        ),
         "flags": [
             "tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size",
             "distributed_executor_backend", "enable_expert_parallel",
@@ -126,7 +128,9 @@ HELP_OVERLAY = {
         "Must match the model family."
     ),
     "tool_parser_plugin": "Path to a Python file registering a custom tool parser.",
-    "chat_template": "Path to, or inline text of, a Jinja chat template overriding the model's own.",
+    "chat_template": (
+        "Path to, or inline text of, a Jinja chat template overriding the model's own."
+    ),
     "chat_template_content_format": (
         "How multimodal content is rendered into the template: 'string' flattens to text, "
         "'openai' keeps the parts list."
@@ -215,7 +219,10 @@ def _render(arg: dict[str, Any], value: Any) -> list[str]:
     widget = arg["widget"]
 
     if widget == "bool":
-        truthy = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
+        truthy = (
+            value if isinstance(value, bool)
+            else str(value).lower() in ("1", "true", "yes", "on")
+        )
         if truthy:
             return [flag]
         if arg.get("negatable"):

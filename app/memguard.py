@@ -54,26 +54,26 @@ async def watch() -> None:
     while True:
         try:
             memory = read_meminfo()
-            if memory.available_bytes and memory.available_bytes < threshold_bytes:
-                if time.monotonic() - last_kill > COOLDOWN_SECONDS:
-                    victims = await _candidates()
-                    if victims:
-                        name, util = victims[0]
-                        reason = (
-                            f"MemAvailable {memory.available_bytes // MIB} MiB below "
-                            f"{settings.memguard_threshold_mib} MiB — killing {name} (util {util:g})"
-                        )
-                        log.warning(reason)
-                        await docker_ctl.kill(name)
-                        # Stop it coming straight back and re-reserving the memory.
-                        await docker_ctl.set_restart_policy(name, "no")
-                        entry = {"ts": time.time(), "container": name, "util": util, "reason": reason}
-                        _history.append(entry)
-                        del _history[:-50]
-                        await events.broker.publish(
-                            events.TELEMETRY, {"type": "memguard", "event": entry}
-                        )
-                        last_kill = time.monotonic()
+            starved = memory.available_bytes and memory.available_bytes < threshold_bytes
+            if starved and time.monotonic() - last_kill > COOLDOWN_SECONDS:
+                victims = await _candidates()
+                if victims:
+                    name, util = victims[0]
+                    reason = (
+                        f"MemAvailable {memory.available_bytes // MIB} MiB below "
+                        f"{settings.memguard_threshold_mib} MiB — killing {name} (util {util:g})"
+                    )
+                    log.warning(reason)
+                    await docker_ctl.kill(name)
+                    # Stop it coming straight back and re-reserving the memory.
+                    await docker_ctl.set_restart_policy(name, "no")
+                    entry = {"ts": time.time(), "container": name, "util": util, "reason": reason}
+                    _history.append(entry)
+                    del _history[:-50]
+                    await events.broker.publish(
+                        events.TELEMETRY, {"type": "memguard", "event": entry}
+                    )
+                    last_kill = time.monotonic()
         except asyncio.CancelledError:
             raise
         except Exception:

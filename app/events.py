@@ -8,6 +8,7 @@ frames rather than growing the producer's memory without limit.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -28,14 +29,10 @@ class Broker:
         for queue in list(self._topics.get(topic, ())):
             if queue.full():
                 # Drop the oldest frame so live data always wins over history.
-                try:
+                with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
+            with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(payload)
-            except asyncio.QueueFull:
-                pass
 
     def publish_soon(self, topic: str, payload: Any) -> None:
         """Publish from synchronous code without awaiting."""

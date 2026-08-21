@@ -17,9 +17,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import db, docker_ctl, events, jobs, memguard, servers as server_service, telemetry
+from app import db, docker_ctl, events, jobs, memguard, telemetry
+from app import servers as server_service
 from app.config import settings
-from app.routers import chat, finetune, heretic, hub, jobs as jobs_router, servers, system
+from app.routers import chat, finetune, heretic, hub, servers, system
+from app.routers import jobs as jobs_router
 
 log = logging.getLogger("llmd")
 
@@ -107,7 +109,8 @@ for router in (
 
 @app.exception_handler(KeyError)
 async def _missing(_request, exc: KeyError) -> JSONResponse:
-    return JSONResponse({"detail": f"not found: {exc.args[0] if exc.args else ''}"}, status_code=404)
+    missing = exc.args[0] if exc.args else ""
+    return JSONResponse({"detail": f"not found: {missing}"}, status_code=404)
 
 
 @app.get("/healthz", include_in_schema=False)
