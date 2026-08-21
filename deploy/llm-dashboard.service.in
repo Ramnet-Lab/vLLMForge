@@ -1,0 +1,38 @@
+# Installed to ~/.config/systemd/user/ by scripts/install-service.sh.
+#
+# A *user* unit, not a system one: this box has no passwordless sudo, the
+# dashboard needs the docker group the login user already has, and it reads
+# /proc and nvidia-smi in the host PID namespace. Running it as root would buy
+# nothing and cost the containers' file ownership.
+#
+# Lingering (loginctl enable-linger) is what makes a user unit start at boot
+# without someone logging in; the installer checks for it.
+
+[Unit]
+Description=LLM Dashboard (vLLM, HuggingFace, Unsloth, Heretic)
+Documentation=file://@REPO@/README.md
+
+[Service]
+Type=exec
+WorkingDirectory=@REPO@
+EnvironmentFile=-@REPO@/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m app.main
+
+# The dashboard never owns a container's lifetime — everything it starts is
+# detached — so a restart here cannot interrupt a thirty-minute model load. It
+# re-adopts running jobs on startup.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Log followers and the docker CLI are children and should go with it; the
+# containers themselves are not in this cgroup.
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-dashboard
+
+[Install]
+WantedBy=default.target

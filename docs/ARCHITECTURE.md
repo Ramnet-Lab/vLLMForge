@@ -26,6 +26,10 @@ a vLLM container, they report that container's single PID — so a containerised
 dashboard could not see how much memory the *other* models are holding. It also
 needs `/proc/<pid>/cgroup` on host PIDs to attribute GPU memory to containers.
 
+It is installed as a systemd *user* unit (`deploy/llm-dashboard.service.in`)
+for the same reason: a system unit would run as root, and root is exactly what
+this process should not be.
+
 **One uvicorn worker, no `--reload`.** The telemetry poller, the log followers
 and the memory watchdog are in-process state. A second worker would run a second
 copy of each, and the reloader forks in a way that breaks the child-process

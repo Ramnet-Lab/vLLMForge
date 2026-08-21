@@ -115,18 +115,42 @@ acts. Pass `--with-images` to build without being asked, `--no-images` to skip,
 
 ## Running it
 
+As a service, which is how it is meant to run:
+
+```bash
+scripts/install-service.sh
+```
+
+That installs `deploy/llm-dashboard.service.in` to
+`~/.config/systemd/user/llm-dashboard.service`, enables it and starts it. It is
+a *user* unit — `systemctl --user` needs no sudo, and the dashboard wants the
+docker group the login user already has rather than root.
+
+```bash
+systemctl --user status llm-dashboard      # what it is doing
+systemctl --user restart llm-dashboard     # after changing code
+journalctl --user -u llm-dashboard -f      # follow its log
+scripts/install-service.sh --uninstall     # remove it
+```
+
+For it to start at boot rather than at first login, the account needs
+lingering: `loginctl enable-linger $USER`. The installer checks and tells you if
+it is off.
+
+Or in the foreground, for development:
+
 ```bash
 scripts/run.sh
 ```
 
-That is a foreground process; it prints the URL it is listening on (default
-`http://0.0.0.0:8700/`). Ctrl-C stops the web process and leaves every container
-it started running, which is deliberate — a model that took four minutes to load
-should not die because you restarted the UI.
+Either way it prints or logs the URL it is listening on (default
+`http://0.0.0.0:8700/`). Stopping it — Ctrl-C or `systemctl --user stop` —
+leaves every container it started running, which is deliberate: a model that
+took four minutes to load should not die because you restarted the UI. It
+re-adopts those containers, and their logs, when it comes back. It does stop the
+memory watchdog, so nothing is watching the host until it returns.
 
-To have it survive a logout, write a systemd *user* unit that runs
-`scripts/run.sh` with `Restart=always` — `systemctl --user` needs no sudo. Do
-not run it with more than one uvicorn worker: the telemetry poller, the log
+Do not run it with more than one uvicorn worker: the telemetry poller, the log
 followers and the memory watchdog are in-process state.
 
 The memory watchdog can also run on its own, for when you are launching models
