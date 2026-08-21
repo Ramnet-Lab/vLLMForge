@@ -85,3 +85,32 @@ async def test_a_missing_datasets_server_entry_is_not_an_error(monkeypatch):
     # Not every dataset is auto-converted to parquet, and a dataset that is not
     # is still perfectly downloadable — it must not fail the detail call.
     assert await hf._datasets_server("/splits", {"dataset": "x"}) == {}
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({"dtype": "string", "_type": "Value"}, "string"),
+        ({"_type": "Image"}, "Image"),
+        # A conversational column is a *list* of struct definitions, not a dict.
+        # Assuming a dict here broke every chat dataset — which is precisely the
+        # kind a fine-tune is most likely to want.
+        ([{"content": {"dtype": "string"}, "role": {"dtype": "string"}}],
+         "list<struct{content, role}>"),
+        ([], "list"),
+        (None, ""),
+    ],
+)
+def test_feature_types_survive_both_shapes(raw, expected):
+    assert hf._feature_type(raw) == expected
+
+
+def test_a_conversational_column_is_recognised_through_its_list_type():
+    columns = [
+        {"name": "messages", "type": hf._feature_type(
+            [{"content": {"dtype": "string"}, "role": {"dtype": "string"}}])},
+        {"name": "source", "type": "string"},
+    ]
+    shape = hf._training_shape(columns)
+    assert shape["level"] == "ok"
+    assert shape["format"] == "messages" and shape["field"] == "messages"

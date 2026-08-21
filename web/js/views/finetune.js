@@ -4,10 +4,10 @@
    strip, model picker, generated form, memory pre-flight, launch, live run,
    history — because the two tools do structurally the same thing. */
 
-import { get, post, stream } from '../api.js';
+import { ApiError, del, get, post, stream } from '../api.js';
 import {
   ago, badge, bytes, confirmDialog, count, debounce, duration, empty, ensureStyles, field, h,
-  logBox, modal, mount, notice, panel, spinner, stat, toast,
+  logBox, modal, mount, notice, panel, spinner, stat, toast, when,
 } from '../ui.js';
 
 const KIND = 'finetune';
@@ -19,6 +19,14 @@ const PRIMARY_GROUPS = ['run', 'export'];
 // check_memory already opens its message with "Fits:"/"Tight:"/"Refusing to
 // start:", so this only has to pick the colour the Serve tab uses.
 const LEVEL = { ok: 'ok', warn: 'warn', block: 'danger' };
+
+// The three axes worth sorting a training set on. The Hub offers more, but
+// nothing else says anything about whether a dataset is any good.
+const SORTS = [
+  ['downloads', 'Most downloaded'],
+  ['likes', 'Most liked'],
+  ['lastModified', 'Recently updated'],
+];
 
 const BLURB =
   'Trains a LoRA adapter on a chat or text dataset with Unsloth on top of a 4-bit base, then '
@@ -37,7 +45,10 @@ export async function render(container, ctx) {
     schema: null,
     status: null,
     local: [],
-    datasets: { datasets: [], files: [] },
+    datasets: { datasets: [], files: [], cached: [] },
+    details: new Map(),
+    hub: { q: '', sort: 'downloads', results: null, seq: 0 },
+    pulls: new Map(),
     preview: null,
     jobs: [],
     verdict: null,
@@ -52,6 +63,8 @@ export async function render(container, ctx) {
   shell(container);
   await Promise.all([loadSchema(), loadStatus(), loadLocal(), loadDatasets(), loadJobs()]);
   view.busClose = stream('/jobs/stream/all', { job: onJobEvent, image: () => loadStatus() });
+  searchHub(view.hub.q);
+  adoptPulls();
   runCheck();
 }
 
@@ -60,6 +73,7 @@ export function dispose() {
   view.logClose?.();
   view.buildClose?.();
   view.busClose?.();
+  for (const entry of view.pulls.values()) entry.close?.();
   view = null;
 }
 
@@ -69,6 +83,9 @@ function shell(container) {
   const refs = view.refs;
   refs.status = h('div');
   refs.dataset = h('div');
+  refs.sources = h('div');
+  refs.pulls = h('div');
+  refs.hubResults = h('div');
   refs.model = h('div');
   refs.form = h('div');
   refs.check = h('div');
@@ -90,7 +107,7 @@ function shell(container) {
     refs.run,
     h('div', { class: 'split' },
       h('div', { class: 'stack' },
-        panel('Dataset', { body: refs.dataset }),
+        panel('Dataset', { body: [refs.dataset, refs.sources, refs.pulls, hubBrowser()] }),
         panel('Configuration', {
           sub: 'config.json',
           body: [refs.model, refs.form],
@@ -222,6 +239,7 @@ async function loadSchema() {
   renderModelPicker();
   renderForm();
   renderDataset();
+  renderSources();
   renderActions();
 }
 
@@ -391,6 +409,8 @@ async function loadDatasets() {
     return;
   }
   renderDataset();
+  renderSources();
+  renderHubResults();
 }
 
 function renderDataset() {
@@ -415,7 +435,15 @@ function renderDataset() {
   } else {
     reference = h('input', {
       type: 'text', value: spec.reference, placeholder: 'yahma/alpaca-cleaned',
-      onInput: (event) => { spec.reference = event.target.value.trim(); scheduleCheck(); },
+      onInput: (event) => {
+        spec.reference = event.target.value.trim();
+        scheduleCheck();
+        // Typing an id by hand deserves the same answer as picking one from the
+        // browser: which column the worker would train on, before the run.
+        if (spec.reference.includes('/') && !spec.reference.endsWith('/')) {
+          lookupShape(spec.reference);
+        }
+      },
     });
   }
 
@@ -426,6 +454,7 @@ function renderDataset() {
       field('reference', reference, {
         flag: 'dataset.reference', help: datasetProps().reference.description,
       })),
+    spec.source === 'hub' ? trainingNotice(spec.reference) : null,
     spec.source === 'local' ? uploader() : null,
     datasetPreview(),
     h('details', { class: 'collapse' },
@@ -499,6 +528,528 @@ function datasetPreview() {
       Object.entries(entry).map(([key, value]) => h('div', null,
         h('span', { class: 'ft-key' }, `${key}: `),
         h('span', null, String(value)))))));
+}
+
+/* --- where a dataset can come from --------------------------------------- */
+
+/* Dataset ids are `owner/name` and the hub routes take them as a path
+   parameter, so the slash has to survive encoding. */
+const repoPath = (repoId) => repoId.split('/').map(encodeURIComponent).join('/');
+
+/** The config wants a bare file name for an upload and the repo id for a Hub
+ *  dataset — those are what the launch resolves against /datasets and the
+ *  shared cache respectively. */
+// Module scope, not per render: a debouncer rebuilt on every keystroke never
+// actually debounces.
+const lookupShape = debounce((repoId) => {
+  if (view && view.config.dataset.reference === repoId) applyShape(repoId);
+}, 600);
+
+
+function selectDataset(source, reference) {
+  const spec = view.config.dataset;
+  spec.source = source;
+  spec.reference = reference;
+  renderDataset();
+  renderSources();
+  renderActions();
+  scheduleCheck();
+  if (source === 'hub') applyShape(reference);
+}
+
+/** Which column the worker can read is only knowable from the detail call, so
+ *  picking a Hub dataset fetches it and fills the column fields in. A dataset
+ *  the datasets server never converted simply leaves them alone. */
+async function applyShape(repoId) {
+  try {
+    await loadDetail(repoId);
+  } catch {
+    // An unreachable datasets server is no reason to refuse the pick; the
+    // column fields keep whatever they had.
+    return;
+  }
+  if (!view) return;
+  const spec = view.config.dataset;
+  if (spec.source !== 'hub' || spec.reference !== repoId) return;
+  const training = view.details.get(repoId)?.training;
+  if (!training?.note) return renderDataset();
+
+  // Both fields are rewritten together, never just the one that applies:
+  // switching from a conversational set to an instruction one used to leave
+  // messages_field pointing at a column the new dataset does not have.
+  //
+  // An instruction/output pair has no single column worth training on — the
+  // notice says to render the two together — so it clears both and lets the
+  // user choose. The worker reads text_field first and only falls through to
+  // the chat path when that column is absent, which is why a conversational set
+  // must leave text_field empty or the rendered turns would never be built.
+  const chat = training.format === 'messages';
+  const usable = training.field && training.format !== 'instruction';
+  spec.text_field = usable && !chat ? training.field : '';
+  spec.messages_field = usable && chat ? training.field : '';
+  scheduleCheck();
+  renderDataset();
+}
+
+function trainingNotice(repoId) {
+  const training = view.details.get(repoId)?.training;
+  if (!training?.note) return null;
+  return notice(LEVEL[training.level] || 'info',
+    h('strong', null, training.field
+      ? `Trains on '${training.field}'. `
+      : 'No column this can train on. '),
+    h('span', null, training.note));
+}
+
+function renderSources() {
+  if (!view.schema) return;
+  const uploads = view.datasets.datasets || [];
+  const loose = (view.datasets.files || []).filter((file) => !file.registered);
+  const cached = view.datasets.cached || [];
+
+  mount(view.refs.sources,
+    h('h3', { class: 'ft-sub' }, 'Available datasets'),
+    view.datasets.cache_ok === false
+      ? notice('warn', 'The shared cache could not be read, so datasets already pulled from the '
+        + 'Hub are missing from this list.')
+      : null,
+    uploads.length + loose.length + cached.length
+      ? [
+        sourceGroup('Uploaded JSONL', uploads.map(uploadRow)),
+        sourceGroup('Loose files in the dataset dir', loose.map(looseRow)),
+        sourceGroup('Hub datasets in the cache', cached.map(cachedRow)),
+      ]
+      : empty('Nothing to train on yet',
+        'Upload a JSONL above, or search the Hub below and pull a dataset.'));
+}
+
+function sourceGroup(title, rows) {
+  if (!rows.length) return null;
+  return h('div', { class: 'ft-group' },
+    h('div', { class: 'ft-group-head' },
+      h('span', null, title),
+      h('span', null, String(rows.length))),
+    h('div', { class: 'ft-list' }, rows));
+}
+
+function sourceRow(source, reference, meta, actions = null) {
+  const spec = view.config.dataset;
+  const chosen = spec.source === source && spec.reference === reference;
+  return h('div', { class: `result${chosen ? ' ft-chosen' : ''}` },
+    h('div', { class: 'r-main' },
+      h('div', { class: 'row wrap' },
+        h('span', { class: 'r-id truncate' }, reference),
+        chosen ? badge('succeeded', 'selected') : null),
+      h('div', { class: 'r-meta' }, meta.filter(Boolean).map((entry) => h('span', null, entry)))),
+    h('div', { class: 'r-actions' },
+      actions,
+      h('button', {
+        class: chosen ? 'btn-sm' : 'btn-sm btn-primary',
+        disabled: chosen,
+        onClick: () => selectDataset(source, reference),
+      }, chosen ? 'Selected' : 'Use')));
+}
+
+function uploadRow(row) {
+  return sourceRow('local', row.name,
+    [`${count(row.rows)} rows`, row.format, bytes(row.size_bytes), `added ${ago(row.created_at)}`]);
+}
+
+function looseRow(file) {
+  return sourceRow('local', file.name,
+    [bytes(file.size_bytes), `modified ${ago(file.modified_at)}`, 'never parsed by an upload']);
+}
+
+function cachedRow(row) {
+  const remove = h('button', { class: 'btn-sm btn-danger' }, 'Delete');
+  remove.addEventListener('click', () => deleteCached(row, remove));
+  return sourceRow('hub', row.reference,
+    [bytes(row.size_bytes), `${row.nb_files} files`, `pulled ${ago(row.last_modified)}`],
+    [h('button', { class: 'btn-sm', onClick: () => openDetail(row.repo_id) }, 'Details'), remove]);
+}
+
+async function deleteCached(row, button) {
+  const go = await confirmDialog(`Delete ${row.repo_id}?`,
+    `This removes the dataset from the shared cache at ${row.path}, freeing `
+    + `${bytes(row.size_bytes)}. Any run still pointing at it downloads it again first.`,
+    { confirmLabel: 'Delete from cache' });
+  if (!go || !view) return;
+  button.disabled = true;
+  try {
+    const result = await del(`/hub/datasets/local/${repoPath(row.repo_id)}`);
+    toast(`Deleted ${row.repo_id} — ${bytes(result.freed_bytes)} freed`, { level: 'ok' });
+    view.details.delete(row.repo_id);
+    await loadDatasets();
+  } catch (error) {
+    toast(error.message, { level: 'danger', title: 'Delete failed' });
+    button.disabled = false;
+  }
+}
+
+/* --- the Hub ------------------------------------------------------------- */
+
+function hubBrowser() {
+  const search = h('input', {
+    type: 'search', placeholder: 'Search HuggingFace datasets…', value: view.hub.q,
+  });
+  const debounced = debounce(() => searchHub(search.value.trim()), 320);
+  search.addEventListener('input', debounced);
+  search.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') searchHub(search.value.trim());
+  });
+
+  const sort = h('select', null,
+    SORTS.map(([value, text]) => h('option', { value }, text)));
+  sort.value = view.hub.sort;
+  sort.addEventListener('change', () => {
+    view.hub.sort = sort.value;
+    searchHub(search.value.trim());
+  });
+
+  return h('div', { class: 'ft-hub' },
+    h('h3', { class: 'ft-sub' }, 'HuggingFace Hub'),
+    h('div', { class: 'row wrap' }, search, sort),
+    view.refs.hubResults);
+}
+
+async function searchHub(q) {
+  if (!view) return; // a debounced keystroke can land after the tab was left
+  const seq = ++view.hub.seq;
+  view.hub.q = q;
+  mount(view.refs.hubResults,
+    h('div', { class: 'row', style: { padding: '14px 2px' } }, spinner(), 'Searching the Hub…'));
+  const params = new URLSearchParams({ q, sort: view.hub.sort, limit: '25' });
+  try {
+    const payload = await get(`/hub/datasets/search?${params}`);
+    if (!view || seq !== view.hub.seq) return; // a newer keystroke already won
+    view.hub.results = payload.results || [];
+  } catch (error) {
+    if (!view || seq !== view.hub.seq) return;
+    mount(view.refs.hubResults, notice('danger', error.message));
+    return;
+  }
+  renderHubResults();
+}
+
+function renderHubResults() {
+  if (!view.refs.hubResults || view.hub.results === null) return;
+  const cached = new Set((view.datasets.cached || []).map((row) => row.repo_id));
+  mount(view.refs.hubResults, view.hub.results.length
+    ? view.hub.results.map((row) => hubRow(row, cached.has(row.id)))
+    : empty('No datasets matched', 'The Hub matches on the id, so try a shorter query.'));
+}
+
+function hubRow(row, isCached) {
+  return h('div', { class: 'result' },
+    h('div', { class: 'r-main' },
+      h('div', { class: 'row wrap' },
+        h('span', { class: 'r-id' }, row.id),
+        isCached ? badge('succeeded', 'in cache') : null,
+        row.gated ? badge('starting', 'gated') : null,
+        row.private ? badge('info', 'private') : null),
+      h('div', { class: 'r-meta' },
+        h('span', null, row.author || '—'),
+        h('span', null, `${count(row.downloads)} downloads`),
+        h('span', null, `${count(row.likes)} likes`),
+        h('span', { title: when(row.updated) }, `updated ${ago(row.updated)}`)),
+      (row.tags || []).length
+        ? h('div', { class: 'row wrap ft-tags' },
+          row.tags.slice(0, 6).map((tag) => h('span', { class: 'tag' }, tag)))
+        : null),
+    h('div', { class: 'r-actions' },
+      h('button', { class: 'btn-sm', onClick: () => openDetail(row.id) }, 'Details'),
+      isCached
+        ? h('button', {
+          class: 'btn-sm btn-primary', onClick: () => selectDataset('hub', row.id),
+        }, 'Use')
+        : null,
+      h('button', {
+        class: isCached ? 'btn-sm' : 'btn-sm btn-primary',
+        onClick: () => pullDataset(row.id),
+      }, 'Pull')));
+}
+
+/* --- dataset detail ------------------------------------------------------ */
+
+async function loadDetail(repoId) {
+  const known = view?.details.get(repoId);
+  if (known) return known;
+  const detail = await get(`/hub/datasets/${repoPath(repoId)}`);
+  view?.details.set(repoId, detail);
+  return detail;
+}
+
+async function openDetail(repoId) {
+  const body = h('div', null, h('div', { class: 'row' }, spinner(), 'Reading the dataset…'));
+  const actions = h('div', { class: 'row' });
+  const control = modal(repoId, body, { wide: true, actions: [actions] });
+
+  let detail;
+  try {
+    detail = await loadDetail(repoId);
+  } catch (error) {
+    mount(body, notice('danger', error.message));
+    return;
+  }
+  mount(body, detailBody(detail));
+
+  const complete = (detail.estimate?.fetch_bytes ?? 1) === 0;
+  mount(actions,
+    h('button', {
+      onClick: () => { control.close(); selectDataset('hub', repoId); },
+    }, 'Train on this'),
+    h('button', {
+      class: 'btn-primary',
+      onClick: () => { control.close(); pullDataset(repoId, detail); },
+    }, complete ? 'Re-check and pull' : 'Pull'));
+}
+
+function detailBody(detail) {
+  const estimate = detail.estimate || {};
+  const training = detail.training || {};
+  const columns = detail.columns || [];
+  const splits = detail.splits || [];
+  const rows = (detail.sample_rows || []).slice(0, 3);
+  const facts = [
+    ['Configs', (detail.configs || []).join(', ') || 'a single unnamed config'],
+    ['Splits', splits.length
+      ? splits.map((entry) => `${entry.config}/${entry.split}`).join(', ')
+      : 'the datasets server has not converted this repo'],
+    ['Popularity', `${count(detail.downloads)} downloads · ${count(detail.likes)} likes`],
+    ['Updated', when(detail.updated)],
+    ['Revision', `${detail.revision} @ ${(detail.sha || '').slice(0, 12) || '—'}`],
+  ];
+
+  return [
+    training.note
+      ? notice(LEVEL[training.level] || 'info',
+        h('strong', null, training.field
+          ? `Trainable: ${training.format} in '${training.field}'. `
+          : 'Not trainable as it stands. '),
+        h('span', null, training.note))
+      : null,
+    h('div', { class: 'grid cols-3', style: { margin: '12px 0' } },
+      stat('Download size', bytes(detail.total_bytes || 0), `${estimate.files_total || 0} files`),
+      stat('Already cached', bytes(estimate.cached_bytes || 0),
+        `${estimate.files_cached || 0} of ${estimate.files_total || 0} files`),
+      stat('To fetch', bytes(estimate.fetch_bytes || 0),
+        estimate.fetch_bytes ? 'over the network' : 'nothing to do')),
+    h('dl', { class: 'ft-kv' },
+      facts.map(([key, value]) => [h('dt', null, key), h('dd', null, value)])),
+    detail.tags?.length
+      ? h('div', { class: 'row wrap ft-tags' },
+        detail.tags.map((tag) => h('span', { class: 'tag' }, tag)))
+      : null,
+    h('h4', { class: 'ft-sub' }, `Columns (${columns.length})`),
+    columns.length
+      ? h('div', { class: 'table-wrap' },
+        h('table', null,
+          h('tbody', null, columns.map((column) => h('tr', null,
+            h('td', { class: 'mono' }, column.name),
+            h('td', { class: 'faint mono' }, column.type || '—'),
+            h('td', { class: 'right' },
+              column.name === training.field ? badge('succeeded', 'trains on this') : null))))))
+      : h('p', { class: 'help' }, 'No parsed schema, so the columns are unknown until the '
+        + 'dataset is pulled and opened by hand.'),
+    rows.length
+      ? [
+        h('h4', { class: 'ft-sub' }, `Sample rows (${rows.length})`),
+        h('div', { class: 'ft-preview' }, rows.map(sampleRow)),
+      ]
+      : null,
+    h('h4', { class: 'ft-sub' }, `Files (${(detail.files || []).length})`),
+    h('div', { class: 'ft-files' },
+      h('table', null,
+        h('tbody', null, (detail.files || []).map((file) => h('tr', null,
+          h('td', { class: 'mono' }, file.path),
+          h('td', { class: 'num' }, bytes(file.size))))))),
+  ];
+}
+
+function sampleRow(row, index) {
+  return h('div', { class: 'ft-row' },
+    h('div', { class: 'faint small' }, `row ${index + 1}`),
+    Object.entries(row).map(([key, value]) => h('div', null,
+      h('span', { class: 'ft-key' }, `${key}: `),
+      h('span', null, cell(value)))));
+}
+
+/* A sample row arrives as real JSON, so a chat column is an array of objects
+   and String() on it reads "[object Object]". */
+function cell(value) {
+  const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? '');
+  return text.length > 240 ? `${text.slice(0, 240)}…` : text;
+}
+
+/* --- pulling ------------------------------------------------------------- */
+
+const speed = (value) => (Number.isFinite(value) && value > 0 ? `${bytes(value)}/s` : '—');
+
+async function pullDataset(repoId, known = null) {
+  let detail = known;
+  if (!detail) {
+    try {
+      detail = await loadDetail(repoId);
+    } catch (error) {
+      toast(error.message, { level: 'danger', title: 'Could not price the pull' });
+      return;
+    }
+  }
+  const estimate = detail.estimate || {};
+  const free = view?.ctx.telemetry()?.disk?.free_bytes ?? null;
+  const tooBig = free !== null && (estimate.fetch_bytes || 0) > free;
+  const lines = [
+    `${bytes(estimate.fetch_bytes || 0)} to fetch of ${bytes(detail.total_bytes || 0)} `
+    + `(${bytes(estimate.cached_bytes || 0)} already cached).`,
+  ];
+  if (free !== null) lines.push(`Disk free: ${bytes(free)}.`);
+  if (tooBig) {
+    lines.push('That does not fit — the pull dies part-way and leaves partial blobs behind.');
+  }
+
+  const go = await confirmDialog(`Pull ${repoId}?`, lines.join(' '),
+    { danger: tooBig, confirmLabel: tooBig ? 'Pull anyway' : 'Pull' });
+  if (!go || !view) return;
+
+  try {
+    const { job_id: jobId } = await post('/hub/datasets/download', { repo_id: repoId });
+    attachPull(jobId, repoId, estimate.fetch_bytes || 0);
+    toast(`Pulling ${repoId} — job ${jobId}`, { level: 'ok' });
+  } catch (error) {
+    const level = error instanceof ApiError && error.status === 409 ? 'warn' : 'danger';
+    toast(error.message, { level, title: 'Pull not started' });
+  }
+}
+
+function pullCard(jobId, repoId) {
+  const bar = h('span', { style: { width: '0%' } });
+  const nums = h('div', { class: 'dl-nums' });
+  const transient = h('div', { class: 'ft-transient' });
+  const status = badge('pending', 'pending');
+  const log = logBox([]);
+  const cancel = h('button', { class: 'btn-sm btn-danger' }, 'Cancel');
+  cancel.addEventListener('click', async () => {
+    cancel.disabled = true;
+    try {
+      await post(`/jobs/${jobId}/cancel`);
+    } catch (error) {
+      toast(error.message, { level: 'danger' });
+      cancel.disabled = false;
+    }
+  });
+
+  const node = h('div', { class: 'ft-dl' },
+    h('div', { class: 'dl-head' },
+      h('span', { class: 'dl-id truncate' }, repoId),
+      status,
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'faint small mono' }, jobId),
+      cancel),
+    h('div', { class: 'progress' }, bar),
+    nums,
+    transient,
+    h('details', { class: 'collapse' }, h('summary', null, 'Log'), log));
+
+  return { node, bar, nums, transient, status, log, cancel };
+}
+
+function applyPullProgress(card, progress) {
+  const percent = Number(progress.percent);
+  if (Number.isFinite(percent)) card.bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  mount(card.nums,
+    h('span', null, 'phase ', h('b', null, progress.phase || '—')),
+    h('span', null, h('b', null, Number.isFinite(percent) ? `${percent.toFixed(1)}%` : '—')),
+    h('span', null, h('b', null, bytes(progress.downloaded_bytes || 0)),
+      ` / ${bytes(progress.total_bytes || 0)}`),
+    h('span', null, h('b', null, `${progress.files_done ?? 0}/${progress.files_total ?? 0}`),
+      ' files'),
+    h('span', null, speed(progress.speed_bps)),
+    progress.eta ? h('span', null, `ETA ${duration(progress.eta)}`) : null);
+}
+
+function attachPull(jobId, repoId, plannedBytes = 0) {
+  if (view.pulls.has(jobId)) return;
+  const card = pullCard(jobId, repoId);
+  const entry = { card, close: null };
+  view.pulls.set(jobId, entry);
+  renderPulls();
+  if (plannedBytes) applyPullProgress(card, { phase: 'starting', total_bytes: plannedBytes });
+
+  const finish = (jobStatus) => {
+    if (!view) return;
+    card.status.className = `badge ${jobStatus}`;
+    mount(card.status, jobStatus);
+    card.cancel.remove();
+    entry.close?.();
+    entry.close = null;
+    // Whatever landed just invalidated the cached estimate for this repo.
+    view.details.delete(repoId);
+    loadDatasets();
+    toast(`${repoId}: pull ${jobStatus}`, { level: jobStatus === 'succeeded' ? 'ok' : 'warn' });
+  };
+
+  entry.close = stream(`/jobs/${jobId}/stream`, {
+    log: (payload) => card.log.append(payload.line),
+    // The parsed dict from the download parser. The marker lines it reads are
+    // kept out of the log broadcast, so this is what moves the bar.
+    progress: (payload) => {
+      const progress = payload?.progress;
+      if (progress && Object.keys(progress).length) applyPullProgress(card, progress);
+    },
+    // A redraw of one line rather than a new one; appending would bury the log
+    // under thousands of near-identical rows.
+    'progress-line': (payload) => { card.transient.textContent = payload?.line ?? ''; },
+    status: (payload) => {
+      card.status.className = `badge ${payload?.status || 'pending'}`;
+      mount(card.status, payload?.status || 'pending');
+      if (payload?.progress && Object.keys(payload.progress).length) {
+        applyPullProgress(card, payload.progress);
+      }
+    },
+    end: (payload) => {
+      const job = payload?.job;
+      if (job?.progress && Object.keys(job.progress).length) applyPullProgress(card, job.progress);
+      finish(payload?.status || 'succeeded');
+    },
+  });
+}
+
+function renderPulls() {
+  if (!view.refs.pulls) return;
+  const cards = [...view.pulls.values()].map((entry) => entry.card.node);
+  mount(view.refs.pulls, cards.length
+    ? h('div', { class: 'ft-pulls' },
+      h('div', { class: 'row' },
+        h('span', { class: 'faint small' }, `${cards.length} pulls in this session`),
+        h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'btn-sm btn-ghost',
+          onClick: () => {
+            for (const [jobId, entry] of [...view.pulls]) {
+              if (!entry.close) view.pulls.delete(jobId); // finished ones only
+            }
+            renderPulls();
+          },
+        }, 'Clear finished')),
+      cards)
+    : null);
+}
+
+/** A pull outlives the tab it was started from, so reattach to the ones still
+ *  running instead of leaving them invisible until they finish. */
+async function adoptPulls() {
+  try {
+    const { jobs } = await get('/jobs?kind=download&limit=20');
+    if (!view) return;
+    for (const job of jobs) {
+      const meta = (job.spec || {}).meta || {};
+      if (meta.repo_type !== 'dataset') continue;
+      if (['succeeded', 'failed', 'cancelled'].includes(job.status)) continue;
+      attachPull(job.id, meta.repo_id || job.title);
+    }
+  } catch {
+    // The Jobs tab is where an unreadable job list gets reported properly.
+  }
 }
 
 /* --- pre-flight ---------------------------------------------------------- */
@@ -927,4 +1478,40 @@ const CSS = `
 .ft-chart .ft-line { fill: none; stroke: var(--accent); stroke-width: 2; }
 .ft-chart .ft-area { fill: var(--accent); opacity: .12; stroke: none; }
 .ft-chart .ft-last { fill: var(--accent); stroke: var(--panel); stroke-width: 2; }
+
+.ft-sub { margin: 18px 0 8px; font-size: 12px; font-weight: 620; color: var(--text-dim); }
+.ft-group { margin-bottom: 12px; }
+.ft-group-head {
+  display: flex; gap: 8px; margin-bottom: 5px; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint);
+}
+.ft-list { border: 1px solid var(--border); border-radius: var(--radius-s); }
+.ft-list .result { padding: 8px 11px; }
+.ft-list .result.ft-chosen { background: var(--accent-dim); }
+.ft-hub input[type="search"] { flex: 1; min-width: 190px; }
+.ft-hub select { width: auto; }
+.ft-tags { gap: 5px; margin-top: 6px; }
+.ft-pulls { margin: 12px 0; }
+.ft-dl {
+  border: 1px solid var(--border); border-radius: var(--radius-s);
+  padding: 10px 12px; margin-top: 8px;
+}
+.ft-dl .dl-head { display: flex; align-items: center; gap: 9px; margin-bottom: 7px; }
+.ft-dl .dl-id { font-family: var(--mono); font-size: 12.5px; font-weight: 560; }
+.ft-dl .dl-nums {
+  display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px;
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.ft-dl .dl-nums b { color: var(--text); font-weight: 600; }
+.ft-dl .logbox { max-height: 200px; margin-top: 8px; }
+.ft-kv {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 16px; margin: 0; font-size: 12.5px;
+}
+.ft-kv dt { color: var(--text-faint); }
+.ft-kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.ft-files {
+  max-height: 220px; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-s);
+}
 `;

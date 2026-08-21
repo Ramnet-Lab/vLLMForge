@@ -418,6 +418,24 @@ async def _datasets_server(path: str, params: dict) -> dict:
         return {}
 
 
+def _feature_type(value: Any) -> str:
+    """A readable name for a datasets-server feature type.
+
+    A scalar column is a dict — {"dtype": "string", "_type": "Value"} — but a
+    conversational column is a *list* of struct definitions, which is exactly
+    the shape that matters most here: `messages` is the column a chat fine-tune
+    trains on. Assuming a dict broke every conversational dataset.
+    """
+    if isinstance(value, dict):
+        return str(value.get("dtype") or value.get("_type") or "")
+    if isinstance(value, list):
+        inner = _feature_type(value[0]) if value else ""
+        if not inner and value and isinstance(value[0], dict):
+            inner = "struct{" + ", ".join(sorted(value[0])) + "}"
+        return f"list<{inner}>" if inner else "list"
+    return str(value or "")
+
+
 def _training_shape(columns: list[dict]) -> dict:
     """Whether the fine-tuning worker could read this, and via which column.
 
@@ -475,8 +493,7 @@ async def dataset_detail(repo_id: str, revision: str = "main") -> dict:
             {"dataset": repo_id, "config": first["config"], "split": first["split"]},
         )
         columns = [
-            {"name": f.get("name"), "type": ((f.get("type") or {}).get("dtype")
-                                             or (f.get("type") or {}).get("_type") or "")}
+            {"name": f.get("name"), "type": _feature_type(f.get("type"))}
             for f in (preview.get("features") or [])
         ]
         rows = [item.get("row") or {} for item in (preview.get("rows") or [])][:3]
