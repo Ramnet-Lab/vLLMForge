@@ -186,17 +186,28 @@ class JobManager:
         parser = _parsers.get(kind)
         progress: dict[str, Any] = (self.get(job_id) or {}).get("progress") or {}
         last_publish = 0.0
+        last_transient_write = 0.0
         try:
-            async for raw in docker_ctl.stream_logs(container, tail="all"):
-                line = split_carriage(raw)
+            async for line, transient in docker_ctl.stream_logs(container, tail="all"):
                 if not line.strip():
                     continue
-                self._append(job_id, line)
+                now = time.monotonic()
+                if transient:
+                    # A live progress bar: show it, but only checkpoint it to the
+                    # log file occasionally so a long download does not write a
+                    # megabyte of redraws.
+                    events.broker.publish_soon(
+                        events.job_topic(job_id), {"type": "progress-line", "line": line}
+                    )
+                    if now - last_transient_write > 5.0:
+                        last_transient_write = now
+                        self._write(job_id, line)
+                else:
+                    self._append(job_id, line)
                 if parser:
                     update = parser(line, progress)
                     if update:
                         progress.update(update)
-                        now = time.monotonic()
                         if now - last_publish > 0.4:
                             last_publish = now
                             self._update(job_id, progress=progress)
@@ -247,10 +258,13 @@ class JobManager:
 
     # --- logs -----------------------------------------------------------
 
-    def _append(self, job_id: str, line: str) -> None:
-        path = db.log_path(job_id)
-        with path.open("a", encoding="utf-8") as handle:
+    @staticmethod
+    def _write(job_id: str, line: str) -> None:
+        with db.log_path(job_id).open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+    def _append(self, job_id: str, line: str) -> None:
+        self._write(job_id, line)
         events.broker.publish_soon(events.job_topic(job_id), {"type": "log", "line": line})
 
     @staticmethod

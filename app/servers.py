@@ -349,6 +349,11 @@ async def status_all() -> dict:
         }
         if entry["status"] in ("running", "starting", "unhealthy"):
             entry["health"] = await probe(int(server["port"]))
+            # vLLM does not bind its port until the weights are loaded and CUDA
+            # graphs are captured, which on a 27B model is minutes. A refused
+            # connection therefore means "still loading", not "broken".
+            if entry["status"] == "running" and not entry["health"]["reachable"]:
+                entry["status"] = "loading"
         else:
             entry["health"] = {"reachable": False, "healthy": False, "models": []}
         return entry

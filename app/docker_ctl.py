@@ -263,14 +263,25 @@ async def logs(name: str, *, tail: int | str = 400) -> str:
 
 
 async def stream_logs(
-    name: str, *, tail: int | str = 200, since: str | None = None
-) -> AsyncIterator[str]:
-    """Follow a container's output, yielding decoded lines until it exits.
+    name: str,
+    *,
+    tail: int | str = 200,
+    since: str | None = None,
+    progress_interval: float = 0.4,
+) -> AsyncIterator[tuple[str, bool]]:
+    """Follow a container's output as (text, transient) pairs.
 
-    docker interleaves the container's stdout and stderr on our stdout/stderr,
-    and vLLM logs to stderr, so both pipes are drained concurrently into one
-    queue. Lines arrive in the order they are read, which is what a log pane
-    wants.
+    Reading with readline() is not an option here: vLLM, tqdm and huggingface_hub
+    all redraw progress with a bare carriage return and no newline, so a
+    line-oriented reader blocks for minutes on a single "line" that is really a
+    thousand redraws of the same bar. This reads raw chunks instead and splits
+    on both terminators. A segment ending in \r is *transient* — the latest
+    state of a progress bar — and is emitted at most every `progress_interval`
+    seconds so callers can show it without writing it to disk a thousand times.
+
+    stdout and stderr are drained concurrently into one queue; vLLM logs to
+    stderr and the container's own output goes to stdout, and a log pane wants
+    them interleaved in arrival order.
     """
     argv = [DOCKER, "logs", "-f", "--tail", str(tail)]
     if since:
@@ -279,20 +290,38 @@ async def stream_logs(
     proc = await asyncio.create_subprocess_exec(
         *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4096)
+    queue: asyncio.Queue[tuple[str, bool] | None] = asyncio.Queue(maxsize=8192)
 
     async def pump(stream: asyncio.StreamReader | None) -> None:
         if stream is None:
             return
+        buffer = ""
+        last_progress = 0.0
+        last_emitted = ""
         while True:
-            try:
-                raw = await stream.readline()
-            except (ValueError, asyncio.LimitOverrunError):
-                # A single absurdly long line (progress bars do this); skip it.
-                continue
-            if not raw:
-                return
-            await queue.put(raw.decode(errors="replace").rstrip("\n"))
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            buffer += chunk.decode(errors="replace")
+            # Complete records end in \n; everything before the final newline is
+            # settled output, with \r-redraws inside collapsed to their last state.
+            while "\n" in buffer:
+                record, buffer = buffer.split("\n", 1)
+                text = record.split("\r")[-1].rstrip()
+                if text:
+                    await queue.put((text, False))
+                    last_emitted = ""
+            # What is left is a partial line — usually a live progress bar.
+            if "\r" in buffer:
+                partial = buffer.split("\r")[-1].rstrip()
+                now = asyncio.get_running_loop().time()
+                if partial and partial != last_emitted and now - last_progress >= progress_interval:
+                    last_progress = now
+                    last_emitted = partial
+                    await queue.put((partial, True))
+        leftover = buffer.split("\r")[-1].rstrip()
+        if leftover:
+            await queue.put((leftover, False))
 
     pumps = [asyncio.create_task(pump(proc.stdout)), asyncio.create_task(pump(proc.stderr))]
 
@@ -303,10 +332,10 @@ async def stream_logs(
     closing = asyncio.create_task(closer())
     try:
         while True:
-            line = await queue.get()
-            if line is None:
+            item = await queue.get()
+            if item is None:
                 break
-            yield line
+            yield item
     finally:
         for task in (*pumps, closing):
             task.cancel()

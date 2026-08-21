@@ -73,6 +73,28 @@ CREATE TABLE IF NOT EXISTS presets (
     UNIQUE (kind, name)
 );
 
+CREATE TABLE IF NOT EXISTS datasets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    source      TEXT NOT NULL,          -- 'hub' | 'upload'
+    reference   TEXT NOT NULL,          -- hub id, or host path for uploads
+    format      TEXT NOT NULL DEFAULT '',
+    rows        INTEGER,
+    size_bytes  INTEGER,
+    preview     TEXT NOT NULL DEFAULT '[]',
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recipes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,           -- 'finetune' | 'heretic'
+    name       TEXT NOT NULL,
+    data       TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (kind, name)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
