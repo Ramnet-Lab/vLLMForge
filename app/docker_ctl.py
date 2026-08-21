@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,7 +164,7 @@ async def run_capture(
 ) -> tuple[int, str, str]:
     """Run a throwaway container and collect its output."""
     argv = build_run_argv(
-        name=name or f"llmd-tmp-{id(command) & 0xFFFFFF:x}",
+        name=name or f"llmd-tmp-{uuid.uuid4().hex[:10]}",
         image=image,
         command=command,
         detach=False,

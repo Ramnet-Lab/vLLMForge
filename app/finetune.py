@@ -444,8 +444,7 @@ async def check_memory(config: FinetuneConfig) -> dict:
                 f"Refusing to start: {params_b:g}B {basis} plus activations for "
                 f"{config.per_device_train_batch_size}x{config.max_seq_length} tokens needs about "
                 f"{_gib(need)}, and only {_gib(budget.available_bytes)} is free. "
-                f"Stop a vLLM server ({tenants}) or drop to 4-bit, a smaller model, "
-                "a shorter max_seq_length or batch size 1."
+                f"Stop a vLLM server ({tenants}) or try {_cheaper(config)}."
             ),
             budget=payload,
             requested_bytes=need,
@@ -478,6 +477,21 @@ async def check_memory(config: FinetuneConfig) -> dict:
         requested_bytes=need,
         requested_util=util,
     ).as_dict()
+
+
+def _cheaper(config: FinetuneConfig) -> str:
+    """The levers that are actually still available on this config."""
+    options = []
+    if config.full_finetuning:
+        options.append("a LoRA instead of full fine-tuning")
+    if not config.load_in_4bit:
+        options.append("load_in_4bit")
+    if config.per_device_train_batch_size > 1:
+        options.append("batch size 1")
+    if config.max_seq_length > 1024:
+        options.append("a shorter max_seq_length")
+    options.append("a smaller model")
+    return ", ".join(options[:-1]) + f" or {options[-1]}" if len(options) > 1 else options[0]
 
 
 def _gib(value: float) -> str:

@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import db, docker_ctl, events, jobs, memguard, telemetry
+from app import db, docker_ctl, events, jobs, memguard, servers as server_service, telemetry
 from app.config import settings
 from app.routers import chat, finetune, heretic, hub, jobs as jobs_router, servers, system
 
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     BACKGROUND.append(asyncio.create_task(telemetry_loop(), name="telemetry"))
     if settings.memguard_enabled:
         BACKGROUND.append(asyncio.create_task(memguard.watch(), name="memguard"))
-    await servers.autostart()
+    await server_service.autostart()
 
     try:
         yield

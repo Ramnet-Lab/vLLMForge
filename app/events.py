@@ -20,6 +20,9 @@ class Broker:
         self._topics: dict[str, set[asyncio.Queue]] = {}
         self._maxsize = maxsize
         self._lock = asyncio.Lock()
+        # asyncio only holds a weak reference to a running task, so a fire-and-
+        # forget publish can be collected before it delivers.
+        self._pending: set[asyncio.Task] = set()
 
     async def publish(self, topic: str, payload: Any) -> None:
         for queue in list(self._topics.get(topic, ())):
@@ -40,7 +43,9 @@ class Broker:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self.publish(topic, payload))
+        task = loop.create_task(self.publish(topic, payload))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     async def subscribe(self, topic: str) -> AsyncIterator[Any]:
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._maxsize)

@@ -296,7 +296,11 @@ def _compatibility(detail: dict, available_bytes: int) -> dict:
         quant.get("quant_method") or quant.get("format") or config["torch_dtype"],
         f"{config['max_position_embeddings']:,} ctx" if config["max_position_embeddings"] else "",
     ]
-    head = ", ".join(part for part in parts if part) or "unknown architecture"
+    head = ", ".join(part for part in parts if part)
+    if not head:
+        # A gated repo's metadata is public but its config.json is not, so
+        # there is genuinely nothing to check until the token is approved.
+        head = "config.json is not readable yet" if detail["gated"] else "unknown architecture"
     weights = _gib(detail["total_bytes"])
 
     level = "ok"
