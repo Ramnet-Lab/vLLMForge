@@ -333,13 +333,11 @@ a pull, because a gated repo's metadata and file list are readable anonymously
 and only the actual download fails, with a 401. Request access on the model's
 Hub page, then give the dashboard a token that has it: `LLMD_HF_TOKEN` (or
 `HF_TOKEN`) in the environment, or stored from the Models tab, which keeps it in
-the database instead. The two are not equivalent. A stored token is used for Hub
-search and for download jobs; only a token in the environment is passed into
-server, fine-tuning and Heretic containers. So a stored token is enough to
-*pull* a gated model into the cache, from where anything can serve it, but a
-server pointed straight at a gated repo it has not cached needs the environment
-variable. A repo that returns "not accessible with this token" may equally be
-private or nonexistent — the Hub does not distinguish, by design.
+the database instead. Either way it reaches everything — Hub search, download
+jobs, and the server, fine-tuning and Heretic containers alike — with the
+environment winning if both are set. A repo that returns "not accessible with
+this token" may equally be private or nonexistent; the Hub does not
+distinguish, by design.
 
 **A model that needs `trust_remote_code`.** For serving, it is a checkbox in the
 Serve form's model section (`--trust-remote-code`); nothing else is needed. For

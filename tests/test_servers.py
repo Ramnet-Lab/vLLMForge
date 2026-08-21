@@ -93,3 +93,17 @@ def test_a_job_s_output_path_is_translated_for_the_container():
     # A path the server container does not mount is left alone rather than
     # silently rewritten into something that does not exist.
     assert servers.container_path(Path("/home/user/models/hf-cache")) == "/home/user/models/hf-cache"
+
+
+def test_a_token_stored_from_the_ui_reaches_server_containers():
+    # A stored token that authenticated a download but not a server launched
+    # from the same UI is a difference nobody could predict.
+    from app import db, hf
+
+    previous = db.get_setting("hf_token", "")
+    try:
+        db.set_setting("hf_token", "hf_probe")
+        assert hf.token() == "hf_probe"
+        assert servers.build_env({"args": {}, "env": {}})["HF_TOKEN"] == "hf_probe"
+    finally:
+        db.set_setting("hf_token", previous)

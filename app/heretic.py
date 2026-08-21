@@ -37,7 +37,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
-from app import docker_ctl, events, jobs, safety
+from app import docker_ctl, events, hf, jobs, safety
 from app.config import settings
 
 # Container-side layout. The host job directory is bind-mounted at /job, which
@@ -270,8 +270,9 @@ def build_job(cfg: HereticSettings) -> jobs.JobSpec:
     nv_cache.mkdir(parents=True, exist_ok=True)
 
     env = {"HF_HOME": "/hf"}
-    if settings.hf_token:
-        env["HF_TOKEN"] = settings.hf_token
+    hf_token = hf.token()
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
 
     return jobs.JobSpec(
         kind="heretic",

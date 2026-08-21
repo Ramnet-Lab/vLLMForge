@@ -61,10 +61,21 @@ class HubError(RuntimeError):
 
 # --- plumbing -----------------------------------------------------------
 
-async def stored_token() -> str:
+def token() -> str:
+    """The token to hand anything that talks to the Hub.
+
+    The environment wins over the one stored from the Models tab, but both reach
+    every container the dashboard launches. Letting a stored token authenticate
+    a download while a server launched from the same UI went out anonymous was a
+    difference nobody could be expected to predict.
+    """
     if settings.hf_token:
         return settings.hf_token
-    return await asyncio.to_thread(db.get_setting, "hf_token", "") or ""
+    return db.get_setting("hf_token", "") or ""
+
+
+async def stored_token() -> str:
+    return await asyncio.to_thread(token)
 
 
 def token_source() -> str:

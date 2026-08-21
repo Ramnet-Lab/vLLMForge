@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app import db, docker_ctl, events, jobs, safety, servers
+from app import db, docker_ctl, events, hf, jobs, safety, servers
 from app.config import settings
 
 log = logging.getLogger("llmd.finetune")
@@ -289,8 +289,9 @@ def build_job(config: FinetuneConfig) -> jobs.JobSpec:
     (run_dir / "config.json").write_text(json.dumps(payload, indent=2))
 
     env = {"HF_HOME": "/hf", "PYTHONUNBUFFERED": "1"}
-    if settings.hf_token:
-        env["HF_TOKEN"] = settings.hf_token
+    hf_token = hf.token()
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
 
     return jobs.JobSpec(
         kind=KIND,

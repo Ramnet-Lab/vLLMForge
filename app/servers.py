@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from app import db, docker_ctl, events, safety, vllm_spec
+from app import db, docker_ctl, events, hf, safety, vllm_spec
 from app.config import settings
 
 JSON_FIELDS = ("args", "env")
@@ -138,8 +138,9 @@ def build_command(server: dict) -> list[str]:
 
 def build_env(server: dict) -> dict[str, str]:
     env = {"HF_HOME": "/hf", **settings.nccl_env()}
-    if settings.hf_token:
-        env["HF_TOKEN"] = settings.hf_token
+    hf_token = hf.token()
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
     env.update({str(k): str(v) for k, v in (server.get("env") or {}).items()})
     if (server.get("args") or {}).get("enable_lora"):
         env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
