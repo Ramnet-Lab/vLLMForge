@@ -688,7 +688,8 @@ async function serve(job, payload) {
   const { ctx } = view;
   try {
     const result = await post(`/finetune/jobs/${job.id}/serve`, payload);
-    modal('Server defined', h('div', { class: 'stack' },
+    let opened;
+    opened = modal('Server defined', h('div', { class: 'stack' },
       notice('ok',
         h('strong', null, `${result.server.name} `),
         h('span', null, `on port ${result.server.port}, serving `),
@@ -697,11 +698,11 @@ async function serve(job, payload) {
       h('p', { class: 'help' },
         'The definition is saved but nothing is running yet — start it from the Serve tab.')), {
       actions: [
-        h('button', { onClick: () => document.getElementById('modal').close() }, 'Stay here'),
+        h('button', { onClick: () => opened.close() }, 'Stay here'),
         h('button', {
           class: 'btn-primary',
           onClick: () => {
-            document.getElementById('modal').close();
+            opened.close();
             ctx.navigate('serve');
           },
         }, 'Open Serve'),

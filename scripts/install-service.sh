@@ -4,7 +4,7 @@
 #
 #   scripts/install-service.sh            install, enable and start
 #   scripts/install-service.sh --status   show what is installed and running
-#   scripts/install-service.sh --uninstall
+#   scripts/install-service.sh --uninstall  stop, disable and remove the unit
 
 set -euo pipefail
 
@@ -18,7 +18,20 @@ say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 fail() { printf '\n\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# The unit reads .env itself; the probe below has to agree with it about which
+# port it just told systemd to bind.
+if [ -f "$REPO/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$REPO/.env"
+    set +a
+fi
+
 case "${1:-install}" in
+    -h|--help)
+        sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
     --status)
         systemctl --user status "$UNIT_NAME" --no-pager || true
         exit 0
@@ -59,7 +72,7 @@ if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; t
 fi
 
 say "Waiting for it to answer"
-PORT="$("$PYTHON" -c 'from app.config import settings; print(settings.port)')"
+PORT="$(cd "$REPO" && "$PYTHON" -c 'from app.config import settings; print(settings.port)')"
 for _ in $(seq 1 30); do
     if curl -sf --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
         note "up on http://127.0.0.1:$PORT/"

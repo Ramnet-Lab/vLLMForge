@@ -147,15 +147,25 @@ export function toast(message, { level = 'ok', title = '', timeout = 5200 } = {}
 /* --- modal ------------------------------------------------------------- */
 
 export function modal(title, body, { actions = [], wide = false } = {}) {
-  const dialog = document.getElementById('modal');
-  const close = () => dialog.close();
+  // A dialog per call rather than one shared element: a confirm opened from
+  // inside an open modal used to replace its content, and closing the confirm
+  // tore down the modal underneath it too.
+  const dialog = h('dialog', { class: 'modal' });
+  if (wide) dialog.style.maxWidth = 'min(96vw, 1240px)';
+
+  const close = () => {
+    dialog.close();
+    dialog.remove();
+  };
+
   mount(dialog,
     h('div', { class: 'modal-head' },
       h('h2', null, title),
       h('button', { class: 'icon-btn', onClick: close, title: 'Close' }, '✕')),
     h('div', { class: 'modal-body' }, body),
     actions.length ? h('div', { class: 'modal-foot' }, actions) : null);
-  dialog.style.maxWidth = wide ? 'min(96vw, 1240px)' : '';
+
+  document.body.append(dialog);
   dialog.showModal();
   return { close, dialog };
 }

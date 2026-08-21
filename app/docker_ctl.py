@@ -171,10 +171,15 @@ async def run_capture(
         remove=True,
         **kwargs,
     )
+    container = argv[argv.index("--name") + 1]
     try:
         return await asyncio.wait_for(_run(argv, check=False), timeout=timeout)
     except TimeoutError:
-        raise DockerError(argv, -1, f"timed out after {timeout}s") from None
+        # Cancelling the waiter does not stop the container. Leaving one running
+        # after telling the caller it failed is how a root `rm -rf` of the model
+        # cache carries on after the request that started it has given up.
+        await remove(container, force=True)
+        raise DockerError(argv, -1, f"timed out after {timeout}s; container removed") from None
 
 
 async def inspect(name: str) -> dict | None:
@@ -364,8 +369,18 @@ async def build_image(
         *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
     assert proc.stdout is not None
-    async for raw in proc.stdout:
-        yield raw.decode(errors="replace").rstrip("\n")
+    try:
+        async for raw in proc.stdout:
+            yield raw.decode(errors="replace").rstrip("\n")
+    finally:
+        # A cancelled consumer closes this generator; without terminating the
+        # child, `docker build` carries on and the cancellation is a lie.
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except TimeoutError:
+                proc.kill()
     await proc.wait()
     if proc.returncode != 0:
         raise DockerError(argv, proc.returncode or -1, "build failed")

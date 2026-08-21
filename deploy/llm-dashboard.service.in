@@ -19,10 +19,15 @@ EnvironmentFile=-@REPO@/.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=@PYTHON@ -m app.main
 
-# The dashboard never owns a container's lifetime — everything it starts is
-# detached — so a restart here cannot interrupt a thirty-minute model load. It
-# re-adopts running jobs on startup.
-Restart=on-failure
+# always, not on-failure: a stray SIGTERM makes uvicorn exit 0, which
+# on-failure treats as a job well done and leaves the dashboard down. An
+# explicit `systemctl --user stop` is still respected — systemd distinguishes
+# that from the process going away on its own.
+#
+# Restarting is cheap because the dashboard never owns a container's lifetime:
+# everything it starts is detached, and it re-adopts running jobs and their logs
+# on startup, so this cannot interrupt a thirty-minute model load.
+Restart=always
 RestartSec=5
 TimeoutStopSec=30
 

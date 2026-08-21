@@ -232,8 +232,12 @@ def _render(arg: dict[str, Any], value: Any) -> list[str]:
     if widget == "list":
         if isinstance(value, str):
             items = [part for part in value.replace(",", " ").split() if part]
-        else:
+        elif isinstance(value, (list, tuple, set)):
             items = [str(v) for v in value]
+        else:
+            # A bare scalar for a list flag is what a hand-edited config looks
+            # like; one value is a perfectly good list of one.
+            items = [str(value)]
         return [flag, *items] if items else []
 
     if widget == "json":
@@ -283,15 +287,19 @@ def validate(params: dict[str, Any]) -> list[str]:
         if value is None or value == "":
             continue
         widget = arg["widget"]
-        if widget == "enum" and arg.get("choices") and str(value) not in arg["choices"]:
+        if widget == "list" and isinstance(value, dict):
+            problems.append(f"{arg['flag']}: expected a list or a value, not an object")
+        elif widget == "enum" and arg.get("choices") and str(value) not in arg["choices"]:
             problems.append(
                 f"{arg['flag']}: '{value}' is not one of {', '.join(arg['choices'][:12])}"
             )
         elif widget == "int":
-            try:
-                int(str(value).replace("k", "000").replace("M", "000000"))
-            except ValueError:
-                problems.append(f"{arg['flag']}: '{value}' is not an integer")
+            text = str(value).strip()
+            # vLLM accepts human sizes and, for several flags, 'auto'.
+            if text.lower() != "auto" and parse_size(text) is None:
+                problems.append(
+                    f"{arg['flag']}: '{value}' is not an integer or a size like 256k or 1M"
+                )
         elif widget == "float":
             try:
                 float(value)

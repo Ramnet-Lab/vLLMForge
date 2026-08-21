@@ -260,6 +260,9 @@ function resultRow(model, cached) {
 }
 
 function renderResults() {
+  const host = state.nodes.results;
+  // A search that lands after the tab was left has nothing to mount into.
+  if (!host) return;
   const cached = localIds();
   mount(state.nodes.results, state.results.length
     ? state.results.map((model) => resultRow(model, cached.has(model.id)))

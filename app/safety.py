@@ -24,6 +24,7 @@ the budget exactly like a managed one.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -313,7 +314,10 @@ async def check_launch(
     projected_bytes = budget.occupied_bytes + requested_bytes
     projected = projected_bytes / budget.total_bytes if budget.total_bytes else 0.0
     headroom_after = budget.total_bytes - projected_bytes
-    suggested = round(max(0.0, budget.free_util - 0.01), 2) or None
+    # Floor, never round: suggesting 0.06 when 0.057 is the ceiling hands the
+    # user a value the very next check refuses.
+    safe_now = math.floor(max(0.0, budget.free_util) * 100) / 100
+    suggested = safe_now or None
 
     if budget.tenants:
         tenants = ", ".join(

@@ -75,6 +75,30 @@ async def create(payload: ServerIn) -> dict:
     return await asyncio.to_thread(svc.create_server, payload.model_dump())
 
 
+# Declared before the /{server_id} routes: FastAPI matches in order, and
+# 'foreign' would otherwise be handed to the int path parameter and rejected.
+@router.get("/foreign/metrics")
+async def foreign_metrics(port: int) -> dict:
+    """Metrics for a vLLM container the dashboard does not manage."""
+    return await svc.metrics(port)
+
+
+@router.post("/foreign/{name}/stop")
+async def stop_foreign(name: str) -> dict:
+    """Stop a hand-launched vLLM container to free memory for a managed one."""
+    from app import docker_ctl
+
+    state = await docker_ctl.state(name)
+    if not state.exists:
+        raise HTTPException(404, "no such container")
+    from app import safety
+
+    if not safety.is_vllm_command(state.command):
+        raise HTTPException(400, "refusing to stop a container that is not running vLLM")
+    await docker_ctl.stop(name)
+    return {"stopped": True, "container": name}
+
+
 @router.get("/{server_id}")
 async def get(server_id: int) -> dict:
     server = await asyncio.to_thread(svc.get_server, server_id)
@@ -121,6 +145,9 @@ async def start(server_id: int, force: bool = False) -> dict:
     except KeyError:
         raise HTTPException(404, "no such server") from None
     if not result["started"]:
+        if result.get("error"):
+            # docker refused the launch itself — a bound port, a missing image.
+            raise HTTPException(502, detail={"message": result["error"], **result["safety"]})
         # 409: the request was well-formed, the host just cannot take it.
         raise HTTPException(409, detail=result["safety"])
     return result
@@ -158,25 +185,3 @@ async def metrics(server_id: int) -> dict:
     if server is None:
         raise HTTPException(404, "no such server")
     return await svc.metrics(int(server["port"]))
-
-
-@router.get("/foreign/metrics")
-async def foreign_metrics(port: int) -> dict:
-    """Metrics for a vLLM container the dashboard does not manage."""
-    return await svc.metrics(port)
-
-
-@router.post("/foreign/{name}/stop")
-async def stop_foreign(name: str) -> dict:
-    """Stop a hand-launched vLLM container to free memory for a managed one."""
-    from app import docker_ctl
-
-    state = await docker_ctl.state(name)
-    if not state.exists:
-        raise HTTPException(404, "no such container")
-    from app import safety
-
-    if not safety.is_vllm_command(state.command):
-        raise HTTPException(400, "refusing to stop a container that is not running vLLM")
-    await docker_ctl.stop(name)
-    return {"stopped": True, "container": name}

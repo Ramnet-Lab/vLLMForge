@@ -58,6 +58,9 @@ async function activate(tab, { replace = false } = {}) {
     await module.render(container, ctx());
   } catch (error) {
     console.error(error);
+    // The user may have moved on while this view was loading; painting its
+    // error over whatever is on screen now would be worse than losing it.
+    if (state.current !== tab.id) return;
     mount(container, notice('danger',
       h('strong', null, `The ${tab.label} view failed to load. `),
       h('span', null, String(error && error.message ? error.message : error))));

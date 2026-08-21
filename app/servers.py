@@ -210,15 +210,22 @@ async def start(server_id: int, *, force: bool = False) -> dict:
 
         await docker_ctl.remove(name, force=True)
         settings.output_dir.mkdir(parents=True, exist_ok=True)
-        await docker_ctl.run_detached(
-            name=name,
-            image=server.get("image") or settings.vllm_image,
-            command=build_command(server),
-            env=build_env(server),
-            mounts=_mounts(),
-            gpu=True,
-            network="host",
-        )
+        try:
+            await docker_ctl.run_detached(
+                name=name,
+                image=server.get("image") or settings.vllm_image,
+                command=build_command(server),
+                env=build_env(server),
+                mounts=_mounts(),
+                gpu=True,
+                network="host",
+            )
+        except docker_ctl.DockerError as exc:
+            # docker's own refusal is the useful message here — a port already
+            # bound, an image that is not present, a bad flag. Losing it to a
+            # bare 500 leaves the UI with nothing to show.
+            return {"started": False, "error": exc.stderr or str(exc),
+                    "safety": verdict.as_dict()}
     db.execute("UPDATE servers SET last_started_at = ? WHERE id = ?", (db.now(), server_id))
     await events.broker.publish(events.SERVERS, {"type": "started", "id": server_id})
     return {"started": True, "safety": verdict.as_dict(), "container": name}

@@ -503,7 +503,8 @@ async function serve(job) {
   try {
     const payload = await post(`/heretic/jobs/${job.id}/serve`);
     const safety = payload.safety || {};
-    modal('Server defined', h('div', { class: 'stack' },
+    let opened;
+    opened = modal('Server defined', h('div', { class: 'stack' },
       notice('ok',
         h('strong', null, `${payload.server.name} `),
         h('span', null, `on port ${payload.server.port}, serving `),
@@ -514,11 +515,11 @@ async function serve(job) {
         'The definition is saved but nothing is running yet — start it from the Serve tab once '
         + 'the memory picture suits you.')), {
       actions: [
-        h('button', { onClick: () => document.getElementById('modal').close() }, 'Stay here'),
+        h('button', { onClick: () => opened.close() }, 'Stay here'),
         h('button', {
           class: 'btn-primary',
           onClick: () => {
-            document.getElementById('modal').close();
+            opened.close();
             ctx.navigate('serve');
           },
         }, 'Open Serve'),

@@ -61,6 +61,12 @@ async def _candidates() -> list[tuple[str, float]]:
     return [(name, util) for name, util, _bytes in ranked]
 
 
+async def _restart_policy(name: str) -> str:
+    info = await docker_ctl.inspect(name)
+    policy = ((info or {}).get("HostConfig") or {}).get("RestartPolicy") or {}
+    return str(policy.get("Name") or "unknown")
+
+
 async def watch() -> None:
     threshold_bytes = settings.memguard_threshold_mib * MIB
     last_kill = 0.0
@@ -77,10 +83,20 @@ async def watch() -> None:
                         f"{settings.memguard_threshold_mib} MiB — killing {name} (util {util:g})"
                     )
                     log.warning(reason)
+                    # A container set to `unless-stopped` would come back and
+                    # re-reserve the memory just freed, so the policy has to go
+                    # — but it is the operator's setting, not ours, so record
+                    # what it was for whoever restarts the container.
+                    previous = await _restart_policy(name)
                     await docker_ctl.kill(name)
-                    # Stop it coming straight back and re-reserving the memory.
                     await docker_ctl.set_restart_policy(name, "no")
-                    entry = {"ts": time.time(), "container": name, "util": util, "reason": reason}
+                    entry = {
+                        "ts": time.time(),
+                        "container": name,
+                        "util": util,
+                        "previous_restart_policy": previous,
+                        "reason": reason,
+                    }
                     _history.append(entry)
                     del _history[:-50]
                     await events.broker.publish(

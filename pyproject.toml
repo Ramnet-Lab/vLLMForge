@@ -38,3 +38,6 @@ ignore = ["B008"]  # FastAPI's Depends()/Query() defaults are the idiom here
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# `python -m pytest` puts the repo on sys.path; the bare `pytest` entry point
+# does not, and app/ is not installed into the venv.
+pythonpath = ["."]

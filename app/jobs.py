@@ -349,10 +349,26 @@ class JobManager:
             return False
         self._cancelled.add(job_id)
         self._append(job_id, "[dashboard] cancel requested")
-        await docker_ctl.stop(row["container_name"], timeout=10)
+
+        state = await docker_ctl.state(row["container_name"] or "")
         task = self._tasks.get(job_id)
-        if task is None:
-            self._update(job_id, status=CANCELLED, finished_at=db.now())
+
+        if state.exists:
+            # A container-backed job ends when its container does; _follow then
+            # records the outcome.
+            await docker_ctl.stop(row["container_name"], timeout=10)
+            if task is None:
+                self._update(job_id, status=CANCELLED, finished_at=db.now())
+            return True
+
+        # An adopted job — an image build — has no container to stop. Stopping
+        # only the container reported success while the build ran on and the row
+        # later flipped to succeeded.
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._update(job_id, status=CANCELLED, finished_at=db.now())
         return True
 
     # --- logs -----------------------------------------------------------

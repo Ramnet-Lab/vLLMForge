@@ -105,3 +105,32 @@ async def test_reattach_resumes_from_where_the_log_stopped(orphan, monkeypatch):
     assert asked.get("since"), "reattach must resume from a cursor"
     assert asked.get("tail") == "all", "--since alone bounds it; --tail 0 drops the outage"
     await jobs.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_an_adopted_job_actually_stops_it(monkeypatch):
+    """An image build has no container to stop, so stopping one was a no-op
+    that reported success while the build carried on."""
+    job_id = jobs.manager.create(_spec("build"))
+    running = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work():
+        jobs.manager.begin(job_id)
+        running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def no_container(name):
+        return docker_ctl.ContainerState(name=name, exists=False)
+
+    monkeypatch.setattr(jobs.docker_ctl, "state", no_container)
+    jobs.manager.adopt(job_id, work())
+    await asyncio.wait_for(running.wait(), timeout=2)
+
+    assert await jobs.manager.cancel(job_id) is True
+    await asyncio.wait_for(cancelled.wait(), timeout=2)
+    assert jobs.manager.get(job_id)["status"] == jobs.CANCELLED

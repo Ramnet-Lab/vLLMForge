@@ -37,12 +37,15 @@ class FakeDocker:
     async def set_restart_policy(self, name, policy):
         self.restart_policies[name] = policy
 
+    async def inspect(self, name):
+        return {"HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}}}
+
 
 @pytest.fixture
 def fake(monkeypatch):
     def install(containers):
         stub = FakeDocker(containers)
-        for method in ("ps", "state", "kill", "set_restart_policy"):
+        for method in ("ps", "state", "kill", "set_restart_policy", "inspect"):
             monkeypatch.setattr(memguard.docker_ctl, method, getattr(stub, method))
         return stub
 
@@ -104,6 +107,8 @@ async def test_a_starved_host_loses_its_largest_engine_and_keeps_it_off(fake, mo
     # re-reserve the memory that was just freed.
     assert stub.restart_policies["vllm-big"] == "no"
     assert memguard.history()[-1]["container"] == "vllm-big"
+    # The operator's own policy is recorded, not silently discarded.
+    assert memguard.history()[-1]["previous_restart_policy"] == "unless-stopped"
 
 
 @pytest.mark.asyncio

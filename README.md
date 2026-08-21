@@ -163,9 +163,11 @@ scripts/memguard.sh --threshold-mib 12288
 ## Configuration
 
 Everything is an environment variable, read once at import. `.env` in the repo
-root is read and exported by all three scripts; the application itself reads
-only the process environment, so a value in `.env` affects a dashboard started
-through `scripts/run.sh` and not one started some other way.
+root is read by the systemd unit directly (`EnvironmentFile`) and exported by
+each of the scripts, so it applies whichever of the two supported ways you
+start the dashboard. The application itself reads only the process environment,
+so a `.env` value will not reach a process you launch by hand with
+`python -m app.main`.
 
 | Variable | Default | What it does |
 |---|---|---|
