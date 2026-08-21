@@ -121,6 +121,20 @@ class JobManager:
         row = self.get(job_id)
         if row:
             events.broker.publish_soon(events.JOBS, {"type": "job", "job": row})
+            # Also to the per-job topic. Without this, a client following one
+            # job blocks on a queue that only ever carried log lines: the
+            # status change that ends the job is published somewhere it is not
+            # listening, so the stream never closes and the pane never learns
+            # the run finished.
+            events.broker.publish_soon(
+                events.job_topic(job_id),
+                {
+                    "type": "progress",
+                    "status": row["status"],
+                    "progress": row.get("progress") or {},
+                    "job": row,
+                },
+            )
 
     # --- lifecycle ------------------------------------------------------
 

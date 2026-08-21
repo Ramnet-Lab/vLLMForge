@@ -134,10 +134,20 @@ if settings.web_dir.exists():
         # 404 that would actually explain the problem.
         if path == "api" or path.startswith("api/"):
             return JSONResponse({"detail": f"no such endpoint: /{path}"}, status_code=404)
-        candidate = settings.web_dir / path
-        if candidate.is_file():
+
+        # Joining a request path onto a directory is an arbitrary file read
+        # unless the result is checked: '../../etc/passwd' resolves cleanly and
+        # Path.is_file() is perfectly happy to confirm it. Anything that does
+        # not land inside web/ falls through to the shell.
+        root = settings.web_dir.resolve()
+        try:
+            candidate = (root / path).resolve()
+            inside = candidate == root or root in candidate.parents
+        except (OSError, ValueError):
+            inside = False
+        if inside and candidate.is_file():
             return FileResponse(candidate)
-        return FileResponse(settings.web_dir / "index.html")
+        return FileResponse(root / "index.html")
 
 
 def main() -> None:

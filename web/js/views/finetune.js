@@ -803,7 +803,11 @@ function updateRun(job) {
       Number.isFinite(progress.train_runtime) ? `ran ${duration(progress.train_runtime)}` : ''));
 
   mount(refs.runChart, sparkline(history));
-  mount(refs.runResult, result(progress.result));
+  // The manager lifts the worker's closing @@RESULT@@ payload onto the job
+  // row; older rows may still carry it inside progress.
+  mount(refs.runResult, result(job.result && Object.keys(job.result).length
+    ? job.result
+    : progress.result));
 }
 
 function result(payload) {

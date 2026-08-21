@@ -492,6 +492,12 @@ function attachDownload(jobId, repoId, plannedBytes = 0) {
       card.status.className = 'badge running';
       mount(card.status, marked.payload.phase || 'running');
     },
+    // The parsed dict from the job's own parser. Marker lines are kept out of
+    // the log broadcast, so this — not the raw text — is what moves the bar.
+    progress: (payload) => {
+      const progress = payload?.progress;
+      if (progress && Object.keys(progress).length) applyProgress(card, progress);
+    },
     'progress-line': (payload) => { card.transient.textContent = payload?.line ?? ''; },
     status: (payload) => {
       card.status.className = `badge ${payload?.status || 'pending'}`;

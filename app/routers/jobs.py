@@ -46,14 +46,28 @@ async def stream_job(job_id: str) -> EventSourceResponse:
             yield events.sse("log", {"line": line})
         yield events.sse("status", {"status": job["status"], "progress": job.get("progress") or {}})
         if job["status"] in jobs.TERMINAL:
-            yield events.sse("end", {"status": job["status"]})
+            yield events.sse("end", {"status": job["status"], "job": job})
             return
+
         async for message in events.broker.subscribe(events.job_topic(job_id)):
-            yield events.sse(message.get("type", "log"), message)
-            current = await asyncio.to_thread(jobs.manager.get, job_id)
-            if current and current["status"] in jobs.TERMINAL:
-                yield events.sse("end", {"status": current["status"], "job": current})
-                return
+            kind = message.get("type", "log")
+            if kind == "progress":
+                # One frame carries both, so a pane that only renders progress
+                # still learns the run ended.
+                yield events.sse("progress", {"progress": message.get("progress") or {}})
+                yield events.sse("status", {
+                    "status": message.get("status"),
+                    "progress": message.get("progress") or {},
+                })
+                if message.get("status") in jobs.TERMINAL:
+                    yield events.sse(
+                        "end",
+                        {"status": message["status"], "job": message.get("job")},
+                    )
+                    return
+                continue
+
+            yield events.sse(kind, message)
 
     return EventSourceResponse(generator(), ping=15)
 

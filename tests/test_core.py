@@ -146,3 +146,26 @@ def test_a_parser_can_hand_an_artefact_to_the_job_row():
     lifted = progress.pop(jobs.RESULT_KEY)
     assert lifted == {"path": "/outputs/model"}
     assert jobs.RESULT_KEY not in progress
+
+
+def test_the_spa_catch_all_cannot_read_outside_web():
+    # Joining a request path onto a directory is an arbitrary file read unless
+    # the result is checked: '../../etc/passwd' resolves cleanly and is_file()
+    # is perfectly happy to confirm it.
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        for escape in (
+            "/../../../../etc/passwd",
+            "/../../../../etc/hostname",
+            "/../app/config.py",
+            "/../../.ssh/authorized_keys",
+        ):
+            response = client.get(escape)
+            assert response.status_code == 200
+            assert "<title>LLM Dashboard" in response.text, f"{escape} escaped web/"
+
+        served = client.get("/css/app.css")
+        assert served.status_code == 200 and served.text.lstrip().startswith("/*")
