@@ -495,7 +495,9 @@ def parse_download(line: str, progress: dict) -> dict | None:
     if not isinstance(payload, dict):
         return None
     if final:
-        return {"phase": "done", "percent": 100.0, **payload}
+        # The worker's closing line names the snapshot it produced; that belongs
+        # on the job's result, not buried in a progress reading.
+        return {"phase": "done", "percent": 100.0, **payload, jobs.RESULT_KEY: payload}
     return payload
 
 

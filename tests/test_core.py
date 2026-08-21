@@ -130,3 +130,19 @@ def test_a_mistyped_api_route_is_a_json_404_not_the_spa_shell():
         deep_link = client.get("/serve")
         assert deep_link.status_code == 200
         assert deep_link.headers["content-type"].startswith("text/html")
+
+
+def test_machine_lines_stay_in_the_log_file_but_out_of_the_log_pane():
+    # The markers are the record of what a worker reported, so the file keeps
+    # them; the pane shows the human output and the parsed progress instead.
+    assert jobs.is_machine_line('@@PROGRESS@@ {"percent": 12}')
+    assert jobs.is_machine_line('  @@RESULT@@ {"path": "/out"}')
+    assert not jobs.is_machine_line("Loading safetensors checkpoint shards: 50%")
+    assert not jobs.is_machine_line("")
+
+
+def test_a_parser_can_hand_an_artefact_to_the_job_row():
+    progress = {"percent": 100.0, jobs.RESULT_KEY: {"path": "/outputs/model"}}
+    lifted = progress.pop(jobs.RESULT_KEY)
+    assert lifted == {"path": "/outputs/model"}
+    assert jobs.RESULT_KEY not in progress

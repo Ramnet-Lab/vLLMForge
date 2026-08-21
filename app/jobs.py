@@ -34,6 +34,20 @@ ProgressParser = Callable[[str, dict], dict | None]
 
 _parsers: dict[str, ProgressParser] = {}
 
+# Workers that have no side channel emit structured state as marked stdout
+# lines. They are kept in the log file because they are the record of what
+# happened, but they are not shown in the log pane — the parsed progress is the
+# readable version of the same thing.
+MACHINE_MARKER = "@@"
+
+# A parser may hand back a finished artefact under this key; the manager lifts
+# it out of progress and onto the job's result.
+RESULT_KEY = "__result__"
+
+
+def is_machine_line(line: str) -> bool:
+    return line.lstrip().startswith(MACHINE_MARKER)
+
 
 def register_parser(kind: str) -> Callable[[ProgressParser], ProgressParser]:
     def decorate(fn: ProgressParser) -> ProgressParser:
@@ -224,12 +238,14 @@ class JobManager:
                         last_transient_write = now
                         self._write(job_id, line)
                 else:
-                    self._append(job_id, line)
+                    self._append(job_id, line, broadcast=not is_machine_line(line))
                 if parser:
                     update = parser(line, progress)
                     if update:
                         progress.update(update)
                         _dedupe_series(progress)
+                        if RESULT_KEY in progress:
+                            self._update(job_id, result=progress.pop(RESULT_KEY))
                         if now - last_publish > 0.4:
                             last_publish = now
                             self._update(job_id, progress=progress)
@@ -328,16 +344,19 @@ class JobManager:
         with db.log_path(job_id).open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    def _append(self, job_id: str, line: str) -> None:
+    def _append(self, job_id: str, line: str, *, broadcast: bool = True) -> None:
         self._write(job_id, line)
-        events.broker.publish_soon(events.job_topic(job_id), {"type": "log", "line": line})
+        if broadcast:
+            events.broker.publish_soon(events.job_topic(job_id), {"type": "log", "line": line})
 
     @staticmethod
-    def tail(job_id: str, lines: int = 200) -> list[str]:
+    def tail(job_id: str, lines: int = 200, *, readable: bool = False) -> list[str]:
         path = db.log_path(job_id)
         if not path.exists():
             return []
         content = path.read_text(errors="replace").splitlines()
+        if readable:
+            content = [line for line in content if not is_machine_line(line)]
         return content[-lines:]
 
     @staticmethod

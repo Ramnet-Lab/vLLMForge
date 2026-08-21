@@ -328,7 +328,9 @@ def parse_progress(line: str, progress: dict) -> dict | None:
     """Turn the worker's tagged JSON lines into the dict the fine-tune view renders."""
     if line.startswith(RESULT_TAG):
         payload = _payload(line, RESULT_TAG)
-        return {"result": payload, "percent": 100.0} if payload else None
+        # RESULT_KEY moves this onto the job row rather than leaving the
+        # finished artefact buried inside a progress reading.
+        return {jobs.RESULT_KEY: payload, "percent": 100.0} if payload else None
     if not line.startswith(PROGRESS_TAG):
         return None
     payload = _payload(line, PROGRESS_TAG)
@@ -754,7 +756,7 @@ def _served_path(path: Path) -> str:
 def serve_plan(job: dict, *, name: str) -> dict:
     """What a server definition for this finished run should look like."""
     meta = ((job.get("spec") or {}).get("meta")) or {}
-    result = ((job.get("progress") or {}).get("result")) or {}
+    result = job.get("result") or (job.get("progress") or {}).get("result") or {}
     run_dir = Path(meta.get("run_dir") or "").resolve()
     if not run_dir.exists():
         raise ValueError("this run left no output directory")

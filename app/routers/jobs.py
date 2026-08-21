@@ -41,7 +41,7 @@ async def stream_job(job_id: str) -> EventSourceResponse:
         raise HTTPException(404, "no such job")
 
     async def generator():
-        backlog = await asyncio.to_thread(jobs.manager.tail, job_id, 2000)
+        backlog = await asyncio.to_thread(jobs.manager.tail, job_id, 2000, readable=True)
         for line in backlog:
             yield events.sse("log", {"line": line})
         yield events.sse("status", {"status": job["status"], "progress": job.get("progress") or {}})
