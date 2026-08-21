@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -157,11 +158,32 @@ def launch_preview(server: dict) -> str:
     )
 
 
+OUTPUTS_MOUNT = "/outputs"
+CACHE_MOUNT = "/hf"
+
+
 def _mounts() -> list[docker_ctl.Mount]:
     return [
-        docker_ctl.Mount(settings.hf_cache, "/hf"),
-        docker_ctl.Mount(settings.output_dir, "/outputs"),
+        docker_ctl.Mount(settings.hf_cache, CACHE_MOUNT),
+        docker_ctl.Mount(settings.output_dir, OUTPUTS_MOUNT),
     ]
+
+
+def container_path(host_path: str | Path) -> str:
+    """Where a vLLM container sees a path that a job produced on the host.
+
+    Models built by the Heretic and fine-tuning tabs live under the output
+    directory, which is bind-mounted into every server container. Handing vLLM
+    the host path instead would fail at load with a missing-directory error, and
+    only after the container had already started.
+    """
+    resolved = Path(host_path).resolve()
+    root = settings.output_dir.resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        return str(resolved)
+    return f"{OUTPUTS_MOUNT}/{relative}" if str(relative) != "." else OUTPUTS_MOUNT
 
 
 # --- lifecycle ----------------------------------------------------------

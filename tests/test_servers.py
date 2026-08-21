@@ -80,3 +80,16 @@ def test_the_gpu_util_helper_tolerates_junk():
     assert vllm_spec.gpu_memory_utilization({"gpu_memory_utilization": "0.5"}) == 0.5
     assert vllm_spec.gpu_memory_utilization({"gpu_memory_utilization": "auto"}) is None
     assert vllm_spec.gpu_memory_utilization({}) is None
+
+
+def test_a_job_s_output_path_is_translated_for_the_container():
+    from pathlib import Path
+
+    from app.config import settings
+
+    produced = settings.output_dir / "heretic-qwen-abc123" / "out"
+    assert servers.container_path(produced) == "/outputs/heretic-qwen-abc123/out"
+    assert servers.container_path(settings.output_dir) == "/outputs"
+    # A path the server container does not mount is left alone rather than
+    # silently rewritten into something that does not exist.
+    assert servers.container_path(Path("/home/user/models/hf-cache")) == "/home/user/models/hf-cache"

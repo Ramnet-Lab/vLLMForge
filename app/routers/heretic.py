@@ -86,8 +86,8 @@ async def serve(job_id: str) -> dict:
     if job is None or job["kind"] != "heretic":
         raise HTTPException(404, "no such heretic job")
     meta = (job.get("spec") or {}).get("meta") or {}
-    out = Path(meta.get("output_dir", ""))
-    if not out.is_dir() or not (out / "config.json").is_file():
+    out = Path(meta["output_dir"]) if meta.get("output_dir") else None
+    if out is None or not (out / "config.json").is_file():
         raise HTTPException(409, f"{out or 'this job'} does not hold a finished model yet")
     if (meta.get("settings") or {}).get("export_strategy") == "adapter":
         raise HTTPException(
@@ -108,7 +108,7 @@ async def serve(job_id: str) -> dict:
     )
     payload = {
         "name": await asyncio.to_thread(_free_name, meta.get("model", job_id), job_id),
-        "model": str(out),
+        "model": servers.container_path(out),
         "served_name": f"heretic-{job_id}",
         "port": await asyncio.to_thread(servers.suggest_port),
         "image": settings.vllm_image,
