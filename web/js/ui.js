@@ -237,3 +237,27 @@ export function ensureStyles(id, css) {
   if (document.getElementById(`style-${id}`)) return;
   document.head.append(h('style', { id: `style-${id}` }, css));
 }
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** Build an SVG element. Separate from h() because SVG needs its own namespace
+ *  and takes attributes rather than properties — createElement would produce an
+ *  HTMLUnknownElement that renders as nothing. */
+export function svg(tag, props = null, ...children) {
+  const el = document.createElementNS(SVG_NS, tag);
+  if (props) {
+    for (const [key, value] of Object.entries(props)) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key.startsWith('on') && typeof value === 'function') {
+        el.addEventListener(key.slice(2).toLowerCase(), value);
+      } else {
+        el.setAttribute(key, value === true ? '' : String(value));
+      }
+    }
+  }
+  for (const child of children.flat(3)) {
+    if (child === null || child === undefined || child === false) continue;
+    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return el;
+}
