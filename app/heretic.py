@@ -25,6 +25,7 @@ hand can edit the file in place and re-launch the same directory.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -36,7 +37,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
-from app import db, docker_ctl, events, jobs, safety
+from app import docker_ctl, events, jobs, safety
 from app.config import settings
 
 # Container-side layout. The host job directory is bind-mounted at /job, which
@@ -505,10 +506,8 @@ def _inspect_local(path: Path) -> dict[str, Any]:
         info.update(params=weights // 2, source="local safetensors size")
     config = path / "config.json"
     if config.is_file():
-        try:
+        with contextlib.suppress(ValueError, OSError):
             info["trust_remote_code"] = "auto_map" in json.loads(config.read_text())
-        except (ValueError, OSError):
-            pass
     else:
         info["error"] = f"{path} has no config.json — Heretic will not be able to load it"
     return info
@@ -674,15 +673,15 @@ async def submit_build(ref: str = "master") -> str:
         meta={"dockerfile": DOCKERFILE, "heretic_ref": ref},
     )
     job_id = await asyncio.to_thread(jobs.manager.create, spec)
-    asyncio.create_task(_drive_build(job_id, ref), name=f"heretic-build-{job_id}")
+    jobs.manager.adopt(job_id, _drive_build(job_id, ref))
     return job_id
 
 
 async def _drive_build(job_id: str, ref: str) -> None:
     tag = settings.heretic_image
     dockerfile = settings.docker_dir / DOCKERFILE
-    jobs.manager._update(job_id, status=jobs.RUNNING, started_at=db.now())
-    jobs.manager._append(
+    jobs.manager.begin(job_id)
+    jobs.manager.log(
         job_id, f"$ docker build -t {tag} -f {dockerfile} --build-arg HERETIC_REF={ref}"
     )
     try:
@@ -690,13 +689,13 @@ async def _drive_build(job_id: str, ref: str) -> None:
             tag, dockerfile, settings.docker_dir, build_args={"HERETIC_REF": ref}
         ):
             if line.strip():
-                jobs.manager._append(job_id, line)
+                jobs.manager.log(job_id, line)
     except docker_ctl.DockerError as exc:
-        jobs.manager._update(job_id, status=jobs.FAILED, error=str(exc), finished_at=db.now())
+        jobs.manager.finish(job_id, ok=False, error=str(exc))
         return
     except Exception as exc:  # a build failure must land on the job, not the event loop
-        jobs.manager._update(job_id, status=jobs.FAILED, error=repr(exc), finished_at=db.now())
+        jobs.manager.finish(job_id, ok=False, error=repr(exc))
         return
     _commit_cache.pop(tag, None)
-    jobs.manager._update(job_id, status=jobs.SUCCEEDED, exit_code=0, finished_at=db.now())
+    jobs.manager.finish(job_id, ok=True)
     await events.broker.publish(events.JOBS, {"type": "image", "image": tag})

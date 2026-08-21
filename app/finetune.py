@@ -14,7 +14,6 @@ checked against the utilisation budget.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -25,7 +24,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app import db, docker_ctl, jobs, safety
+from app import db, docker_ctl, events, jobs, safety, servers
 from app.config import settings
 
 log = logging.getLogger("llmd.finetune")
@@ -172,7 +171,7 @@ class FinetuneConfig(BaseModel):
         "adapter",
         description=(
             "adapter: LoRA only, needs an fp16 base to serve. merged_16bit: a standalone model "
-            "vLLM can serve directly. merged_4bit / gguf are wired but unverified on this box."
+            "vLLM can serve directly. merged_4bit and gguf are wired but unverified on this box."
         ),
     )
     gguf_quant: Literal[GGUF_QUANTS] = Field(  # type: ignore[valid-type]
@@ -242,9 +241,9 @@ def ui_schema() -> dict[str, Any]:
             "A saved adapter records the bnb-4bit repo it was trained on as its base model. "
             "vLLM cannot serve that, so serving an adapter means pointing it at the fp16 base "
             "with --enable-lora, or exporting merged_16bit instead.",
-            "Only the adapter export has been run end to end on this GB10. merged_4bit and "
-            "gguf come straight from Unsloth's API; gguf additionally needs llama.cpp, which "
-            "the image does not ship.",
+            "The adapter and merged_16bit exports have been run end to end on this GB10. "
+            "merged_4bit and gguf come straight from Unsloth's API and are unverified here; "
+            "gguf additionally needs llama.cpp, which the image does not ship.",
         ],
     }
 
@@ -514,7 +513,7 @@ async def probe_image() -> dict:
     """Does unsloth actually import in the built image? Cached, because it costs ~40s."""
     code, out, err = await docker_ctl.run_capture(
         image=settings.finetune_image,
-        command=["python", "-c", PROBE],
+        command=["-c", PROBE],
         entrypoint="python",
         gpu=True,
         network="bridge",
@@ -556,7 +555,6 @@ _BUILD_STEP = re.compile(r"^#\d+\s+\[(\d+)/(\d+)\]")
 
 # The job manager only tracks tasks that tail containers, so these are held here
 # to keep them from being garbage-collected mid-build.
-_builds: dict[str, asyncio.Task] = {}
 
 
 async def build_image_job(build_args: dict[str, str] | None = None) -> str:
@@ -587,11 +585,7 @@ async def build_image_job(build_args: dict[str, str] | None = None) -> str:
         },
     )
     job_id = jobs.manager.create(spec)
-    task = asyncio.create_task(
-        _run_build(job_id, tag, dockerfile, build_args), name=f"build-{job_id}"
-    )
-    _builds[job_id] = task
-    task.add_done_callback(lambda _t: _builds.pop(job_id, None))
+    jobs.manager.adopt(job_id, _run_build(job_id, tag, dockerfile, build_args))
     return job_id
 
 
@@ -599,31 +593,32 @@ async def _run_build(
     job_id: str, tag: str, dockerfile: Path, build_args: dict[str, str] | None
 ) -> None:
     manager = jobs.manager
-    manager._update(job_id, status=jobs.RUNNING, started_at=db.now())
+    manager.begin(job_id)
+    manager.log(job_id, f"$ docker build -t {tag} -f {dockerfile} {settings.docker_dir}")
     progress: dict[str, Any] = {"phase": "building"}
     try:
         async for line in docker_ctl.build_image(
             tag, dockerfile, settings.docker_dir, build_args=build_args
         ):
-            manager._append(job_id, line)
+            manager.log(job_id, line)
             match = _BUILD_STEP.match(line)
             if match:
                 done, total = int(match.group(1)), int(match.group(2))
                 progress = {"phase": line[:120], "step": done, "total_steps": total,
                             "percent": round(100.0 * done / total, 1)}
-                manager._update(job_id, progress=progress)
+                manager.report(job_id, progress)
     except Exception as exc:
-        manager._append(job_id, f"[dashboard] build failed: {exc}")
-        manager._update(job_id, status=jobs.FAILED, error=str(exc)[:400], finished_at=db.now())
+        log.exception("finetune image build failed")
+        manager.log(job_id, f"[dashboard] build failed: {exc}")
+        manager.finish(job_id, ok=False, error=str(exc)[:400])
         return
-    manager._update(
+    manager.finish(
         job_id,
-        status=jobs.SUCCEEDED,
-        exit_code=0,
-        progress={**progress, "phase": "built", "percent": 100.0},
+        ok=True,
         result={"tag": tag},
-        finished_at=db.now(),
+        progress={**progress, "phase": "built", "percent": 100.0},
     )
+    await events.broker.publish(events.JOBS, {"type": "image", "image": tag})
 
 
 # --- datasets ------------------------------------------------------------
@@ -742,9 +737,18 @@ def fp16_base(repo: str) -> str:
     return _QUANT_SUFFIX.sub("", repo or "")
 
 
+def _base_repo(recorded: str, requested: str) -> str:
+    """Prefer the repo id the user typed: unsloth records its 4-bit mirror
+    lower-cased, and hub ids are case-sensitive."""
+    stripped = fp16_base(recorded)
+    if requested and stripped.lower() == fp16_base(requested).lower():
+        return fp16_base(requested)
+    return stripped or fp16_base(requested)
+
+
 def _served_path(path: Path) -> str:
-    """Rewrite a host path under the output dir to where vLLM's container sees it."""
-    return f"/outputs/{path.relative_to(settings.output_dir.resolve())}"
+    """Where vLLM's container sees a path this job wrote on the host."""
+    return servers.container_path(path)
 
 
 def serve_plan(job: dict, *, name: str) -> dict:
@@ -772,7 +776,7 @@ def serve_plan(job: dict, *, name: str) -> dict:
     adapter = run_dir / "adapter"
     if not adapter.exists():
         raise ValueError(f"no adapter or merged export under {run_dir}")
-    base = fp16_base(result.get("adapter_base_model") or config.get("model") or "")
+    base = _base_repo(result.get("adapter_base_model") or "", config.get("model") or "")
     rank = int(result.get("lora_rank") or config.get("r") or 16)
     if rank not in SERVABLE_RANKS:
         raise ValueError(f"LoRA rank {rank} is not one of {SERVABLE_RANKS}; merge instead")

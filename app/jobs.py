@@ -266,6 +266,49 @@ class JobManager:
             )
         await docker_ctl.remove(container, force=True)
 
+    # --- jobs the manager does not run itself ------------------------------
+    # Image builds stream from `docker build` rather than from a container the
+    # manager started, so they drive their own lifecycle. They still belong in
+    # the job list, and they still need their task kept alive: asyncio holds
+    # only a weak reference to a running task.
+
+    def adopt(self, job_id: str, coro) -> asyncio.Task:
+        """Run an externally-driven job, keeping the task reachable."""
+        task = asyncio.create_task(coro, name=f"job-{job_id}")
+        self._tasks[job_id] = task
+        task.add_done_callback(lambda _t: self._tasks.pop(job_id, None))
+        return task
+
+    def begin(self, job_id: str) -> None:
+        self._update(job_id, status=RUNNING, started_at=db.now())
+
+    def log(self, job_id: str, line: str) -> None:
+        self._append(job_id, line)
+
+    def report(self, job_id: str, progress: dict[str, Any]) -> None:
+        self._update(job_id, progress=progress)
+
+    def finish(
+        self,
+        job_id: str,
+        *,
+        ok: bool,
+        error: str = "",
+        result: dict[str, Any] | None = None,
+        exit_code: int | None = None,
+        progress: dict[str, Any] | None = None,
+    ) -> None:
+        if progress is not None:
+            self._update(job_id, progress=progress)
+        self._update(
+            job_id,
+            status=SUCCEEDED if ok else FAILED,
+            error=error[:2000] or None,
+            result=result or {},
+            exit_code=exit_code if exit_code is not None else (0 if ok else 1),
+            finished_at=db.now(),
+        )
+
     async def cancel(self, job_id: str) -> bool:
         row = self.get(job_id)
         if not row or row["status"] in TERMINAL:

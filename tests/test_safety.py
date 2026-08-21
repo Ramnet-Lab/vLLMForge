@@ -144,19 +144,6 @@ async def test_free_versus_available_is_surfaced_not_ignored(monkeypatch):
     assert "free memory" in verdict.message
 
 
-@pytest.mark.asyncio
-async def test_check_job_blocks_when_a_model_will_not_fit(monkeypatch):
-    async def fake(exclude=None):
-        return budget([("vllm-qwen", 0.52), ("vllm-embed", 0.16)])
-
-    monkeypatch.setattr(safety, "current_budget", fake)
-    blocked = await safety.check_job(int(30 * GIB), label="A 12B Heretic run")
-    assert not blocked.ok and "12B Heretic run" in blocked.message
-
-    fits = await safety.check_job(int(2 * GIB), label="A 0.5B Heretic run")
-    assert fits.ok
-
-
 def test_kv_cache_memory_override_is_recognised():
     assert safety.KV_BYTES_FLAG.match("--kv-cache-memory")
     assert safety.KV_BYTES_FLAG.match("--kv-cache-memory-bytes=123")

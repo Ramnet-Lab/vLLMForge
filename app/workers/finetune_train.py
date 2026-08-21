@@ -195,10 +195,10 @@ def train(cfg: dict[str, Any], model, tokenizer, dataset, text_field: str, out: 
 def save(cfg: dict[str, Any], model, tokenizer, out: Path) -> dict[str, Any]:
     """Write the artefacts the export option asks for.
 
-    Only the adapter path has been run on this box. save_pretrained_merged and
-    save_pretrained_gguf are wired from Unsloth's documented API and are NOT
-    verified on GB10 — and GGUF additionally needs llama.cpp, which the NGC base
-    image does not ship, so Unsloth would have to fetch and build it here.
+    adapter and merged_16bit have both been run on this box. merged_4bit and
+    gguf are wired from Unsloth's documented API but are NOT verified here, and
+    gguf additionally needs llama.cpp, which the NGC base image does not ship —
+    Unsloth would have to fetch and build it at save time on aarch64.
     """
     artefacts: dict[str, Any] = {}
     export = cfg.get("export", "adapter")
