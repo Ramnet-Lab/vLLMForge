@@ -78,6 +78,11 @@ class Reporter:
 
     @property
     def downloaded(self) -> int:
+        # Xet can satisfy part of a file from chunks it already holds, so the
+        # network bar legitimately finishes short of the repo total; the writer
+        # bar is the one that always lands exactly on it.
+        if self.phase == "done":
+            return max(self.net_bytes, self.disk_bytes)
         return self.net_bytes or self.disk_bytes
 
     @property
@@ -101,7 +106,9 @@ class Reporter:
         self._last_emit = now
         self._tick_speed(now)
         total, done = self.total, self.downloaded
-        if total:
+        if self.phase == "done":
+            percent = 100.0
+        elif total:
             percent = min(100.0, 100.0 * done / total)
         elif self.files_total:
             percent = 100.0 * self.files_done / self.files_total

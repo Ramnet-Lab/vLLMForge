@@ -10,10 +10,17 @@ GIB = 1024 ** 3
 TOTAL = 130_663_006_208  # this box: torch's total_memory and MemTotal agree exactly
 
 
-def budget(committed: list[tuple[str, float]], available_gib: float = 60.0) -> safety.Budget:
+def budget(
+    committed: list[tuple[str, float]],
+    available_gib: float = 60.0,
+    free_gib: float | None = None,
+    measured_gib: float = 0.0,
+) -> safety.Budget:
     return safety.Budget(
         total_bytes=TOTAL,
         available_bytes=int(available_gib * GIB),
+        free_bytes=int((available_gib if free_gib is None else free_gib) * GIB),
+        measured_gpu_bytes=int(measured_gib * GIB),
         reserve_bytes=int(32 * GIB),
         warn_reserve_bytes=int(38 * GIB),
         tenants=[
@@ -76,13 +83,16 @@ async def test_check_launch_blocks_an_overcommit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_check_launch_warns_about_an_unset_util(monkeypatch):
+async def test_an_unset_util_is_evaluated_as_vllm_s_default(monkeypatch):
+    # Leaving the flag off is not "unspecified", it is 0.92 — 112 GiB here, which
+    # cannot fit beside the OS reserve on an otherwise idle host.
     async def fake(exclude=None):
         return budget([])
 
     monkeypatch.setattr(safety, "current_budget", fake)
     verdict = await safety.check_launch(None)
-    assert verdict.level == "warn" and "0.92" in verdict.message
+    assert not verdict.ok and verdict.level == "block"
+    assert "0.92" in verdict.message
 
 
 @pytest.mark.asyncio
@@ -93,3 +103,61 @@ async def test_live_headroom_blocks_even_a_budget_legal_launch(monkeypatch):
     monkeypatch.setattr(safety, "current_budget", fake)
     verdict = await safety.check_launch(0.5)
     assert not verdict.ok and "available on the host right now" in verdict.message
+
+
+def test_measured_usage_wins_when_it_exceeds_the_declared_utils():
+    # A fine-tuning job or a Heretic run holds GPU memory without any util flag
+    # to sum, so the measured figure has to be able to dominate.
+    b = budget([("vllm-embed", 0.16)], measured_gib=90.0)
+    assert b.committed_bytes < b.measured_gpu_bytes
+    assert b.occupied_bytes == b.measured_gpu_bytes
+    assert b.free_util < 0.05
+
+
+def test_the_declared_utils_win_when_engines_have_not_finished_allocating():
+    b = budget([("vllm-qwen", 0.52)], measured_gib=5.0)
+    assert b.occupied_bytes == b.committed_bytes
+
+
+@pytest.mark.asyncio
+async def test_a_serve_command_without_a_util_flag_is_not_free(monkeypatch):
+    # vLLM applies its own 0.92 default, which is over 100 GiB on this host.
+    # Treating such a container as contributing zero was the dangerous bug here.
+    async def fake(exclude=None):
+        return budget([("vllm-nodefault", safety.default_util())])
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    verdict = await safety.check_launch(0.2)
+    assert not verdict.ok and verdict.level == "block"
+
+
+@pytest.mark.asyncio
+async def test_free_versus_available_is_surfaced_not_ignored(monkeypatch):
+    # vLLM's own guard compares against free memory; page cache does not count
+    # for it even though MemAvailable includes it.
+    async def fake(exclude=None):
+        return budget([], available_gib=80.0, free_gib=5.0)
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    verdict = await safety.check_launch(0.3)
+    assert verdict.ok and verdict.level == "warn"
+    assert "free memory" in verdict.message
+
+
+@pytest.mark.asyncio
+async def test_check_job_blocks_when_a_model_will_not_fit(monkeypatch):
+    async def fake(exclude=None):
+        return budget([("vllm-qwen", 0.52), ("vllm-embed", 0.16)])
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    blocked = await safety.check_job(int(30 * GIB), label="A 12B Heretic run")
+    assert not blocked.ok and "12B Heretic run" in blocked.message
+
+    fits = await safety.check_job(int(2 * GIB), label="A 0.5B Heretic run")
+    assert fits.ok
+
+
+def test_kv_cache_memory_override_is_recognised():
+    assert safety.KV_BYTES_FLAG.match("--kv-cache-memory")
+    assert safety.KV_BYTES_FLAG.match("--kv-cache-memory-bytes=123")
+    assert not safety.KV_BYTES_FLAG.match("--kv-cache-dtype")

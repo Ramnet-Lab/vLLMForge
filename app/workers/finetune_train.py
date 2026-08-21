@@ -13,6 +13,7 @@ them — they are carriage-return redraws and interleave badly.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -77,10 +78,10 @@ def _standardize(dataset):
     """ShareGPT from/value rows -> role/content, under whichever name unsloth uses."""
     from unsloth import chat_templates
 
-    fn = getattr(chat_templates, "standardize_data_formats", None) or getattr(
-        chat_templates, "standardize_sharegpt"
-    )
-    return fn(dataset)
+    standardize = getattr(chat_templates, "standardize_data_formats", None)
+    if standardize is None:
+        standardize = chat_templates.standardize_sharegpt
+    return standardize(dataset)
 
 
 def build_dataset(cfg: dict[str, Any], tokenizer):
@@ -244,14 +245,10 @@ def chown_tree(path: Path, uid: int, gid: int) -> None:
         return
     for root, dirs, files in os.walk(path):
         for name in (*dirs, *files):
-            try:
+            with contextlib.suppress(OSError):
                 os.chown(os.path.join(root, name), uid, gid)
-            except OSError:
-                pass
-    try:
+    with contextlib.suppress(OSError):
         os.chown(path, uid, gid)
-    except OSError:
-        pass
 
 
 def main() -> int:

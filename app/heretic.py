@@ -682,7 +682,9 @@ async def _drive_build(job_id: str, ref: str) -> None:
     tag = settings.heretic_image
     dockerfile = settings.docker_dir / DOCKERFILE
     jobs.manager._update(job_id, status=jobs.RUNNING, started_at=db.now())
-    jobs.manager._append(job_id, f"$ docker build -t {tag} -f {dockerfile} --build-arg HERETIC_REF={ref}")
+    jobs.manager._append(
+        job_id, f"$ docker build -t {tag} -f {dockerfile} --build-arg HERETIC_REF={ref}"
+    )
     try:
         async for line in docker_ctl.build_image(
             tag, dockerfile, settings.docker_dir, build_args={"HERETIC_REF": ref}
