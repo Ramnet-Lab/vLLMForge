@@ -251,3 +251,91 @@ async def test_pool_status_asks_the_engine_because_it_is_the_head(monkeypatch):
     # There is no standalone head container any more; the engine is the head.
     assert "llmd-vllm-9" in seen["argv"] and "llmd-ray-head" not in seen["argv"]
     assert result["nodes"] == 2 and result["expected"] == 2
+
+
+# --- a peer's model cache -------------------------------------------------
+
+
+def _fake_ssh(code: int, out: str):
+    """Stand in for the one round trip node_cache makes."""
+    async def run(host, script):
+        return code, out
+    return run
+
+
+@pytest.fixture
+def peer(monkeypatch):
+    """A registered node2. by_name falls back to this machine for an unknown
+    name, which would quietly turn every peer test into a local one."""
+    node = nodes.Node(name="node2", address="10.0.0.2", docker_host="ssh://node2")
+    monkeypatch.setattr(nodes, "by_name", lambda name: node)
+    return node
+
+
+@pytest.mark.anyio
+async def test_a_peers_cache_scan_matches_the_local_shape(monkeypatch, peer):
+    """The Models page renders one table for either node, so a peer's scan has
+    to answer the same field names the local cache does."""
+    from app import hf
+
+    out = "\n".join([
+        "R|models--google--gemma-4-31B-it|62578686995|21|1787369116",
+        "R|datasets--tatsu-lab--alpaca|4096|3|1787000000",
+        "R|garbage-without-enough-fields",
+        "I|2 8192",
+        "D|3648547196928 4031871553536",
+    ])
+    monkeypatch.setattr(nodes, "_ssh", _fake_ssh(0, out))
+    payload = await hf.node_cache("node2")
+
+    assert payload["ok"] and payload["node"] == "node2"
+    assert payload["incomplete_files"] == 2 and payload["incomplete_bytes"] == 8192
+    assert payload["disk"]["free_bytes"] == 3648547196928
+
+    # Sorted by size, and the malformed line is dropped rather than guessed at.
+    assert [r["repo_id"] for r in payload["repos"]] == [
+        "google/gemma-4-31B-it", "tatsu-lab/alpaca"]
+    model = payload["repos"][0]
+    assert model["size_on_disk"] == 62578686995
+    assert model["nb_files"] == 21
+    assert model["kind"] == "model" and model["repo_type"] == "model"
+    assert payload["repos"][1]["kind"] == "dataset"
+    # What ssh cannot see is empty, never invented.
+    assert model["revisions"] == [] and model["refs"] == {}
+    assert payload["size_on_disk"] == 62578686995 + 4096
+
+
+@pytest.mark.anyio
+async def test_a_node_without_a_cache_directory_is_empty_not_broken(monkeypatch, peer):
+    from app import hf
+
+    monkeypatch.setattr(nodes, "_ssh", _fake_ssh(3, ""))
+    payload = await hf.node_cache("node2")
+    assert payload["ok"] and payload["repos"] == [] and payload["size_on_disk"] == 0
+    assert "error" in payload  # says why, without claiming the node is broken
+
+
+@pytest.mark.anyio
+async def test_an_unreachable_node_reports_the_failure(monkeypatch, peer):
+    from app import hf
+
+    monkeypatch.setattr(nodes, "_ssh", _fake_ssh(255, "ssh: connect to host node2: no route"))
+    payload = await hf.node_cache("node2")
+    assert payload["ok"] is False and "no route" in payload["error"]
+
+
+def test_one_repo_can_download_onto_two_nodes_at_once(monkeypatch):
+    """The clash being guarded against is two writers on one cache, and a cache
+    belongs to a node — so the same repo landing on two machines is fine."""
+    from app import hf, jobs
+
+    running = [{
+        "id": "job-local", "status": "running",
+        "spec": {"meta": {"repo_id": "org/model", "node": "local"}},
+    }]
+    monkeypatch.setattr(jobs.manager, "list", lambda *a, **k: running)
+
+    assert hf._running_download("org/model") == "job-local"
+    assert hf._running_download("org/model", "local") == "job-local"
+    assert hf._running_download("org/model", "node2") is None
+    assert hf._running_download("org/other", "local") is None

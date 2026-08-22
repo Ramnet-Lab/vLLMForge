@@ -672,11 +672,19 @@ def parse_download(line: str, progress: dict) -> dict | None:
     return payload
 
 
-def _running_download(repo_id: str) -> str | None:
+def _running_download(repo_id: str, node: str = "") -> str | None:
+    """Is this repo already being pulled onto this node?
+
+    The clash the caller guards against is two containers writing one cache's
+    blobs, and a cache belongs to a node — so pulling the same repo onto
+    another machine at the same time is fine and must not be refused.
+    """
+    wanted = node or "local"
     for job in jobs.manager.list("download", limit=50):
         if job["status"] in jobs.TERMINAL:
             continue
-        if ((job.get("spec") or {}).get("meta") or {}).get("repo_id") == repo_id:
+        meta = ((job.get("spec") or {}).get("meta") or {})
+        if meta.get("repo_id") == repo_id and (meta.get("node") or "local") == wanted:
             return job["id"]
     return None
 
@@ -692,11 +700,13 @@ async def submit_download(
 ) -> str:
     check_repo_id(repo_id)
     _repo_type(repo_type)
-    existing = await asyncio.to_thread(_running_download, repo_id)
+    existing = await asyncio.to_thread(_running_download, repo_id, node)
     if existing:
         # Two containers writing one repo's blobs interleave badly, and the
         # cache lock is inside the container, not across containers.
-        raise HubError(f"'{repo_id}' is already downloading in job {existing}.", 409)
+        raise HubError(
+            f"'{repo_id}' is already downloading onto {node or 'this machine'} "
+            f"in job {existing}.", 409)
 
     command = ["-u", "/worker/hf_download.py", "--repo-id", repo_id, "--revision", revision,
                "--repo-type", repo_type]
@@ -794,7 +804,14 @@ async def _delete_remote(repo_id: str, repo_type: str, node_name: str) -> dict:
 
 
 async def node_cache(node_name: str) -> dict:
-    """What a peer holds, with sizes, so the Models page can manage it."""
+    """What a peer holds, with sizes, so the Models page can manage it.
+
+    One ssh round trip does the whole scan: a line per repo carrying size, file
+    count and mtime, then a df line for the filesystem the cache sits on. The
+    fields are named to match `local_models()` so the same table renders either
+    node — what cannot be known remotely (a repo's revisions, whether a model
+    directory is really an adapter) is simply absent rather than faked.
+    """
     from app import nodes
 
     node = nodes.by_name(node_name)
@@ -802,32 +819,59 @@ async def node_cache(node_name: str) -> dict:
         return await local_models()
 
     hub = f"{settings.hf_cache}/hub"
-    code, out = await nodes._ssh(
-        node.name or node.address,
-        f"cd {hub} 2>/dev/null && du -sb models--* datasets--* 2>/dev/null || true",
+    script = (
+        f'cd {hub} 2>/dev/null || exit 3; '
+        'for d in models--* datasets--*; do [ -d "$d" ] || continue; '
+        'echo "R|$d|$(du -sb "$d" | cut -f1)|$(find "$d" -type f ! -name "*.incomplete" '
+        '| wc -l)|$(stat -c %Y "$d")"; done; '
+        'echo "I|$(find . -name \'*.incomplete\' -printf \'%s\\n\' 2>/dev/null '
+        '| awk \'{n++; t+=$1} END {print n+0, t+0}\')"; '
+        f'echo "D|$(df -B1 --output=avail,size {hub} | tail -1)"'
     )
+    code, out = await nodes._ssh(node.name or node.address, script)
+    if code == 3:
+        return {"ok": True, "node": node.name, "cache_dir": hub, "repos": [],
+                "size_on_disk": 0, "error": "no cache directory on this node yet"}
     if code != 0:
-        return {"ok": False, "node": node.name, "error": out.strip()[:300], "repos": []}
+        return {"ok": False, "node": node.name, "cache_dir": hub,
+                "error": out.strip()[:300], "repos": [], "size_on_disk": 0}
 
-    repos = []
+    repos: list[dict] = []
+    payload: dict = {"ok": True, "node": node.name, "cache_dir": hub}
     for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2 or not parts[0].isdigit():
-            continue
-        size, directory = int(parts[0]), parts[1].strip()
-        kind, _, rest = directory.partition("--")
-        repos.append({
-            "repo_id": rest.replace("--", "/", 1),
-            "repo_type": "dataset" if kind == "datasets" else "model",
-            "size_on_disk": size,
-            "directory": directory,
-            "node": node.name,
-        })
+        tag, _, rest = line.partition("|")
+        if tag == "R":
+            parts = rest.split("|")
+            if len(parts) != 4 or not parts[1].isdigit():
+                continue
+            directory, size, files, mtime = parts
+            kind, _, name = directory.partition("--")
+            repos.append({
+                "repo_id": name.replace("--", "/", 1),
+                "repo_type": "dataset" if kind == "datasets" else "model",
+                # A peer's cache cannot be inspected deeply enough to tell an
+                # adapter from a model, so `kind` mirrors the directory prefix.
+                "kind": "dataset" if kind == "datasets" else "model",
+                "size_on_disk": int(size),
+                "nb_files": int(files) if files.isdigit() else 0,
+                "last_modified": float(mtime) if mtime.isdigit() else None,
+                "revisions": [],
+                "refs": {},
+                "path": f"{hub}/{directory}",
+                "directory": directory,
+                "node": node.name,
+            })
+        elif tag == "I":
+            count, _, total = rest.strip().partition(" ")
+            payload["incomplete_files"] = int(count) if count.isdigit() else 0
+            payload["incomplete_bytes"] = int(total) if total.strip().isdigit() else 0
+        elif tag == "D":
+            avail, _, total = rest.strip().partition(" ")
+            if avail.isdigit():
+                payload["disk"] = {"free_bytes": int(avail), "path": hub,
+                                   "total_bytes": int(total) if total.strip().isdigit() else 0}
+
     repos.sort(key=lambda r: -r["size_on_disk"])
-    return {
-        "ok": True,
-        "node": node.name,
-        "cache_dir": hub,
-        "size_on_disk": sum(r["size_on_disk"] for r in repos),
-        "repos": repos,
-    }
+    payload["repos"] = repos
+    payload["size_on_disk"] = sum(r["size_on_disk"] for r in repos)
+    return payload

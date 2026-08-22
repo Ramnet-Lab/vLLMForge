@@ -12,6 +12,21 @@ import {
 import { ApiError, del, get, post, put, stream } from '../api.js';
 
 const CSS = `
+/* One tab per node. A tab is a filter over which machine every action on this
+   page talks to, so it sits at the top of the panel it governs. */
+.node-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.node-tab {
+  font-family: var(--mono); font-size: 12px; padding: 5px 12px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--bg-sunken); color: var(--text-dim); cursor: pointer;
+}
+.node-tab:hover { border-color: var(--border-strong); color: var(--text); }
+.node-tab.active {
+  background: var(--accent-dim); border-color: var(--accent); color: var(--text);
+}
+.node-tab.down { opacity: .6; }
+.node-tab .dot-down { color: var(--danger); margin-left: 5px; font-weight: 700; }
+
 .models-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .models-filters input[type="search"] { flex: 1; min-width: 200px; }
 .models-filters select { width: auto; }
@@ -68,7 +83,15 @@ const state = {
   downloads: new Map(),
   nodes: {},
   searchSeq: 0,
+  /* Which machine's cache this page is managing. '' is this one; every cache
+     call carries it, so switching the tab switches what a delete deletes and
+     what a pull lands on. Search results are Hub-side and never node-specific,
+     but "cached" is — so the results list restates itself per node too. */
+  node: '',
+  registry: [],
 };
+
+const nodeLabel = () => (state.node || 'this machine');
 
 /* A repo id is a path segment pair; the routes take it as `{repo_id:path}`, so
    the slash has to survive encoding. */
@@ -90,20 +113,72 @@ function markerPayload(line) {
   return null;
 }
 
+/** Disk on whichever node this page is managing. A peer reports its own with
+ *  the cache scan; this machine's comes from the telemetry stream. */
+function diskOf() {
+  if (state.node) return state.local?.disk || {};
+  return state.ctx?.telemetry()?.disk || {};
+}
+
 function freeDisk() {
-  const snapshot = state.ctx?.telemetry();
-  return snapshot?.disk?.free_bytes ?? null;
+  return diskOf().free_bytes ?? null;
 }
 
 /* --- local cache -------------------------------------------------------- */
 
 async function loadLocal() {
+  const wanted = state.node;
   try {
-    state.local = await get('/hub/local');
+    const query = wanted ? `?node=${encodeURIComponent(wanted)}` : '';
+    const payload = await get(`/hub/local${query}`);
+    if (wanted !== state.node) return; // the tab moved while this was in flight
+    state.local = payload;
   } catch (error) {
+    if (wanted !== state.node) return;
     state.local = { ok: false, error: error.message, repos: [], cache_dir: '' };
   }
   renderLocal();
+  renderResults();
+}
+
+async function loadRegistry() {
+  try {
+    const payload = await get('/nodes');
+    state.registry = payload.nodes || [];
+  } catch {
+    state.registry = [];
+  }
+  renderNodeTabs();
+}
+
+function selectNode(name) {
+  if (state.node === name) return;
+  state.node = name;
+  state.local = null;
+  renderNodeTabs();
+  renderLocal();
+  loadLocal();
+}
+
+/** One tab per registered node. A node the dashboard cannot reach is still
+ *  listed and still clickable — the error belongs in the panel, where it can
+ *  say what failed, not in a tab that silently disappears. */
+function renderNodeTabs() {
+  const host = state.nodes.tabs;
+  if (!host) return;
+  if (state.registry.length < 2) return mount(host);
+  mount(host, h('div', { class: 'node-tabs', role: 'tablist' },
+    state.registry.map((node) => {
+      const name = node.local ? '' : node.name;
+      const active = name === state.node;
+      return h('button', {
+        class: `node-tab${active ? ' active' : ''}${node.reachable ? '' : ' down'}`,
+        role: 'tab',
+        'aria-selected': active ? 'true' : 'false',
+        title: node.reachable ? node.address : (node.error || 'unreachable'),
+        onClick: () => selectNode(name),
+      }, node.name, node.reachable ? null : h('span', { class: 'dot-down' }, '·'));
+    })));
 }
 
 function localIds() {
@@ -113,7 +188,7 @@ function localIds() {
 async function deleteRepo(repo, button) {
   const ok = await confirmDialog(
     `Delete ${repo.repo_id}?`,
-    `This removes the whole repo from ${state.local.cache_dir}, freeing `
+    `This removes the whole repo from ${state.local.cache_dir} on ${nodeLabel()}, freeing `
     + `${bytes(repo.size_on_disk)}. Any server still pointing at it will fail to load, and `
     + 'getting it back means downloading it again.',
     { confirmLabel: 'Delete from cache' },
@@ -122,7 +197,8 @@ async function deleteRepo(repo, button) {
   button.disabled = true;
   button.textContent = 'Deleting…';
   try {
-    const result = await del(`/hub/local/${repoPath(repo.repo_id)}`);
+    const query = state.node ? `?node=${encodeURIComponent(state.node)}` : '';
+    const result = await del(`/hub/local/${repoPath(repo.repo_id)}${query}`);
     toast(`Deleted ${repo.repo_id} — ${bytes(result.freed_bytes)} freed`, { level: 'ok' });
     await loadLocal();
   } catch (error) {
@@ -142,13 +218,18 @@ function localRow(repo) {
   return h('tr', null,
     h('td', null,
       h('div', { class: 'mono' }, repo.repo_id),
-      h('div', { class: 'faint small' }, refs ? `refs: ${refs}` : repo.path)),
+      // A peer's scan has no refs to name and its path is already the tile
+      // above, so the line is simply absent rather than restating either.
+      h('div', { class: 'faint small' }, refs ? `refs: ${refs}` : (repo.node ? '' : repo.path))),
     h('td', null, badge(servable ? 'succeeded' : 'info', repo.kind)),
     h('td', { class: 'num' }, bytes(repo.size_on_disk)),
     h('td', { class: 'num' }, String(repo.nb_files)),
     h('td', { class: 'num' },
-      h('span', { title: revisions.map((rev) => rev.sha).join('\n') },
-        String(revisions.length))),
+      revisions.length
+        ? h('span', { title: revisions.map((rev) => rev.sha).join('\n') },
+          String(revisions.length))
+        : h('span', { class: 'faint', title: 'a peer\'s cache is scanned by size, not by ref' },
+          '—')),
     h('td', { class: 'nowrap', title: when(repo.last_modified) }, ago(repo.last_modified)),
     h('td', { class: 'right nowrap' },
       h('div', { class: 'row', style: { justifyContent: 'flex-end' } },
@@ -170,23 +251,32 @@ function renderLocal() {
   const host = state.nodes.local;
   if (!host) return;
   const local = state.local;
-  if (!local) return mount(host, h('div', { class: 'row' }, spinner(), 'Scanning the cache…'));
+  if (!local) {
+    return mount(host, h('div', { class: 'row' }, spinner(),
+      `Scanning the cache on ${nodeLabel()}…`));
+  }
 
   const repos = local.repos || [];
   const free = freeDisk();
-  const disk = state.ctx?.telemetry()?.disk || {};
+  const disk = diskOf();
   const models = repos.filter((repo) => repo.kind === 'model').length;
   const adapters = repos.filter((repo) => repo.kind === 'adapter').length;
 
   mount(host,
-    local.ok ? null : notice('danger', h('strong', null, 'Cache unreadable. '), local.error),
+    local.ok
+      ? (local.error ? notice('warn', local.error) : null)
+      : notice('danger', h('strong', null, `Cache unreadable on ${nodeLabel()}. `), local.error),
     h('div', { class: 'grid cols-4', style: { marginBottom: '14px' } },
       stat('Cache on disk', bytes(local.size_on_disk || 0), local.cache_dir),
-      stat('Repos', String(repos.length), `${models} servable · ${adapters} adapters`),
+      stat('Repos', String(repos.length), state.node
+        ? `${models} model${models === 1 ? '' : 's'} · scanned over ssh`
+        : `${models} servable · ${adapters} adapters`),
       stat('Disk free', free === null ? '—' : bytes(free),
         disk.total_bytes ? `of ${bytes(disk.total_bytes)}` : ''),
-      stat('HF token', state.token.configured ? 'Configured' : 'Not set',
-        state.token.source ? `from ${state.token.source}` : 'anonymous rate limits')),
+      state.node
+        ? stat('Node', state.node, 'deletes and pulls here land on this machine')
+        : stat('HF token', state.token.configured ? 'Configured' : 'Not set',
+          state.token.source ? `from ${state.token.source}` : 'anonymous rate limits')),
     local.incomplete_bytes
       ? notice('warn', `${bytes(local.incomplete_bytes)} of partial downloads `
         + `(${local.incomplete_files} files) are sitting in the cache from interrupted pulls.`)
@@ -203,7 +293,8 @@ function renderLocal() {
             h('th', null, 'Modified'),
             h('th', { class: 'right' }, 'Actions'))),
           h('tbody', null, repos.map(localRow))))
-      : empty('Nothing cached yet', 'Search the Hub below and pull a model to get started.'),
+      : empty(`Nothing cached on ${nodeLabel()}`,
+        'Search the Hub below and pull a model to get started.'),
     repos.length
       ? h('p', { class: 'faint small', style: { marginBottom: 0 } },
         `Deleting every repo here would reclaim ${bytes(local.size_on_disk || 0)}.`)
@@ -239,7 +330,7 @@ function resultRow(model, cached) {
     h('div', { class: 'r-main' },
       h('div', { class: 'row wrap' },
         h('span', { class: 'r-id' }, model.id),
-        cached ? badge('succeeded', 'in cache') : null,
+        cached ? badge('succeeded', state.node ? `on ${state.node}` : 'in cache') : null,
         gatedLabel ? badge('starting', gatedLabel) : null,
         model.private ? badge('info', 'private') : null),
       h('div', { class: 'r-meta' },
@@ -256,7 +347,11 @@ function resultRow(model, cached) {
         : null),
     h('div', { class: 'r-actions' },
       h('button', { class: 'btn-sm', onClick: () => openDetail(model.id) }, 'Details'),
-      h('button', { class: 'btn-sm btn-primary', onClick: () => pull(model.id) }, 'Pull')));
+      h('button', {
+        class: 'btn-sm btn-primary',
+        title: `Download onto ${nodeLabel()}`,
+        onClick: () => pull(model.id),
+      }, state.node ? `Pull to ${state.node}` : 'Pull')));
 }
 
 function renderResults() {
@@ -386,7 +481,7 @@ async function pull(repoId, known = null) {
     `${bytes(fetchBytes)} to fetch of ${bytes(estimate.total_bytes || 0)} `
     + `(${bytes(estimate.cached_bytes || 0)} already cached).`,
   ];
-  if (free !== null) lines.push(`Disk free: ${bytes(free)}.`);
+  if (free !== null) lines.push(`Disk free on ${nodeLabel()}: ${bytes(free)}.`);
   if (tooBig) {
     lines.push('That does not fit — the download will fail part-way and leave partial blobs '
       + 'behind. Delete something from the cache first.');
@@ -398,16 +493,17 @@ async function pull(repoId, known = null) {
     lines.push('This is a LoRA adapter — it needs its base model to be served with --enable-lora.');
   }
 
-  const ok = await confirmDialog(`Pull ${repoId}?`, lines.join(' '), {
+  const ok = await confirmDialog(`Pull ${repoId} onto ${nodeLabel()}?`, lines.join(' '), {
     danger: tooBig,
     confirmLabel: tooBig ? 'Pull anyway' : 'Pull',
   });
   if (!ok) return;
 
   try {
-    const { job_id: jobId } = await post('/hub/download', { repo_id: repoId });
+    const { job_id: jobId } = await post('/hub/download',
+      { repo_id: repoId, node: state.node });
     attachDownload(jobId, repoId, estimate.fetch_bytes || 0);
-    toast(`Pulling ${repoId} — job ${jobId}`, { level: 'ok' });
+    toast(`Pulling ${repoId} onto ${nodeLabel()} — job ${jobId}`, { level: 'ok' });
   } catch (error) {
     const level = error instanceof ApiError && error.status === 409 ? 'warn' : 'danger';
     toast(error.message, { level, title: 'Pull not started' });
@@ -612,6 +708,7 @@ export async function render(container, ctx) {
   state.downloads = new Map();
   state.nodes = {
     downloads: h('div', null),
+    tabs: h('div', null),
     local: h('div', null),
     results: h('div', null),
   };
@@ -639,15 +736,20 @@ export async function render(container, ctx) {
     h('div', { class: 'page-head' },
       h('div', null,
         h('h1', null, 'Models'),
-        h('p', null, 'The HuggingFace cache is shared by every container on this box — vLLM '
+        h('p', null, 'The HuggingFace cache is shared by every container on a box — vLLM '
           + 'servers, fine-tuning runs and Heretic all read the same blobs, so pulling once is '
           + 'enough. Writes happen inside a root container, which is why a pull shows up as a '
-          + 'job.')),
+          + 'job. Each node keeps its own cache: pick one below and every pull and delete on '
+          + 'this page lands there.')),
       h('div', { class: 'page-actions' },
         h('button', { onClick: openTokenDialog }, 'HF token…'),
-        h('button', { onClick: () => { loadLocal(); loadToken(); } }, 'Refresh'))),
+        h('button', { onClick: () => { loadRegistry(); loadLocal(); loadToken(); } },
+          'Refresh'))),
     state.nodes.downloads,
-    panel('Local cache', { body: state.nodes.local }),
+    panel('Model cache', {
+      sub: 'per node',
+      body: [state.nodes.tabs, state.nodes.local],
+    }),
     panel('HuggingFace Hub', {
       sub: 'search',
       flush: true,
@@ -663,7 +765,7 @@ export async function render(container, ctx) {
     }));
 
   await loadToken();
-  await Promise.all([loadLocal(), runSearch(), adoptRunningDownloads()]);
+  await Promise.all([loadRegistry(), loadLocal(), runSearch(), adoptRunningDownloads()]);
 
   const requested = ctx.routeDetail();
   if (requested) openDetail(requested);
