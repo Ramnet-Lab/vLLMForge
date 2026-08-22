@@ -107,3 +107,29 @@ def test_a_token_stored_from_the_ui_reaches_server_containers():
         assert servers.build_env({"args": {}, "env": {}})["HF_TOKEN"] == "hf_probe"
     finally:
         db.set_setting("hf_token", previous)
+
+
+def test_renaming_onto_a_taken_name_is_a_conflict_not_a_crash():
+    """Names are unique in the table. Create answered 409 and rename did not,
+    so it reached sqlite as an IntegrityError and came back a 500 — and a name
+    derived from the model is exactly the name a second server wants."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    first = client.post("/api/servers", json={
+        "name": "qwen3-chat", "model": "org/qwen3", "port": 8401}).json()
+    second = client.post("/api/servers", json={
+        "name": "qwen3-chat-2", "model": "org/qwen3", "port": 8402}).json()
+
+    clash = client.patch(f"/api/servers/{second['id']}", json={"name": "qwen3-chat"})
+    assert clash.status_code == 409
+    assert "already exists" in clash.json()["detail"]
+
+    # Renaming a server to the name it already has is not a clash with itself.
+    same = client.patch(f"/api/servers/{first['id']}", json={"name": "qwen3-chat"})
+    assert same.status_code == 200
+
+    for row in (first, second):
+        servers.delete_server(int(row["id"]))

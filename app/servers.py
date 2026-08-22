@@ -230,7 +230,10 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
     engine is told how many stages to split into.
     """
     pool = pool_of(server)
-    plan = await cluster.plan(pool)
+    # The arguments go with it: a pooled launch used to skip the memory guard
+    # entirely, which is how a definition asking for 0.95 of a box with 0.88
+    # free reached vLLM and died four minutes in.
+    plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {})
     if not plan["ok"] and not force:
         return {"started": False, "error": plan.get("reason", "cannot pool across these nodes"),
                 "plan": plan}

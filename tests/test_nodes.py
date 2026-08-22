@@ -339,3 +339,64 @@ def test_one_repo_can_download_onto_two_nodes_at_once(monkeypatch):
     assert hf._running_download("org/model", "local") == "job-local"
     assert hf._running_download("org/model", "node2") is None
     assert hf._running_download("org/other", "local") is None
+
+
+# --- the guard on a pooled launch -----------------------------------------
+
+
+@pytest.mark.anyio
+async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
+    """A pooled engine declares the same utilisation fraction on each machine it
+    spans. Asking only the head is how a config that cannot start anywhere gets
+    accepted — which is exactly the launch that failed with 'free memory on
+    device cuda:0 (107.81/121.69 GiB) is less than desired (0.95, 115.6 GiB)'."""
+    from app import cluster, safety
+
+    wired = [nodes.Node(name="node1", address="10.0.0.1", docker_host=""),
+             nodes.Node(name="node2", address="10.0.0.2", docker_host="ssh://node2")]
+    monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
+    monkeypatch.setattr(nodes, "by_name", lambda name: next(
+        (n for n in wired if n.name == name), wired[0]))
+
+    async def fake_wiring(node, prefix):
+        return cluster.NodeWiring(node=node, interface="enp1s0", address=f"{prefix}.1")
+
+    async def has_image(*a, **k):
+        return True
+
+    async def budget(node=None, exclude=None):
+        # max_util and free_util are derived; 12% held back leaves 0.88 free.
+        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
+                             free_bytes=TOTAL, reserve_bytes=int(TOTAL * 0.12))
+
+    seen: list[str] = []
+
+    async def check(util, *, replacing=None, params=None, node=None):
+        seen.append(node.name)
+        fits = (util or 0) <= 0.88
+        return safety.Verdict(
+            ok=fits, level="ok" if fits else "block",
+            message="fits" if fits else f"0.95 of {node.name} needs more than is free",
+            budget={}, requested_util=util or 0.0)
+
+    monkeypatch.setattr(cluster, "wiring", fake_wiring)
+    monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
+    monkeypatch.setattr(cluster.safety, "current_budget", budget)
+    monkeypatch.setattr(cluster.safety, "check_launch", check)
+
+    greedy = await cluster.plan(["node1", "node2"], "", {"gpu_memory_utilization": 0.95})
+    assert seen == ["node1", "node2"], "every node in the pool is asked"
+    assert greedy["ok"] is False
+    assert "node1" in greedy["reason"] and "node2" in greedy["reason"]
+    assert greedy["free_util"] == pytest.approx(0.88, abs=0.01)
+
+    seen.clear()
+    modest = await cluster.plan(["node1", "node2"], "", {"gpu_memory_utilization": 0.80})
+    assert modest["ok"] is True
+    assert [n["verdict"]["ok"] for n in modest["nodes"]] == [True, True]
+
+    # Without arguments there is nothing to judge, and the plan stays a plan.
+    seen.clear()
+    bare = await cluster.plan(["node1", "node2"], "")
+    assert bare["ok"] is True and seen == []
+    assert all(n["verdict"] is None for n in bare["nodes"])

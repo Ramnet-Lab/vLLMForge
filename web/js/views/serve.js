@@ -23,6 +23,9 @@ import {
 } from '../ui.js';
 
 const STYLES = `
+.serve-pool-budgets { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.serve-pool-budgets .ov-key { display: inline-flex; align-items: center; gap: 6px; }
+
 /* What the model is, read off disk. Sits directly under the basics so the
    answer is beside the question that provoked it. */
 .serve-profile {
@@ -747,7 +750,7 @@ async function loadPoolDetail() {
     get(`/servers/pool/status?${query}`).catch((error) => ({ error: error.message })),
     // The plan is what this pool could hold and whether it could start again;
     // it walks every node, so it is read once per selection, not on the poll.
-    post('/servers/pool/plan', { nodes: pool, model: server.model })
+    post('/servers/pool/plan', { nodes: pool, model: server.model, args: server.args || {} })
       .catch((error) => ({ ok: false, reason: error.message })),
   ]);
   if (state.pool.forServer !== server.id) return;
@@ -1209,7 +1212,12 @@ function setArg(arg, value) {
   else editor.args[arg.dest] = value;
   const el = editor.fields.get(arg.dest);
   if (el) el.classList.toggle('changed', !isDefaultValue(arg, editor.args[arg.dest]));
-  if (arg.dest === 'gpu_memory_utilization') scheduleSafety();
+  if (arg.dest === 'gpu_memory_utilization') {
+    scheduleSafety();
+    // A pooled definition has no single-node verdict; its answer comes from
+    // the plan, so the plan is what has to be re-asked.
+    if (state.editor?.form.pooled) schedulePlan();
+  }
 }
 
 /** Returns [control element, setter] — the setter is what presets drive. */
@@ -1971,7 +1979,11 @@ async function runPlan() {
   if (!editor || !editor.form.pooled) return;
   const pool = [...editor.form.pool];
   const model = editor.form.model.trim();
-  const key = `${pool.join(',')}|${model}`;
+  // The arguments are part of the question now: the plan runs the memory guard
+  // on every node in the pool, so a change to the utilisation fraction is a
+  // different question and has to re-ask it.
+  const args = { ...editor.args };
+  const key = `${pool.join(',')}|${model}|${JSON.stringify(args)}`;
   editor.planKey = key;
 
   if (pool.length < 2) {
@@ -1988,7 +2000,7 @@ async function runPlan() {
   mountPoolSafety();
   let plan;
   try {
-    plan = await post('/servers/pool/plan', { nodes: pool, model });
+    plan = await post('/servers/pool/plan', { nodes: pool, model, args });
   } catch (error) {
     plan = { ok: false, reason: error.message };
   }
@@ -2030,8 +2042,31 @@ function renderPlan() {
       : notice('danger',
         h('strong', null, 'Cannot launch. '),
         plan.reason || 'the cluster cannot take this pool'),
+    poolBudgets(plan),
     (plan.missing_model_on || []).map((name) => missingModelRow(name)),
     (plan.missing_image || []).length ? missingImageNotice(plan.missing_image) : null);
+}
+
+/** What each machine in the pool can give, and what this configuration asks of
+ *  it. A pooled engine declares the same utilisation fraction on every node it
+ *  spans, so the tightest one decides — and until now nothing in this form
+ *  showed the fraction against any node at all. */
+function poolBudgets(plan) {
+  const rows = (plan.nodes || []).filter((node) => node.verdict);
+  if (!rows.length) return null;
+  const asked = rows[0].verdict.requested_util;
+  return h('div', { class: 'serve-pool-budgets' },
+    h('div', { class: 'faint small' },
+      `Asking ${asked ? asked.toFixed(2) : '—'} of each machine; the tightest can give `
+      + `${(plan.free_util ?? 0).toFixed(2)}.`),
+    h('div', { class: 'row wrap' }, rows.map((node) => h('span', {
+      class: 'ov-key',
+      title: node.verdict.message,
+    },
+    badge(node.verdict.level === 'ok' ? 'running'
+      : node.verdict.level === 'warn' ? 'starting' : 'failed', node.name),
+    h('span', { class: 'faint small' },
+      `${node.free_util.toFixed(2)} free of ${bytes(node.total_bytes)}`)))));
 }
 
 /* A blocker the operator can clear from here: the bytes are already on this

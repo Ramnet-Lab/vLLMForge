@@ -73,7 +73,11 @@ async def pool_plan(payload: dict) -> dict:
     """What pooling across these nodes would give, and what stands in the way."""
     from app import cluster
 
-    return await cluster.plan(payload.get("nodes") or [], payload.get("model") or "")
+    return await cluster.plan(
+        payload.get("nodes") or [],
+        payload.get("model") or "",
+        payload.get("args") if isinstance(payload.get("args"), dict) else None,
+    )
 
 
 @router.get("/pool/status")
@@ -175,6 +179,14 @@ async def update(server_id: int, payload: ServerPatch) -> dict:
         problems = vllm_spec.validate(payload.args)
         if problems:
             raise HTTPException(422, "; ".join(problems))
+    if payload.name:
+        # Names are unique in the table. Create checks and answers 409; rename
+        # did not, so it reached sqlite and came back as an unhandled 500 —
+        # which is now easy to hit, since a name derived from the model is
+        # exactly the name a second server for that model would want.
+        clash = await asyncio.to_thread(svc.get_by_name, payload.name)
+        if clash and int(clash["id"]) != server_id:
+            raise HTTPException(409, f"a server named '{payload.name}' already exists")
     server = await asyncio.to_thread(
         svc.update_server, server_id, payload.model_dump(exclude_none=True)
     )

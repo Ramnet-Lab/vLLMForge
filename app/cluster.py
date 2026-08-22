@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app import docker_ctl, nodes, safety
+from app import docker_ctl, nodes, safety, vllm_spec
 from app.config import settings
 
 RAY_PORT = 6379
@@ -94,12 +94,18 @@ async def wiring(node: nodes.Node, prefix: str) -> NodeWiring:
     return NodeWiring(node=node)
 
 
-async def plan(node_names: list[str], model: str = "") -> dict[str, Any]:
+async def plan(node_names: list[str], model: str = "",
+               args: dict[str, Any] | None = None) -> dict[str, Any]:
     """Everything that has to be true before a pooled engine can start.
 
     Given a model, this also reports which nodes are missing it — the answer the
     form needs *before* a launch, since each node loads its own shard from its
     own disk and a missing model there surfaces minutes in.
+
+    Given the arguments too, it runs the memory guard on every node. A pooled
+    engine declares the same utilisation fraction on each machine it spans, so
+    "does this fit" has to be asked of all of them; asking only the head is how
+    a config that cannot start anywhere gets accepted.
     """
     prefix = _subnet_prefix()
     if not prefix:
@@ -125,12 +131,22 @@ async def plan(node_names: list[str], model: str = "") -> dict[str, Any]:
 
     missing_model_on = await missing_model(model, node_names) if model else []
 
+    # The same fraction, judged against each machine's own free memory.
+    util = vllm_spec.gpu_memory_utilization(args or {})
+    verdicts = await asyncio.gather(*(
+        safety.check_launch(util, params=args, node=w.node) for w in wirings
+    )) if args is not None else [None] * len(wirings)
+    refused = [(w.node.name, v) for w, v in zip(wirings, verdicts, strict=True)
+               if v is not None and not v.ok]
+
     # A missing image is a blocker: nothing here can build it on a peer.
     # A missing model is not — the launch copies it over the cluster link
     # before starting the engine, so it is work to be done, not a refusal.
     reasons = []
     if missing_image:
         reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
+    for name, verdict in refused:
+        reasons.append(f"{name}: {verdict.message}")
 
     will_sync = ""
     if missing_model_on:
@@ -152,10 +168,13 @@ async def plan(node_names: list[str], model: str = "") -> dict[str, Any]:
                 "local": w.node.is_local,
                 "free_util": round(b.free_util, 3),
                 "total_bytes": b.total_bytes,
+                "verdict": v.as_dict() if v is not None else None,
             }
-            for w, b in zip(wirings, budgets, strict=True)
+            for w, b, v in zip(wirings, budgets, verdicts, strict=True)
         ],
         "pipeline_parallel_size": len(wirings),
+        # A pooled engine can only ask for what the tightest node can give.
+        "free_util": round(min((b.free_util for b in budgets), default=0.0), 3),
         "pooled_bytes": pooled_bytes,
         "single_node_bytes": int(budgets[0].max_util * budgets[0].total_bytes),
         "missing_image": missing_image,
