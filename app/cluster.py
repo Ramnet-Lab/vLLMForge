@@ -94,8 +94,13 @@ async def wiring(node: nodes.Node, prefix: str) -> NodeWiring:
     return NodeWiring(node=node)
 
 
-async def plan(node_names: list[str]) -> dict[str, Any]:
-    """Everything that has to be true before a pooled engine can start."""
+async def plan(node_names: list[str], model: str = "") -> dict[str, Any]:
+    """Everything that has to be true before a pooled engine can start.
+
+    Given a model, this also reports which nodes are missing it — the answer the
+    form needs *before* a launch, since each node loads its own shard from its
+    own disk and a missing model there surfaces minutes in.
+    """
     prefix = _subnet_prefix()
     if not prefix:
         return {"ok": False, "reason": f"no cluster subnet on {settings.roce_interface}"}
@@ -118,10 +123,19 @@ async def plan(node_names: list[str]) -> dict[str, Any]:
     budgets = await asyncio.gather(*(safety.current_budget(node=w.node) for w in wirings))
     pooled_bytes = sum(int(b.max_util * b.total_bytes) for b in budgets)
 
+    missing_model_on = await missing_model(model, node_names) if model else []
+
+    reasons = []
+    if missing_image:
+        reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
+    if missing_model_on:
+        reasons.append(f"{model} is not cached on: {', '.join(missing_model_on)}")
+
     return {
-        "ok": not missing_image,
-        "reason": (f"{settings.ray_image} is not built on: {', '.join(missing_image)}"
-                   if missing_image else ""),
+        "ok": not reasons,
+        "reason": "; ".join(reasons),
+        "missing_model_on": missing_model_on,
+        "model": model,
         "head": wirings[0].node.name,
         "nodes": [
             {
@@ -218,22 +232,47 @@ async def stop_workers(wirings: list[NodeWiring]) -> None:
         await docker_ctl.remove(WORKER, force=True, host=worker.node.docker_host)
 
 
-async def status(node_names: list[str]) -> dict:
-    """Is a Ray cluster up, and does it have everyone?"""
+async def status(node_names: list[str], container: str = "") -> dict:
+    """Is this pool's Ray cluster up, and does it have everyone?
+
+    The engine container IS the Ray head, so the head's health is the engine's:
+    there is no separate head container to ask any more. Without a container
+    name all that can be reported is which peers are carrying a worker.
+    """
     if not node_names:
-        return {"running": False, "nodes": 0, "raw": ""}
+        return {"running": False, "nodes": 0, "expected": 0, "raw": ""}
+
     head = nodes.by_name(node_names[0])
-    state = await docker_ctl.state(HEAD, head.docker_host)  # legacy standalone head
+    workers = []
+    for name in node_names[1:]:
+        peer = nodes.by_name(name)
+        state = await docker_ctl.state(WORKER, peer.docker_host)
+        workers.append({"node": peer.name, "running": state.running, "status": state.ui_status})
+
+    if not container:
+        return {
+            "running": all(w["running"] for w in workers) and bool(workers),
+            "head": head.name,
+            "nodes": sum(1 for w in workers if w["running"]) + 1,
+            "expected": len(node_names),
+            "workers": workers,
+            "raw": "",
+        }
+
+    state = await docker_ctl.state(container, head.docker_host)
     if not state.running:
-        return {"running": False, "nodes": 0, "head": head.name, "raw": ""}
+        return {"running": False, "head": head.name, "nodes": 0,
+                "expected": len(node_names), "workers": workers, "raw": ""}
+
     code, out, _ = await docker_ctl._run(
-        docker_ctl.docker_argv(head.docker_host, "exec", HEAD, "ray", "status"), check=False
+        docker_ctl.docker_argv(head.docker_host, "exec", container, "ray", "status"), check=False
     )
     return {
         "running": True,
         "head": head.name,
         "nodes": out.count("node_") if code == 0 else 0,
         "expected": len(node_names),
+        "workers": workers,
         "raw": out[-2000:],
     }
 

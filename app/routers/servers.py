@@ -72,14 +72,24 @@ async def pool_plan(payload: dict) -> dict:
     """What pooling across these nodes would give, and what stands in the way."""
     from app import cluster
 
-    return await cluster.plan(payload.get("nodes") or [])
+    return await cluster.plan(payload.get("nodes") or [], payload.get("model") or "")
 
 
 @router.get("/pool/status")
-async def pool_status(nodes: str = "") -> dict:
+async def pool_status(nodes: str = "", server_id: int | None = None) -> dict:
+    """Pool health. Pass server_id to ask the engine itself — it is the Ray head,
+    so its `ray status` is the authoritative view of who joined."""
     from app import cluster
 
-    return await cluster.status([n for n in nodes.split(",") if n])
+    container = ""
+    names = [n for n in nodes.split(",") if n]
+    if server_id is not None:
+        server = await asyncio.to_thread(svc.get_server, server_id)
+        if server is None:
+            raise HTTPException(404, "no such server")
+        container = svc.container_name(server)
+        names = names or svc.pool_of(server)
+    return await cluster.status(names, container)
 
 
 @router.get("/paths")

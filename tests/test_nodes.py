@@ -184,3 +184,67 @@ def test_a_pooled_servers_containers_live_on_its_head():
         ) == "ssh://peer-x"
     finally:
         db.set_setting("nodes", previous)
+
+
+@pytest.mark.asyncio
+async def test_the_plan_reports_a_model_missing_from_a_node(monkeypatch):
+    """Each node loads its own shard from its own disk, so a model present only
+    on the head fails minutes into a launch. The form needs to know first."""
+    from app import cluster
+
+    async def only_here(model, node_names):
+        return [n for n in node_names if n != "local"]
+
+    async def fine(*a, **k):
+        return True
+
+    async def budget(node=None, exclude=None):
+        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
+                             reserve_bytes=32 * GIB, warn_reserve_bytes=38 * GIB)
+
+    monkeypatch.setattr(cluster, "missing_model", only_here)
+    monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
+    monkeypatch.setattr(cluster.docker_ctl, "image_exists", fine)
+    monkeypatch.setattr(cluster.safety, "current_budget", budget)
+
+    async def wired(node, prefix):
+        return cluster.NodeWiring(node=node, interface="eth0", address="10.0.0.1")
+
+    monkeypatch.setattr(cluster, "wiring", wired)
+
+    from app import db
+
+    previous = db.get_setting("nodes", [])
+    try:
+        nodes.add("peer-y", address="10.0.0.2")
+        result = await cluster.plan(["local", "peer-y"], "org/model")
+        assert not result["ok"]
+        assert result["missing_model_on"] == ["peer-y"]
+        assert "not cached on" in result["reason"]
+
+        clean = await cluster.plan(["local", "peer-y"], "")
+        assert clean["ok"], "with no model named there is nothing to be missing"
+    finally:
+        db.set_setting("nodes", previous)
+
+
+@pytest.mark.asyncio
+async def test_pool_status_asks_the_engine_because_it_is_the_head(monkeypatch):
+    from app import cluster, docker_ctl
+
+    seen = {}
+
+    async def state(name, host=None):
+        return docker_ctl.ContainerState(name=name, exists=True, status="running", running=True)
+
+    async def run(argv, check=True):
+        seen["argv"] = argv
+        return 0, "node_aaa\nnode_bbb\n", ""
+
+    monkeypatch.setattr(cluster.docker_ctl, "state", state)
+    monkeypatch.setattr(cluster.docker_ctl, "_run", run)
+
+    result = await cluster.status(["local", "node2"], container="llmd-vllm-9")
+    # There is no standalone head container any more; the engine is the head.
+    assert "llmd-vllm-9" in seen["argv"] and "llmd-ray-head" not in seen["argv"]
+    assert result["nodes"] == 2 and result["expected"] == 2
