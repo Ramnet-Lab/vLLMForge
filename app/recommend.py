@@ -41,10 +41,30 @@ from app.model_profile import Profile
 # recommendation from being refused by a machine that got a little busier.
 UTIL_MARGIN = 0.03
 
+# What a first-try configuration plans for. vLLM will still fit the context to
+# whatever is actually left, so this only decides how much of the machine to
+# reserve — and reserving all of it for a model that wants a fraction is how a
+# box ends up holding one engine when it could hold three.
+TARGET_CONTEXT = 32768
+
+# Everything resident that is neither weights nor KV cache: the CUDA context,
+# torch's allocator, compiled graphs, activations. vLLM measures this with a
+# real profiling run and no offline figure can match it, so this is a constant
+# with the concurrency factor below absorbing the error.
+OVERHEAD_BYTES = 6 * 1024 ** 3
+MULTIMODAL_OVERHEAD_BYTES = 2 * 1024 ** 3
+
+# KV for more than one sequence at a time. A server that can only hold a single
+# conversation is not one anybody wanted.
+CONCURRENCY = 2
+
 # Flags a recommendation deliberately leaves alone, with the reason. Shown to
 # the operator, because "why didn't it set the quantisation" is the obvious
 # question and the answer is that setting it makes things worse.
 LEFT_ALONE = (
+    ("kv_cache_memory_bytes", "vLLM sizes the cache from what is left after loading, and a "
+                              "number here overrides that measurement with a guess"),
+    ("enforce_eager", "cuda graphs are worth their memory; turn this on only to diagnose"),
     ("quantization", "the checkpoint declares its own method and vLLM detects it; "
                      "naming it here can only disagree"),
     ("dtype", "vLLM resolves it from the checkpoint and refuses float16 where a model "
@@ -103,6 +123,21 @@ def _gib(value: float) -> str:
     return f"{value / 1024 ** 3:.1f} GiB"
 
 
+def needed_utilisation(profile: Profile, total_bytes: int, context: int) -> float | None:
+    """The fraction this model actually wants, as opposed to the most it may have.
+
+    Weights, plus a fixed overhead for the CUDA context and compiled graphs,
+    plus KV cache for a couple of concurrent sequences at the target context.
+    Rounded up: the point is to fit, not to be exact.
+    """
+    if total_bytes <= 0 or not profile.weight_bytes:
+        return None
+    kv = profile.kv_bytes(context) or 0
+    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
+    wanted = profile.weight_bytes + overhead + CONCURRENCY * kv
+    return math.ceil(wanted / total_bytes * 100) / 100
+
+
 def safe_utilisation(total_bytes: int, available_bytes: int, budget_free_util: float) -> float:
     """The largest --gpu-memory-utilization that will actually start.
 
@@ -155,7 +190,9 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None) 
     _memory(rec, profile, total, available, budget.free_util)
     if profile.found:
         _loading(rec, profile)
+        _quantisation(rec, profile)
         _serving(rec, profile)
+    _existing(rec, args or {})
 
     rec.left_alone = [{"dest": dest, "why": why} for dest, why in LEFT_ALONE]
     _finish(rec, profile, args or {})
@@ -201,13 +238,23 @@ def _blockers(rec: Recommendation, profile: Profile, available: int) -> None:
 
 def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
             free_util: float) -> None:
-    util = safe_utilisation(total, available, free_util)
+    ceiling = safe_utilisation(total, available, free_util)
+    context = min(profile.max_position_embeddings or TARGET_CONTEXT, TARGET_CONTEXT)
+    wanted = needed_utilisation(profile, total, context) if profile.found else None
+
+    util = min(ceiling, wanted) if wanted else ceiling
     if util > 0:
-        rec.suggestions.append(Suggestion(
-            "gpu_memory_utilization", util,
-            f"vLLM refuses to start when the fraction it asks for exceeds free memory, and "
-            f"{_gib(available)} of {_gib(total)} is free — so its own default of "
-            f"{safety.default_util():g} would be refused on this machine."))
+        if wanted and wanted <= ceiling:
+            why = (
+                f"Enough for {_gib(profile.weight_bytes)} of weights and a {context:,}-token "
+                f"context for a couple of callers at once. The ceiling here is {ceiling:g} — "
+                "raise it for a longer context, or leave the rest for another engine.")
+        else:
+            why = (
+                f"The most this machine can give: vLLM refuses to start when the fraction it "
+                f"asks for exceeds available memory, and {_gib(available)} of {_gib(total)} is "
+                f"available, so its own default of {safety.default_util():g} would be refused.")
+        rec.suggestions.append(Suggestion("gpu_memory_utilization", util, why))
 
     # Letting vLLM fit the context beats computing it: it sizes max_model_len
     # against the KV cache left after it has profiled the real model, which is
@@ -218,14 +265,66 @@ def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
         "vLLM measures what is left after loading and fits the context to it, instead of "
         "refusing to start because the config advertises more than the KV cache can hold."))
 
-    if profile.max_position_embeddings and profile.kv_bytes(profile.max_position_embeddings):
-        full = profile.kv_bytes(profile.max_position_embeddings) or 0
-        budget_bytes = int(util * total) - profile.weight_bytes
-        if budget_bytes > 0 and full > budget_bytes:
+    _context_note(rec, profile, util, total)
+
+
+def _context_note(rec: Recommendation, profile: Profile, util: float, total: int) -> None:
+    """Roughly what context this will actually serve.
+
+    A statement, not a warning: with --max-model-len auto a context shorter than
+    the config advertises is the normal, correct outcome, and calling it a
+    problem trains the operator to ignore the panel.
+    """
+    advertised = profile.max_position_embeddings
+    per_token = profile.kv_bytes_per_token()
+    if not (advertised and per_token):
+        return
+
+    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
+    for_kv = int(util * total) - profile.weight_bytes - overhead
+    if for_kv <= 0:
+        return
+    fits = int(for_kv / CONCURRENCY / per_token)
+    if fits >= advertised:
+        return
+    rec.findings.append(Finding("ok", (
+        f"That fits roughly {fits // 1024:,}k tokens of context, of the {advertised // 1024:,}k "
+        "the config advertises. vLLM measures the real figure at startup; raise the "
+        "utilisation for more.")))
+
+
+def _quantisation(rec: Recommendation, profile: Profile) -> None:
+    """Two checkpoint shapes that load and then fail, both present in this cache.
+
+    Neither is a configuration problem — no flag rescues either — so they are
+    said before a launch rather than discovered from an abort partway through
+    weight loading.
+    """
+    quant = profile.quantization or {}
+    groups = quant.get("config_groups") or {}
+    strategies = {
+        str((group.get("weights") or {}).get("strategy") or "")
+        for group in groups.values() if isinstance(group, dict)
+    }
+
+    if profile.quant_method == "compressed-tensors" and "block" in strategies:
+        rec.findings.append(Finding("warn", (
+            "These are FP8 block-quantised weights, and block layouts hit a DeepGEMM assertion "
+            "on this GPU in vLLM 0.24 — the engine loads them and then aborts. A per-channel or "
+            "per-tensor FP8 build of the same model avoids it, as does the unquantised one.")))
+
+    if profile.quant_method == "modelopt" and profile.tie_word_embeddings:
+        # The tied pair is embed_tokens and lm_head; an entry naming either
+        # exempts it. `model.embed_vision*` does not — that is a different
+        # tensor, and matching it loosely would silence a real warning.
+        exempted = any(
+            "embed_tokens" in str(entry) or "lm_head" in str(entry)
+            for entry in (quant.get("ignore") or []))
+        if not exempted:
             rec.findings.append(Finding("warn", (
-                f"Its full {profile.max_position_embeddings:,}-token context needs {_gib(full)} "
-                f"of KV cache and about {_gib(budget_bytes)} is left after the weights, so the "
-                "served context will be shorter than the config advertises.")))
+                "This checkpoint quantises a tied input embedding, which this build cannot "
+                "untie — model construction raises NotImplementedError. The unquantised base "
+                "model, or a checkpoint whose ignore list exempts embed_tokens, loads.")))
 
 
 def _loading(rec: Recommendation, profile: Profile) -> None:
@@ -258,6 +357,19 @@ def _serving(rec: Recommendation, profile: Profile) -> None:
         rec.findings.append(Finding("warn", (
             "The repo ships no chat template. The server starts and /v1/completions works, but "
             "every /v1/chat/completions request fails until a template is supplied.")))
+
+
+def _existing(rec: Recommendation, args: dict[str, Any]) -> None:
+    """Flags already set that this machine makes worse rather than better."""
+    try:
+        offload = float(args.get("cpu_offload_gb") or 0)
+    except (TypeError, ValueError):
+        offload = 0.0
+    if offload > 0:
+        rec.findings.append(Finding("warn", (
+            "--cpu-offload-gb frees nothing here: GPU memory is host memory on this machine, so "
+            "the offloaded weights sit in the same pool, pinned and unreclaimable, and every "
+            "forward pass reads them back over the same bus.")))
 
 
 def _finish(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None:

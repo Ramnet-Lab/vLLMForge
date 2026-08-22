@@ -195,3 +195,100 @@ async def test_an_unregistered_architecture_warns_without_refusing(box):
     rec = (await recommend.build("org/odd")).to_dict()
     assert rec["ok"] is True and rec["level"] == "warn"
     assert any("Transformers backend" in f["text"] for f in rec["findings"])
+
+
+@pytest.mark.anyio
+async def test_the_utilisation_is_sized_to_the_model_not_to_the_machine(box):
+    """Reserving the whole box for a model that wants a fraction is how a
+    machine ends up holding one engine when it could hold three."""
+    place, mp = box
+    small = mp.Profile(reference="org/small", found=True, architectures=["LlamaForCausalLM"],
+                       max_position_embeddings=40960, num_hidden_layers=36,
+                       num_key_value_heads=8, head_dim=128, weight_bytes=14 * GIB,
+                       has_safetensors=True, chat_template=True, supported=True)
+    place(small)
+    modest = (await recommend.build("org/small")).to_dict()
+
+    big = mp.Profile(**{**small.__dict__, "reference": "org/big", "weight_bytes": 58 * GIB})
+    place(big)
+    large = (await recommend.build("org/big")).to_dict()
+
+    assert modest["args"]["gpu_memory_utilization"] < large["args"]["gpu_memory_utilization"]
+    # And neither takes the whole ceiling just because it is there.
+    ceiling = recommend.safe_utilisation(int(TOTAL), int(100 * GIB), 0.73)
+    assert modest["args"]["gpu_memory_utilization"] < ceiling
+
+
+@pytest.mark.anyio
+async def test_a_model_too_big_for_a_comfortable_fit_still_gets_the_ceiling(box):
+    """When what it wants exceeds what the machine can give, the answer is the
+    most the machine can give — not a number that cannot start."""
+    place, mp = box
+    place(mp.Profile(reference="org/big", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=131072, num_hidden_layers=60,
+                     num_key_value_heads=16, head_dim=256, weight_bytes=int(75 * GIB),
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/big")).to_dict()
+    ceiling = recommend.safe_utilisation(int(TOTAL), int(100 * GIB), 0.73)
+    assert rec["args"]["gpu_memory_utilization"] == ceiling
+    assert "The most this machine can give" in rec["suggestions"][0]["why"]
+
+
+@pytest.mark.anyio
+async def test_a_shorter_context_than_advertised_is_stated_not_warned(box):
+    """With --max-model-len auto, a context shorter than the config advertises is
+    the normal outcome. Calling it a problem trains the operator to ignore the
+    panel."""
+    place, mp = box
+    place(mp.Profile(reference="org/long", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=262144, num_hidden_layers=60,
+                     num_key_value_heads=16, head_dim=256, weight_bytes=20 * GIB,
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/long")).to_dict()
+    context = [f for f in rec["findings"] if "of context" in f["text"]]
+    assert context and context[0]["level"] == "ok"
+    assert rec["level"] == "ok"
+
+
+@pytest.mark.anyio
+async def test_fp8_block_weights_are_flagged_for_this_gpu(box):
+    place, mp = box
+    place(mp.Profile(reference="org/fp8", found=True, architectures=["LlamaForCausalLM"],
+                     quant_method="compressed-tensors", weight_bytes=30 * GIB,
+                     quantization={"config_groups": {"FP8_BLOCK": {
+                         "weights": {"strategy": "block", "block_structure": [128, 128]}}}},
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/fp8")).to_dict()
+    assert any("DeepGEMM" in f["text"] for f in rec["findings"])
+
+
+@pytest.mark.anyio
+async def test_a_quantised_tied_embedding_is_flagged_unless_it_is_exempt(box):
+    """model.embed_vision* is a different tensor; matching 'embed' loosely would
+    silence a real warning, and matching nothing would raise a false one."""
+    place, mp = box
+    base = dict(found=True, architectures=["LlamaForCausalLM"], quant_method="modelopt",
+                tie_word_embeddings=True, weight_bytes=30 * GIB, has_safetensors=True,
+                chat_template=True, supported=True)
+
+    place(mp.Profile(reference="org/tied", **base,
+                     quantization={"ignore": ["model.embed_vision*", "re:.*vision.*"]}))
+    flagged = (await recommend.build("org/tied")).to_dict()
+    assert any("tied input embedding" in f["text"] for f in flagged["findings"])
+
+    place(mp.Profile(reference="org/exempt", **base,
+                     quantization={"ignore": ["lm_head", "model.embed_vision*"]}))
+    clean = (await recommend.build("org/exempt")).to_dict()
+    assert not any("tied input embedding" in f["text"] for f in clean["findings"])
+
+
+@pytest.mark.anyio
+async def test_cpu_offload_is_called_out_on_unified_memory(box):
+    place, mp = box
+    place(mp.Profile(reference="org/m", found=True, architectures=["LlamaForCausalLM"],
+                     weight_bytes=8 * GIB, has_safetensors=True, chat_template=True,
+                     supported=True))
+    rec = (await recommend.build("org/m", "", {"cpu_offload_gb": 20})).to_dict()
+    assert any("frees nothing here" in f["text"] for f in rec["findings"])
+    clean = (await recommend.build("org/m", "", {})).to_dict()
+    assert not any("frees nothing here" in f["text"] for f in clean["findings"])
