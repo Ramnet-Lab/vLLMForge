@@ -123,6 +123,20 @@ def _gib(value: float) -> str:
     return f"{value / 1024 ** 3:.1f} GiB"
 
 
+def floor_utilisation(profile: Profile, total_bytes: int) -> float | None:
+    """The least utilisation that could possibly work.
+
+    vLLM's budget has to cover the weights before it covers anything else. Below
+    this, `--max-model-len auto` gives up with "not enough GPU memory available
+    to serve even a single token", and no other flag rescues it — so a value
+    under this floor is not a tight configuration, it is a broken one.
+    """
+    if total_bytes <= 0 or not profile.weight_bytes:
+        return None
+    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
+    return math.ceil((profile.weight_bytes + overhead) / total_bytes * 100) / 100
+
+
 def needed_utilisation(profile: Profile, total_bytes: int, context: int) -> float | None:
     """The fraction this model actually wants, as opposed to the most it may have.
 
@@ -236,7 +250,7 @@ def _blockers(rec: Recommendation, profile: Profile, available: int) -> None:
         rec.level = "block"
         rec.headline = "The weights alone do not fit."
         rec.findings.append(Finding("block", (
-            f"{_gib(profile.weight_bytes)} of weights against {_gib(available)} free. No "
+            f"{_gib(profile.weight_bytes)} of weights against {_gib(available)} available. No "
             "--gpu-memory-utilization serves it on this node right now — stop something, or "
             "pool it across machines.")))
 
@@ -271,8 +285,25 @@ def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
     ceiling = safe_utilisation(total, available, free_util)
     context = min(profile.max_position_embeddings or TARGET_CONTEXT, TARGET_CONTEXT)
     wanted = needed_utilisation(profile, total, context) if profile.found else None
+    floor = floor_utilisation(profile, total) if profile.found else None
+
+    # A value under the floor is not a tight configuration, it is one that
+    # cannot load the weights. Better to say so than to hand over a number that
+    # is certain to fail after four minutes of reading safetensors.
+    if floor and floor > ceiling:
+        rec.ok = False
+        rec.level = "block"
+        rec.headline = "Not enough room for this right now."
+        rec.findings.append(Finding("block", (
+            f"The weights alone need {floor:g} of this machine and only {ceiling:g} can be "
+            f"given — {_gib(available)} is available of {_gib(total)}. vLLM would read the whole "
+            "checkpoint and then give up with \"not enough GPU memory available to serve even a "
+            "single token\". Stop something, or pool it across machines.")))
+        return
 
     util = min(ceiling, wanted) if wanted else ceiling
+    if floor:
+        util = max(util, floor)
     if util > 0:
         if wanted and wanted <= ceiling:
             why = (

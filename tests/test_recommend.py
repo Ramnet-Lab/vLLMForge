@@ -412,3 +412,51 @@ async def test_pooling_a_model_that_does_not_fit_is_left_alone(box):
                      has_safetensors=True, chat_template=True, supported=True))
     spread = (await recommend.build("org/huge", "", {}, ["local", "node2"])).to_dict()
     assert not any("does not need" in f["text"] for f in spread["findings"])
+
+
+@pytest.mark.anyio
+async def test_a_utilisation_below_the_weights_is_refused_not_offered(box, monkeypatch):
+    """vLLM's budget has to cover the weights before it covers anything else.
+    Below that, --max-model-len auto gives up with 'not enough GPU memory
+    available to serve even a single token' — after reading the whole
+    checkpoint. Handing over a number certain to fail that way is worse than
+    saying it does not fit."""
+    from app import safety, telemetry
+
+    place, mp = box
+    place(mp.Profile(reference="org/big", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=131072, num_hidden_layers=30,
+                     num_key_value_heads=8, head_dim=256, weight_bytes=int(48 * GIB),
+                     has_safetensors=True, chat_template=True, supported=True))
+
+    # A busy machine: the weights still nominally fit in what is available, so
+    # the outright blocker does not fire — but the ceiling cannot cover them.
+    async def busy(node=None, exclude=None):
+        return safety.Budget(total_bytes=int(TOTAL), available_bytes=int(56 * GIB),
+                             free_bytes=int(56 * GIB), reserve_bytes=int(32 * GIB))
+
+    monkeypatch.setattr(recommend.safety, "current_budget", busy)
+    monkeypatch.setattr(recommend.telemetry, "read_meminfo", lambda: telemetry.HostMemory(
+        total_bytes=int(TOTAL), available_bytes=int(56 * GIB)))
+
+    rec = (await recommend.build("org/big")).to_dict()
+    assert rec["ok"] is False and rec["level"] == "block"
+    assert rec["args"] == {}
+    assert "serve even a single token" in rec["findings"][0]["text"]
+
+
+@pytest.mark.anyio
+async def test_the_floor_lifts_a_recommendation_that_would_be_too_small(box):
+    """When the ceiling is generous but the model is large, the answer must
+    still cover the weights — never the smaller of the two."""
+    place, mp = box
+    place(mp.Profile(reference="org/big", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=1024, num_hidden_layers=30,
+                     num_key_value_heads=8, head_dim=256, weight_bytes=int(48 * GIB),
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/big")).to_dict()
+    util = rec["args"]["gpu_memory_utilization"]
+    floor = recommend.floor_utilisation(
+        mp.Profile(reference="x", weight_bytes=int(48 * GIB)), int(TOTAL))
+    assert util >= floor
+    assert util * TOTAL > 48 * GIB, "the budget has to cover the weights"
