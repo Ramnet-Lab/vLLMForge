@@ -184,6 +184,11 @@ def classify(arg: dict) -> str:
         return "bool"
     if arg["choices"]:
         return "enum"
+    # vLLM takes "32k" and, for max-model-len, "auto" on these. A number input
+    # can hold neither, so they get a widget of their own rather than being
+    # rendered as something that silently refuses valid values.
+    if arg["type"] in ("human_readable_int", "human_readable_int_or_auto"):
+        return "size"
     if arg["type"] in _INT_TYPES:
         return "int"
     if arg["type"] in _FLOAT_TYPES:

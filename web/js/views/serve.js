@@ -23,6 +23,30 @@ import {
 } from '../ui.js';
 
 const STYLES = `
+/* The recommendation. Directly under the profile, because it is the answer to
+   what the profile just described. */
+.serve-rec {
+  border: 1px solid var(--border); border-left: 3px solid var(--ok);
+  border-radius: var(--radius); background: var(--bg-raised);
+  padding: 11px 13px; margin-bottom: var(--gap);
+}
+.serve-rec.lv-warn { border-left-color: var(--warn); }
+.serve-rec.lv-danger { border-left-color: var(--danger); }
+.sr-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sr-list { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; }
+.sr-item { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sr-item code {
+  font-family: var(--mono); font-size: 12px; white-space: nowrap;
+  background: var(--bg-sunken); border: 1px solid var(--border);
+  border-radius: var(--radius-s); padding: 1px 6px; color: var(--text);
+}
+.sr-item.done code { opacity: .65; }
+.sr-why { font-size: 11.5px; color: var(--text-dim); flex: 1 1 320px; min-width: 0; }
+.serve-rec .notice { margin-top: 9px; }
+.sr-left { margin-top: 10px; }
+.sr-left summary { cursor: pointer; font-size: 11.5px; color: var(--text-faint); }
+.sr-left summary:hover { color: var(--text-dim); }
+
 .serve-pool-budgets { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .serve-pool-budgets .ov-key { display: inline-flex; align-items: center; gap: 6px; }
 
@@ -1266,6 +1290,20 @@ function controlFor(arg) {
     return [select, (v) => { select.value = v === undefined ? '' : String(v); }];
   }
 
+  // A size flag takes 32k, 1M or auto as readily as a plain integer, and a
+  // number input can hold none of those — it silently blanks whatever it
+  // cannot parse. So it stays text, and the value stays whatever was typed.
+  if (arg.widget === 'size') {
+    const box = h('input', {
+      type: 'text',
+      inputMode: 'numeric',
+      placeholder: formatDefault(arg) || 'auto, 32k, or a number',
+      value: value === undefined ? '' : String(value),
+      onInput: (e) => put(e.target.value.trim() === '' ? undefined : e.target.value.trim()),
+    });
+    return [box, (v) => { box.value = v === undefined ? '' : String(v); }];
+  }
+
   if (arg.widget === 'int' || arg.widget === 'float') {
     const box = h('input', {
       type: 'number',
@@ -1468,18 +1506,120 @@ async function loadProfile() {
     return;
   }
   renderProfile({ loading: true });
+  renderRecommendation({ loading: true });
   try {
-    const params = new URLSearchParams({ model });
-    if (node && node !== LOCAL) params.set('node', node);
-    const profile = await get(`/servers/profile?${params}`);
+    // The recommendation carries the profile it was built from, so one call
+    // answers both "what is this" and "what should it be set to".
+    const rec = await post('/servers/recommend', { model, node, args: { ...editor.args } });
     if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
-    state.editor.profile = profile;
+    state.editor.profile = rec.profile;
+    state.editor.rec = rec;
   } catch (error) {
     if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
     state.editor.profile = { found: false, error: error.message };
+    state.editor.rec = null;
   }
   renderProfile();
+  renderRecommendation();
 }
+
+/* --- the recommendation ---------------------------------------------------
+
+   Two flags and a reason for each, plus the reasons for everything it left
+   alone. The button is the whole point of this page: the operator should not
+   have to know which of ~190 flags matter before a model will load. */
+
+/** Apply a set of {dest: value} through the form's own machinery.
+ *  Going through state.flagIndex is not optional: the backend refuses a dest
+ *  this image does not have, so a flag that would 422 on save is skipped here
+ *  with a word about it instead. */
+function applyArgs(args) {
+  const missing = [];
+  let applied = 0;
+  for (const [dest, value] of Object.entries(args || {})) {
+    const arg = state.flagIndex.get(dest);
+    if (!arg) {
+      missing.push(dest);
+      continue;
+    }
+    setArg(arg, value);
+    state.editor.setters.get(dest)?.(value);
+    applied += 1;
+  }
+  return { applied, missing };
+}
+
+function applyRecommendation() {
+  const rec = state.editor?.rec;
+  if (!rec) return;
+  const { applied, missing } = applyArgs(rec.args);
+  if (missing.length) {
+    toast(`This vLLM build has no ${missing.join(', ')}; the rest was applied.`,
+      { level: 'warn' });
+  }
+  toast(applied ? `Applied ${applied} flag${applied === 1 ? '' : 's'}.` : 'Nothing to change.',
+    { level: 'ok' });
+  scheduleSafety();
+  if (state.editor.form.pooled) schedulePlan();
+  // The recommendation is relative to what is set, so re-ask it.
+  state.editor.profileFor = '';
+  loadProfile();
+}
+
+function recLevelClass(level) {
+  return level === 'block' ? 'danger' : level === 'warn' ? 'warn' : 'ok';
+}
+
+function renderRecommendation(options = {}) {
+  const host = state.nodes.recBox;
+  if (!host) return;
+  const editor = state.editor;
+  if (!editor || !String(editor.form.model || '').trim()) return mount(host);
+
+  if (options.loading) {
+    return mount(host, h('div', { class: 'serve-rec' },
+      h('div', { class: 'row' }, spinner(),
+        h('span', { class: 'faint small' }, 'working out what this needs…'))));
+  }
+
+  const rec = editor.rec;
+  if (!rec) return mount(host);
+
+  const pending = Object.entries(rec.args || {})
+    .filter(([dest, value]) => editor.args[dest] !== value);
+
+  mount(host, h('div', { class: `serve-rec lv-${recLevelClass(rec.level)}` },
+    h('div', { class: 'sr-head' },
+      h('strong', null, rec.headline),
+      h('span', { class: 'spacer' }),
+      rec.ok && pending.length
+        ? h('button', { class: 'btn-primary btn-sm', onClick: applyRecommendation },
+          `Apply ${pending.length} flag${pending.length === 1 ? '' : 's'}`)
+        : null),
+    (rec.suggestions || []).length
+      ? h('div', { class: 'sr-list' }, rec.suggestions.map((s) => {
+        const already = editor.args[s.dest] === s.value;
+        return h('div', { class: `sr-item${already ? ' done' : ''}` },
+          h('code', null, `${flagOf(s.dest)} ${formatValue(s.value)}`),
+          already ? badge('succeeded', 'set') : null,
+          h('span', { class: 'sr-why' }, s.why));
+      }))
+      : null,
+    (rec.findings || []).map((f) => notice(
+      f.level === 'block' ? 'danger' : f.level === 'warn' ? 'warn' : 'info', f.text)),
+    (rec.left_alone || []).length
+      ? h('details', { class: 'sr-left' },
+        h('summary', null, `${rec.left_alone.length} flags deliberately left alone`),
+        h('div', { class: 'sr-list' }, rec.left_alone.map((entry) =>
+          h('div', { class: 'sr-item' },
+            h('code', null, flagOf(entry.dest)),
+            h('span', { class: 'sr-why' }, entry.why)))))
+      : null));
+}
+
+const flagOf = (dest) => state.flagIndex.get(dest)?.flag || `--${dest.replace(/_/g, '-')}`;
+
+const formatValue = (value) => (value === true ? '' : String(value));
 
 const CTX_FMT = (tokens) => (tokens >= 1024 ? `${Math.round(tokens / 1024)}k` : String(tokens));
 
@@ -1602,9 +1742,12 @@ async function openEditor(server, prefill = {}) {
     // What the currently selected model derived. A field still holding this is
     // fair game to refill; anything else is the user's and is left alone.
     derived: null,
-    // What the files beside the chosen model's weights say it is.
+    // What the files beside the chosen model's weights say it is, and what
+    // that implies for the handful of flags that decide whether it starts.
     profile: null,
     profileFor: '',
+    rec: null,
+    recFor: '',
     sections: [],
     searchable: [],
     paths: EMPTY_PATHS,
@@ -1676,6 +1819,7 @@ function renderEditor() {
   state.nodes.syncBox = h('div');
   state.nodes.poolBox = h('div', { class: 'param-section' });
   state.nodes.profileBox = h('div');
+  state.nodes.recBox = h('div');
 
   const flagCount = [...state.schema.featured, ...state.schema.advanced]
     .reduce((total, section) => total + section.flags.length, 0);
@@ -1763,6 +1907,7 @@ function renderEditor() {
       body: h('div', { class: 'serve-form' },
         basics,
         state.nodes.profileBox,
+        state.nodes.recBox,
         state.nodes.poolBox,
         h('div', { class: 'param-section' },
           h('h3', null, 'Presets'),
@@ -1788,6 +1933,7 @@ function renderEditor() {
   syncPlacement();
   renderFootActions();
   renderProfile();
+  renderRecommendation();
   loadProfile();
 }
 
@@ -2258,21 +2404,16 @@ function mountPoolSafety() {
 }
 
 function applyPreset(preset) {
-  const missing = [];
-  for (const [dest, value] of Object.entries(preset.args)) {
-    const arg = state.flagIndex.get(dest);
-    if (!arg) {
-      missing.push(dest);
-      continue;
-    }
-    setArg(arg, value);
-    state.editor.setters.get(dest)?.(value);
-  }
+  const { missing } = applyArgs(preset.args);
   if (missing.length) {
     toast(`This vLLM build has no ${missing.join(', ')}; the rest of the preset was applied.`,
       { level: 'warn' });
   }
   scheduleSafety();
+  if (state.editor.form.pooled) schedulePlan();
+  // A preset can undo what the recommendation asked for, so re-ask it.
+  state.editor.profileFor = '';
+  loadProfile();
 }
 
 const scheduleSafety = debounce(() => checkSafety(), 300);

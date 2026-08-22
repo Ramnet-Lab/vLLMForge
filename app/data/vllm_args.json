@@ -1760,7 +1760,7 @@
    "action": "_StoreAction",
    "group": "LoadConfig",
    "required": false,
-   "widget": "int",
+   "widget": "size",
    "flag": "--safetensors-prefetch-block-size",
    "negatable": false,
    "help": "Read size in bytes for each safetensors checkpoint file prefetch. Parse human-readable integers like '1k', '2M', etc. Including decimal values with decimal multipliers. Examples: - '1k' -> 1,000 - '1K' -> 1,024 - '25.6k' -> 25,600"
@@ -2263,7 +2263,7 @@
    "action": "_StoreAction",
    "group": "ModelConfig",
    "required": false,
-   "widget": "int",
+   "widget": "size",
    "flag": "--max-model-len",
    "negatable": false,
    "help": "Model context length (prompt and output). If unspecified, will be automatically derived from the model config. When passing via `--max-model-len`, supports k/m/g/K/M/G in human-readable format. Examples: - 1k -> 1000 - 1K -> 1024 - 25.6k -> 25,600 - -1 or 'auto' -> Automatically choose the maximum model length that fits in GPU memory. This will use the model's maximum context length if it fits, otherwise it will find the largest length that can be accommodated. Parse human-readable integers like '1k', '2M', etc. Including decimal values with decimal multipliers. Also accepts -1 or 'auto' as a special value for auto- detection. Examples: - '1k' -> 1,000 - '1K' -> 1,024 - '25.6k' -> 25,600 - '-1' or 'auto' -> -1 (special value for auto- detection)"
@@ -4163,7 +4163,7 @@
    "action": "_StoreAction",
    "group": "SchedulerConfig",
    "required": false,
-   "widget": "int",
+   "widget": "size",
    "flag": "--max-num-batched-tokens",
    "negatable": false,
    "help": "Maximum number of tokens that can be processed in a single iteration. The default value here is mainly for convenience when testing. In real usage, this should be set in `EngineArgs.create_engine_config`. Parse human-readable integers like '1k', '2M', etc. Including decimal values with decimal multipliers. Examples: - '1k' -> 1,000 - '1K' -> 1,024 - '25.6k' -> 25,600"

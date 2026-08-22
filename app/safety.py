@@ -56,6 +56,11 @@ def flag_value(command: list[str] | None, pattern: re.Pattern[str]) -> str | Non
     return None
 
 
+# How close to MemAvailable a request may sit before it is worth a warning.
+# Recommendations keep the same headroom; see app/recommend.py UTIL_MARGIN.
+DRIFT_MARGIN = 0.03
+
+
 def default_util() -> float:
     """vLLM's own default, read from the image's schema so it tracks upgrades."""
     arg = vllm_spec.by_dest().get("gpu_memory_utilization") or {}
@@ -361,12 +366,16 @@ async def check_launch(
         )
 
     if requested_bytes > budget.available_bytes:
+        # This is vLLM's own gate, not a policy of ours. On a unified-memory box
+        # the engine reads psutil.virtual_memory().available — MemAvailable — and
+        # refuses when ceil(total * util) exceeds it.
         return Verdict(
             ok=False,
             level="block",
             message=(
                 f"{preface}Refusing to launch: {util:g} needs {_gib(requested_bytes)} but only "
-                f"{_gib(budget.available_bytes)} is available on the host right now. "
+                f"{_gib(budget.available_bytes)} is available on the host right now — which is "
+                "the number vLLM itself compares against, so it would refuse to start. "
                 "Stop something first."
             ),
             budget=payload,
@@ -375,23 +384,29 @@ async def check_launch(
             suggested_util=suggested,
         )
 
-    if requested_bytes > budget.free_bytes:
-        # vLLM's own pre-flight compares against free memory, not available, so
-        # a launch can be budget-legal here and still be refused by the engine.
+    # MemAvailable moves while an image is pulled and weights are read, so a
+    # request that only just fits now can be refused by the time the engine
+    # starts. That is worth a word; page cache is not — vLLM counts reclaimable
+    # memory as free on this hardware, and telling the operator to drop caches
+    # for a launch that would have succeeded is how an afternoon disappears.
+    #
+    #   vllm/utils/mem_utils.py: if current_platform.is_integrated_gpu(...):
+    #       self.free_memory = psutil.virtual_memory().available
+    #
+    if requested_bytes > budget.available_bytes * (1 - DRIFT_MARGIN):
         return Verdict(
             ok=True,
             level="warn",
             message=(
-                f"{preface}{util:g} needs {_gib(requested_bytes)} and the host has "
-                f"{_gib(budget.available_bytes)} available, but only {_gib(budget.free_bytes)} is "
-                "actually free — the rest is reclaimable page cache. vLLM's own guard compares "
-                "against free memory and may refuse to start with 'Free memory on device is less "
-                "than desired GPU memory utilization'. Dropping caches or stopping something else "
-                "resolves it."
+                f"{preface}{util:g} needs {_gib(requested_bytes)} of the "
+                f"{_gib(budget.available_bytes)} available — close enough that a little more "
+                "activity before the engine starts would push it over vLLM's own check. "
+                f"{max(0.0, suggested or 0):.2f} leaves room for that."
             ),
             budget=payload,
             requested_util=util,
             requested_bytes=requested_bytes,
+            suggested_util=suggested,
         )
 
     if projected_bytes > budget.total_bytes - budget.warn_reserve_bytes:

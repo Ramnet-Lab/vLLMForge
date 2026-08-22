@@ -132,16 +132,54 @@ async def test_a_serve_command_without_a_util_flag_is_not_free(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_free_versus_available_is_surfaced_not_ignored(monkeypatch):
-    # vLLM's own guard compares against free memory; page cache does not count
-    # for it even though MemAvailable includes it.
+async def test_page_cache_is_not_treated_as_unavailable(monkeypatch):
+    """This box has an integrated GPU, and vLLM knows it:
+
+        vllm/utils/mem_utils.py
+        if current_platform.is_integrated_gpu(device.index):
+            self.free_memory = psutil.virtual_memory().available
+
+    So reclaimable page cache counts as free to the engine, and MemAvailable is
+    the number its startup check compares against. The guard used to warn that
+    vLLM compares against MemFree and suggest dropping caches — which fires on
+    every ordinary machine and sends the operator hunting for memory they were
+    never short of."""
     async def fake(exclude=None, node=None):
         return budget([], available_gib=80.0, free_gib=5.0)
 
     monkeypatch.setattr(safety, "current_budget", fake)
     verdict = await safety.check_launch(0.3)
+    assert verdict.ok and verdict.level == "ok"
+    assert "page cache" not in verdict.message
+    assert "drop" not in verdict.message.lower()
+
+
+@pytest.mark.anyio
+async def test_a_request_that_only_just_fits_warns_about_drift(monkeypatch):
+    """MemAvailable moves while an image is pulled and weights are read, so a
+    request sitting right on it can be refused by the time the engine starts."""
+    async def fake(exclude=None, node=None):
+        return budget([], available_gib=61.0)
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    # 0.5 of 121.7 GiB is 60.8 — inside the 3% drift margin of 61.0 available.
+    verdict = await safety.check_launch(0.5)
     assert verdict.ok and verdict.level == "warn"
-    assert "free memory" in verdict.message
+    assert "before the engine starts" in verdict.message
+    assert verdict.suggested_util is not None
+
+
+@pytest.mark.anyio
+async def test_a_request_over_available_is_refused_as_vllm_would(monkeypatch):
+    # Inside the dashboard's own 32 GiB reserve, so the reserve check passes and
+    # the one being exercised is the available-memory gate vLLM itself applies.
+    async def fake(exclude=None, node=None):
+        return budget([], available_gib=50.0)
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    verdict = await safety.check_launch(0.7)
+    assert not verdict.ok and verdict.level == "block"
+    assert "vLLM itself compares against" in verdict.message
 
 
 def test_kv_cache_memory_override_is_recognised():

@@ -80,3 +80,26 @@ def test_ui_model_covers_every_flag_exactly_once():
     managed = set(ui["managed"])
     expected = {a["dest"] for a in vllm_spec.schema()["args"]} - managed
     assert set(seen) == expected, "the form would hide some flags entirely"
+
+
+def test_a_size_flag_keeps_its_own_widget():
+    """--max-model-len takes 32k and auto as readily as a number. Classifying it
+    as an int rendered a number input, which silently blanks anything it cannot
+    parse — so the form refused values the backend and vLLM both accept."""
+    by_dest = vllm_spec.by_dest()
+    assert by_dest["max_model_len"]["widget"] == "size"
+    assert by_dest["max_num_batched_tokens"]["widget"] == "size"
+    # A plain count stays a plain int.
+    assert by_dest["max_num_seqs"]["widget"] == "int"
+
+
+def test_size_values_survive_validation_and_rendering():
+    for value, rendered in (("auto", "auto"), (-1, "-1"), ("32k", "32k"), (131072, "131072")):
+        assert vllm_spec.validate({"max_model_len": value}) == []
+        argv = vllm_spec.build_argv("org/m", {"max_model_len": value})
+        assert argv[argv.index("--max-model-len") + 1] == rendered
+
+
+def test_a_size_flag_still_rejects_nonsense():
+    problems = vllm_spec.validate({"max_model_len": "as long as possible"})
+    assert problems and "--max-model-len" in problems[0]

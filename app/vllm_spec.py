@@ -323,7 +323,7 @@ def validate(params: dict[str, Any]) -> list[str]:
             problems.append(
                 f"{arg['flag']}: '{value}' is not one of {', '.join(arg['choices'][:12])}"
             )
-        elif widget == "int":
+        elif widget in ("int", "size"):
             text = str(value).strip()
             # vLLM accepts human sizes and, for several flags, 'auto'.
             if text.lower() != "auto" and parse_size(text) is None:
