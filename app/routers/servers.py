@@ -126,11 +126,13 @@ async def recommend(payload: dict) -> dict:
 
     args = payload.get("args")
     pool = payload.get("pool")
+    server_id = payload.get("server_id")
     result = await recommender.build(
         str(payload.get("model") or ""),
         str(payload.get("node") or ""),
         args if isinstance(args, dict) else None,
         [str(name) for name in pool] if isinstance(pool, list) else None,
+        int(server_id) if isinstance(server_id, int) else None,
     )
     return result.to_dict()
 

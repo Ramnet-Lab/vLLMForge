@@ -260,7 +260,8 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
     # The arguments go with it: a pooled launch used to skip the memory guard
     # entirely, which is how a definition asking for 0.95 of a box with 0.88
     # free reached vLLM and died four minutes in.
-    plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {})
+    plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {},
+                              replacing=container_name(server))
     if not plan["ok"] and not force:
         safety_block = _pool_safety(plan)
         # A plan refused because the memory would not fit is the same kind of

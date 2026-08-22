@@ -1525,6 +1525,8 @@ async function loadProfile() {
     const rec = await post('/servers/recommend', {
       model, node, args: { ...editor.args },
       pool: editor.form.pooled ? editor.form.pool : [],
+      // So an existing server's own container is not counted against itself.
+      server_id: editor.id,
     });
     if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
     state.editor.profile = rec.profile;

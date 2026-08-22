@@ -293,3 +293,36 @@ def test_a_shell_command_that_is_not_vllm_is_not_claimed():
 def test_an_unbalanced_shell_string_does_not_raise():
     """A command with a stray quote must not take the budget scan down with it."""
     assert safety.is_vllm_command(["-lc", "vllm serve org/m --tokenizer 'unclosed"]) is False
+
+
+@pytest.mark.anyio
+async def test_a_restart_gets_its_own_memory_back(monkeypatch):
+    """Excluding a container dropped it from the tenant list but not from the
+    measured total, so a running server counted against its own restart and
+    every answer for it came out as 'there is no room'."""
+    from app import docker_ctl
+
+    async def one_engine(all_containers=False, host=None):
+        return [{"Names": "llmd-vllm-7"}]
+
+    async def state(name, host=None):
+        return docker_ctl.ContainerState(
+            name=name, exists=True, running=True, status="running",
+            command=["vllm", "serve", "org/m", "--gpu-memory-utilization", "0.60"])
+
+    async def processes():
+        return []
+
+    monkeypatch.setattr(safety.docker_ctl, "ps", one_engine)
+    monkeypatch.setattr(safety.docker_ctl, "state", state)
+    monkeypatch.setattr(safety, "read_gpu_processes", processes)
+
+    counted = await safety.current_budget()
+    assert counted.committed_util == pytest.approx(0.60, abs=0.01)
+    assert counted.excluded_bytes == 0
+
+    freed = await safety.current_budget(exclude="llmd-vllm-7")
+    assert freed.tenants == []
+    assert freed.excluded_bytes > 0
+    assert freed.occupied_bytes == 0
+    assert freed.free_util > counted.free_util

@@ -95,7 +95,8 @@ async def wiring(node: nodes.Node, prefix: str) -> NodeWiring:
 
 
 async def plan(node_names: list[str], model: str = "",
-               args: dict[str, Any] | None = None) -> dict[str, Any]:
+               args: dict[str, Any] | None = None,
+               replacing: str | None = None) -> dict[str, Any]:
     """Everything that has to be true before a pooled engine can start.
 
     Given a model, this also reports which nodes are missing it — the answer the
@@ -133,8 +134,11 @@ async def plan(node_names: list[str], model: str = "",
 
     # The same fraction, judged against each machine's own free memory.
     util = vllm_spec.gpu_memory_utilization(args or {})
+    # `replacing` matters: restarting a pooled server must not count its own
+    # running containers against itself, on any of the machines it spans.
     verdicts = await asyncio.gather(*(
-        safety.check_launch(util, params=args, node=w.node) for w in wirings
+        safety.check_launch(util, replacing=replacing, params=args, node=w.node)
+        for w in wirings
     )) if args is not None else [None] * len(wirings)
     refused = [(w.node.name, v) for w, v in zip(wirings, verdicts, strict=True)
                if v is not None and not v.ok]

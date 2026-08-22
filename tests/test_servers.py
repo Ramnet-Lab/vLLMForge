@@ -150,7 +150,7 @@ def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
         "pool_nodes": ["local", "node2"],
     })
 
-    async def refused(pool, model="", args=None):
+    async def refused(pool, model="", args=None, replacing=None):
         return {
             "ok": False,
             "reason": "local: 0.92 would reserve more than is free",
@@ -195,7 +195,7 @@ def test_an_environment_failure_stays_a_502(monkeypatch):
         "pool_nodes": ["local", "node2"],
     })
 
-    async def no_image(pool, model="", args=None):
+    async def no_image(pool, model="", args=None, replacing=None):
         return {"ok": False, "reason": "ray image is not built on: node2", "nodes": []}
 
     monkeypatch.setattr(cluster, "plan", no_image)

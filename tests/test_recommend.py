@@ -483,3 +483,59 @@ async def test_a_custom_sampler_model_cannot_be_pooled(box):
     assert spread["ok"] is False and spread["level"] == "block"
     assert spread["args"] == {}
     assert "cannot be split across machines" in spread["headline"]
+
+
+@pytest.mark.anyio
+async def test_a_pooled_engine_is_sized_per_machine(box):
+    """Pipeline parallelism divides the layers, so the weights and the KV cache
+    divide with them. Sizing a pooled server as if one machine held the whole
+    model asks for roughly twice what each node needs — and on a large model
+    that is the difference between a recommendation and a refusal."""
+    place, mp = box
+    place(mp.Profile(reference="org/big", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=131072, num_hidden_layers=60,
+                     num_key_value_heads=16, head_dim=256, weight_bytes=int(58 * GIB),
+                     has_safetensors=True, chat_template=True, supported=True))
+
+    alone = (await recommend.build("org/big", "", {}, [])).to_dict()
+    spread = (await recommend.build("org/big", "", {}, ["local", "node2"])).to_dict()
+
+    one = alone["args"]["gpu_memory_utilization"]
+    two = spread["args"]["gpu_memory_utilization"]
+    assert two < one, "each machine holds half the layers"
+    # The overhead is per process, so the halving is of the model, not of the
+    # whole figure — two nodes need more than half each, not exactly half.
+    assert two > one / 2
+
+
+def test_the_floor_and_the_need_both_divide_by_the_shards():
+    from app import model_profile as mp
+
+    profile = mp.Profile(reference="x", weight_bytes=int(58 * GIB), num_hidden_layers=60,
+                         num_key_value_heads=16, head_dim=256,
+                         max_position_embeddings=131072)
+    total = int(TOTAL)
+    assert recommend.floor_utilisation(profile, total, 1) > \
+        recommend.floor_utilisation(profile, total, 2)
+    assert recommend.needed_utilisation(profile, total, 32768, 1) > \
+        recommend.needed_utilisation(profile, total, 32768, 2)
+    # One machine is the default and must be unchanged by the new parameter.
+    assert recommend.floor_utilisation(profile, total) == \
+        recommend.floor_utilisation(profile, total, 1)
+
+
+@pytest.mark.anyio
+async def test_weights_that_do_not_fit_one_machine_may_fit_two(box):
+    place, mp = box
+    # 100 GiB of weights needs 0.88 of a 121.7 GiB machine once the CUDA
+    # context is counted, and the guard's reserve caps a single node at 0.73.
+    place(mp.Profile(reference="org/huge", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=8192, num_hidden_layers=60,
+                     num_key_value_heads=16, head_dim=256, weight_bytes=int(100 * GIB),
+                     has_safetensors=True, chat_template=True, supported=True))
+
+    alone = (await recommend.build("org/huge", "", {}, [])).to_dict()
+    assert alone["ok"] is False
+
+    spread = (await recommend.build("org/huge", "", {}, ["local", "node2"])).to_dict()
+    assert spread["ok"] is True, "50 GiB a machine fits where 100 does not"

@@ -156,6 +156,11 @@ class Budget:
     available_bytes: int = 0
     free_bytes: int = 0
     measured_gpu_bytes: int = 0
+    excluded_bytes: int = 0
+    """What the excluded container is measured to be holding. A restart gets its
+    own memory back, and nvidia-smi cannot know that — it reports processes, not
+    intentions — so it is subtracted here rather than left to inflate a budget
+    that is about to change."""
     reserve_bytes: int = 0
     warn_reserve_bytes: int = 0
     tenants: list[Tenant] = field(default_factory=list)
@@ -178,7 +183,7 @@ class Budget:
         job, a Heretic run, even a browser with a few GiB of GPU surfaces — so
         the measured per-process figure is used whenever it is larger.
         """
-        return max(self.committed_bytes, self.measured_gpu_bytes)
+        return max(0, max(self.committed_bytes, self.measured_gpu_bytes) - self.excluded_bytes)
 
     @property
     def occupied_util(self) -> float:
@@ -292,10 +297,18 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
     fallback = default_util()
     for row in await docker_ctl.ps(all_containers=False, host=host):
         name = str(row.get("Names", ""))
-        if not name or (exclude and name == exclude):
+        if not name:
             continue
         info = await docker_ctl.state(name, host)
         if not is_vllm_command(info.command):
+            continue
+
+        if exclude and name == exclude:
+            # The container this survey is about to replace. It is not a tenant,
+            # and what it holds is memory the replacement can have back — so it
+            # comes off the measured total too, which otherwise counts the very
+            # engine being restarted against its own restart.
+            budget.excluded_bytes = footprint(command_params(info.command), total)
             continue
 
         params = command_params(info.command)

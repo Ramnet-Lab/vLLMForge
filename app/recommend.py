@@ -123,32 +123,48 @@ def _gib(value: float) -> str:
     return f"{value / 1024 ** 3:.1f} GiB"
 
 
-def floor_utilisation(profile: Profile, total_bytes: int) -> float | None:
-    """The least utilisation that could possibly work.
+def _overhead(profile: Profile) -> int:
+    """Per-process, so a pooled engine pays it once on every machine."""
+    return OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
+
+
+def floor_utilisation(profile: Profile, total_bytes: int, shards: int = 1) -> float | None:
+    """The least utilisation that could possibly work, per machine.
 
     vLLM's budget has to cover the weights before it covers anything else. Below
     this, `--max-model-len auto` gives up with "not enough GPU memory available
     to serve even a single token", and no other flag rescues it — so a value
     under this floor is not a tight configuration, it is a broken one.
+
+    A pooled engine splits the model by layer, so each machine holds its own
+    share and no more. The fraction is per machine either way: every rank asks
+    for `util` of the box it runs on.
     """
     if total_bytes <= 0 or not profile.weight_bytes:
         return None
-    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
-    return math.ceil((profile.weight_bytes + overhead) / total_bytes * 100) / 100
+    shards = max(1, shards)
+    return math.ceil(
+        (profile.weight_bytes / shards + _overhead(profile)) / total_bytes * 100) / 100
 
 
-def needed_utilisation(profile: Profile, total_bytes: int, context: int) -> float | None:
-    """The fraction this model actually wants, as opposed to the most it may have.
+def needed_utilisation(profile: Profile, total_bytes: int, context: int,
+                       shards: int = 1) -> float | None:
+    """The fraction this model wants on one machine, as opposed to the most it
+    may have.
 
     Weights, plus a fixed overhead for the CUDA context and compiled graphs,
     plus KV cache for a couple of concurrent sequences at the target context.
     Rounded up: the point is to fit, not to be exact.
+
+    Pipeline parallelism divides the layers, so both the weights and the KV
+    cache divide with them; the overhead does not, because every rank is its own
+    process with its own CUDA context and its own compiled graphs.
     """
     if total_bytes <= 0 or not profile.weight_bytes:
         return None
+    shards = max(1, shards)
     kv = profile.kv_bytes(context) or 0
-    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
-    wanted = profile.weight_bytes + overhead + CONCURRENCY * kv
+    wanted = (profile.weight_bytes + CONCURRENCY * kv) / shards + _overhead(profile)
     return math.ceil(wanted / total_bytes * 100) / 100
 
 
@@ -173,8 +189,15 @@ def safe_utilisation(total_bytes: int, available_bytes: int, budget_free_util: f
 
 
 async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
-                pool: list[str] | None = None) -> Recommendation:
-    """What to set for this model on this node, and what stands in the way."""
+                pool: list[str] | None = None,
+                server_id: int | None = None) -> Recommendation:
+    """What to set for this model on this node, and what stands in the way.
+
+    `server_id` names the definition being configured, if there is one. Its own
+    running container is then excluded from the budget — a server counted
+    against itself leaves nothing free and turns every recommendation for it
+    into "there is no room".
+    """
     from app import nodes
 
     target = nodes.by_name(node)
@@ -189,12 +212,27 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
         profile = await model_profile.read_remote(model, target.name)
     rec.profile = profile.to_dict()
 
-    budget = await safety.current_budget(node=target)
+    # How many machines this engine will span. Pipeline parallelism divides the
+    # layers, so every figure below that scales with the model divides with them.
+    shards = max(1, len(pool or []))
+
+    replacing = None
+    if server_id is not None:
+        from app import servers as server_service
+
+        replacing = server_service.container_name({"id": server_id})
+
+    budget = await safety.current_budget(exclude=replacing, node=target)
     memory = telemetry.read_meminfo() if target.is_local else None
     total = memory.total_bytes if memory else budget.total_bytes
     available = memory.available_bytes if memory else budget.available_bytes
 
-    _blockers(rec, profile, available)
+    # A server being reconfigured is about to be replaced, so the memory its own
+    # container holds is memory it can have back. current_budget takes that off
+    # the occupied side; MemAvailable cannot know it, so it is added here.
+    available = min(total, available + budget.excluded_bytes)
+
+    _blockers(rec, profile, available, shards)
     if not rec.ok:
         return rec
 
@@ -206,7 +244,7 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
     # is here yet. Everything else is read from files, so with no files there is
     # nothing to say — and saying "no chat template" about a repo nobody has
     # pulled would be a guess dressed as a fact.
-    _memory(rec, profile, total, available, budget.free_util)
+    _memory(rec, profile, total, available, budget.free_util, shards)
     if profile.found:
         _loading(rec, profile)
         _quantisation(rec, profile)
@@ -220,7 +258,7 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
     return rec
 
 
-def _blockers(rec: Recommendation, profile: Profile, available: int) -> None:
+def _blockers(rec: Recommendation, profile: Profile, available: int, shards: int = 1) -> None:
     """The cases no flag rescues. Offering settings for these wastes an afternoon."""
     if not profile.found:
         rec.headline = "Not on this machine yet."
@@ -247,14 +285,19 @@ def _blockers(rec: Recommendation, profile: Profile, available: int) -> None:
             "This image loads safetensors. There is no flag that makes it read GGUF.")))
         return
 
-    if profile.weight_bytes and available and profile.weight_bytes >= available:
+    # A pooled engine splits the layers, so each machine holds its own share.
+    per_node = profile.weight_bytes / max(1, shards)
+    if profile.weight_bytes and available and per_node >= available:
         rec.ok = False
         rec.level = "block"
         rec.headline = "The weights alone do not fit."
-        rec.findings.append(Finding("block", (
-            f"{_gib(profile.weight_bytes)} of weights against {_gib(available)} available. No "
-            "--gpu-memory-utilization serves it on this node right now — stop something, or "
-            "pool it across machines.")))
+        tail = (f"{_gib(per_node)} on each of {shards} machines against {_gib(available)} "
+                "available. Add a machine, or stop something."
+                if shards > 1 else
+                f"{_gib(profile.weight_bytes)} of weights against {_gib(available)} available. "
+                "No --gpu-memory-utilization serves it on this node right now — stop something, "
+                "or pool it across machines.")
+        rec.findings.append(Finding("block", tail))
 
 
 def _placement(rec: Recommendation, profile: Profile, total: int, available: int,
@@ -306,11 +349,11 @@ def _placement(rec: Recommendation, profile: Profile, total: int, available: int
 
 
 def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
-            free_util: float) -> None:
+            free_util: float, shards: int = 1) -> None:
     ceiling = safe_utilisation(total, available, free_util)
     context = min(profile.max_position_embeddings or TARGET_CONTEXT, TARGET_CONTEXT)
-    wanted = needed_utilisation(profile, total, context) if profile.found else None
-    floor = floor_utilisation(profile, total) if profile.found else None
+    wanted = needed_utilisation(profile, total, context, shards) if profile.found else None
+    floor = floor_utilisation(profile, total, shards) if profile.found else None
 
     # A value under the floor is not a tight configuration, it is one that
     # cannot load the weights. Better to say so than to hand over a number that
@@ -320,6 +363,8 @@ def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
         rec.level = "block"
         rec.headline = "Not enough room for this right now."
         rec.findings.append(Finding("block", (
+            f"The weights alone need {floor:g} of each machine and only {ceiling:g} can be "
+            if shards > 1 else
             f"The weights alone need {floor:g} of this machine and only {ceiling:g} can be "
             f"given — {_gib(available)} is available of {_gib(total)}. vLLM would read the whole "
             "checkpoint and then give up with \"not enough GPU memory available to serve even a "
@@ -331,10 +376,13 @@ def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
         util = max(util, floor)
     if util > 0:
         if wanted and wanted <= ceiling:
+            share = (f"{_gib(profile.weight_bytes / shards)} of weights on each of {shards} "
+                     f"machines" if shards > 1
+                     else f"{_gib(profile.weight_bytes)} of weights")
             why = (
-                f"Enough for {_gib(profile.weight_bytes)} of weights and a {context:,}-token "
-                f"context for a couple of callers at once. The ceiling here is {ceiling:g} — "
-                "raise it for a longer context, or leave the rest for another engine.")
+                f"Enough for {share} and a {context:,}-token context for a couple of callers at "
+                f"once. The ceiling here is {ceiling:g} — raise it for a longer context, or "
+                "leave the rest for another engine.")
         else:
             why = (
                 f"The most this machine can give: vLLM refuses to start when the fraction it "
@@ -351,10 +399,11 @@ def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
         "vLLM measures what is left after loading and fits the context to it, instead of "
         "refusing to start because the config advertises more than the KV cache can hold."))
 
-    _context_note(rec, profile, util, total)
+    _context_note(rec, profile, util, total, shards)
 
 
-def _context_note(rec: Recommendation, profile: Profile, util: float, total: int) -> None:
+def _context_note(rec: Recommendation, profile: Profile, util: float, total: int,
+                  shards: int = 1) -> None:
     """Roughly what context this will actually serve.
 
     A statement, not a warning: with --max-model-len auto a context shorter than
@@ -366,11 +415,13 @@ def _context_note(rec: Recommendation, profile: Profile, util: float, total: int
     if not (advertised and per_token):
         return
 
-    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
-    for_kv = int(util * total) - profile.weight_bytes - overhead
+    shards = max(1, shards)
+    for_kv = int(util * total) - int(profile.weight_bytes / shards) - _overhead(profile)
     if for_kv <= 0:
         return
-    fits = int(for_kv / CONCURRENCY / per_token)
+    # Each machine holds its own layers' share of the cache, so the context the
+    # engine can serve is what all of them together can hold.
+    fits = int(for_kv * shards / CONCURRENCY / per_token)
     if fits >= advertised:
         return
     rec.findings.append(Finding("ok", (
