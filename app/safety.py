@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +43,7 @@ OFFLOAD_FLAG = re.compile(r"--cpu[-_]offload[-_]gb(?:=(\S+))?$")
 
 def flag_value(command: list[str] | None, pattern: re.Pattern[str]) -> str | None:
     """The value of a flag in a container's argv, whether joined by = or spaced."""
+    command = argv_of(command)
     if not command:
         return None
     for index, token in enumerate(command):
@@ -101,9 +103,40 @@ def footprint(params: dict[str, Any], total_bytes: int) -> int:
     return vllm_spec.footprint_bytes(params, total_bytes, default_util=default_util())
 
 
+# `vllm serve` as a word, anywhere in a string that may be a whole shell line.
+_VLLM_SERVE = re.compile(r"(?:^|[\s;&|])vllm\s+serve(?:\s|$)")
+
+
+def argv_of(command: list[str] | None) -> list[str]:
+    """A container's command as tokens, whether or not a shell is in the way.
+
+    A pooled engine is launched as `bash -lc "ray start ... && exec vllm serve
+    ..."` — one element, because the Ray head and the engine have to share a
+    container. Treating that as opaque made the dashboard's own pooled servers
+    weigh nothing in the budget, so a second launch could be admitted on top of
+    memory that was already spoken for.
+    """
+    if not command:
+        return []
+    for token in command:
+        if not _VLLM_SERVE.search(token):
+            continue
+        if len(token.split()) == 1:
+            break
+        try:
+            parts = shlex.split(token)
+        except ValueError:
+            continue
+        for index, part in enumerate(parts):
+            if part.endswith("vllm") and parts[index + 1:index + 2] == ["serve"]:
+                return parts[index:]
+    return list(command)
+
+
 def is_vllm_command(command: list[str] | None) -> bool:
-    return bool(command) and any(token == "serve" for token in command) and any(
-        "vllm" in token for token in command[:2]
+    argv = argv_of(command)
+    return bool(argv) and any(token == "serve" for token in argv) and any(
+        "vllm" in token for token in argv[:2]
     )
 
 

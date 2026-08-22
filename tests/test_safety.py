@@ -258,3 +258,38 @@ def test_tenants_are_summed_in_bytes_not_fractions():
     # while 102 GiB of it was actually spoken for.
     assert b.committed_bytes == 102 * GIB
     assert b.committed_util > 0.8
+
+
+def test_a_shell_wrapped_engine_still_weighs_something():
+    """A pooled engine is launched as `bash -lc "ray start ... && exec vllm serve
+    ..."` — one element, because the Ray head and the engine have to share a
+    container. Treating that as opaque made the dashboard's own pooled servers
+    weigh nothing in the budget, so a second launch could be admitted on top of
+    memory that was already spoken for."""
+    pooled = ["-lc", "ray start --head --node-ip-address=10.0.0.1 --port=6379 "
+                     "&& exec vllm serve org/model --host 0.0.0.0 --port 8011 "
+                     "--gpu-memory-utilization 0.62 --pipeline-parallel-size 2"]
+    assert safety.is_vllm_command(pooled)
+    assert safety.parse_util(pooled) == 0.62
+    assert safety.command_params(pooled)["gpu_memory_utilization"] == 0.62
+
+
+def test_a_plain_argv_engine_is_unaffected():
+    plain = ["vllm", "serve", "org/model", "--gpu-memory-utilization=0.4",
+             "--kv-cache-memory-bytes", "8G"]
+    assert safety.is_vllm_command(plain)
+    params = safety.command_params(plain)
+    assert params["gpu_memory_utilization"] == 0.4
+    assert params["kv_cache_memory_bytes"] == "8G"
+
+
+def test_a_shell_command_that_is_not_vllm_is_not_claimed():
+    assert not safety.is_vllm_command(["-lc", "sleep 3600"])
+    assert not safety.is_vllm_command(["-lc", "echo 'vllm serves nothing here'"])
+    assert not safety.is_vllm_command(["ray", "start", "--head"])
+    assert not safety.is_vllm_command([])
+
+
+def test_an_unbalanced_shell_string_does_not_raise():
+    """A command with a stray quote must not take the budget scan down with it."""
+    assert safety.is_vllm_command(["-lc", "vllm serve org/m --tokenizer 'unclosed"]) is False
