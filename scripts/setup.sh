@@ -112,7 +112,7 @@ if missing:
 PYEOF
 )
 
-say "vLLM parameter schema"
+say "vLLM parameter schema and model registry"
 if ! command -v docker >/dev/null; then
     note "docker not on PATH — skipping. The checked-in schema still renders the form."
 else
@@ -121,16 +121,24 @@ else
 print(json.loads(p.read_text())["image"] if p.exists() else "")')"
     WANT_IMAGE="$(cd "$REPO" && "$VENV/bin/python" -c \
         'from app.config import settings; print(settings.vllm_image)')"
-    if [ "$SCHEMA_IMAGE" = "$WANT_IMAGE" ]; then
+    ARCH_IMAGE="$(cd "$REPO" && "$VENV/bin/python" -c \
+        'import json,pathlib; p=pathlib.Path("app/data/vllm_archs.json");
+print(json.loads(p.read_text())["image"] if p.exists() else "")')"
+    if [ "$SCHEMA_IMAGE" = "$WANT_IMAGE" ] && [ "$ARCH_IMAGE" = "$WANT_IMAGE" ]; then
         note "app/data/vllm_args.json already describes $WANT_IMAGE"
     elif ! docker image inspect "$WANT_IMAGE" >/dev/null 2>&1; then
         note "$WANT_IMAGE is not pulled; keeping the checked-in schema for $SCHEMA_IMAGE."
         note "Pull it and re-run this script to regenerate the form."
     else
         note "schema describes '${SCHEMA_IMAGE:-nothing}', but the configured image is $WANT_IMAGE"
-        if confirm "Regenerate it from $WANT_IMAGE now? (two container runs, ~15 seconds)"; then
+        if confirm "Regenerate them from $WANT_IMAGE now? (three container runs, ~30 seconds)"; then
             (cd "$REPO" && "$VENV/bin/python" tools/gen_vllm_schema.py \
                 --image "$WANT_IMAGE" --out app/data/vllm_args.json)
+            # The architecture list is what tells the Serve page a model cannot
+            # load before it spends four minutes finding out. It goes stale the
+            # same way the flag list does, so it is regenerated with it.
+            (cd "$REPO" && "$VENV/bin/python" tools/gen_vllm_archs.py \
+                --image "$WANT_IMAGE" --out app/data/vllm_archs.json)
         else
             note "skipped; the Serve form will show the flags of $SCHEMA_IMAGE"
         fi

@@ -333,6 +333,7 @@ optional version pins (`UNSLOTH_VERSION`, `TRL_VERSION`, …); unpinned means
 | `~/models/outputs/<name>-<job_id>/` | One directory per job: config, checkpoints, and the exported model or adapter. |
 | `~/models/datasets/` | Uploaded JSONL training sets. |
 | `app/data/vllm_args.json` | Generated vLLM flag schema. Checked in. |
+| `app/data/vllm_archs.json` | Generated list of the architectures the image can load. Checked in. |
 | `app/data/sampling_params.json` | Generated sampling-parameter schema, used as a fallback. Checked in. |
 
 Deleting the state directory loses your server definitions and job history and
@@ -358,6 +359,46 @@ about fifteen seconds. It needs the GPU — vLLM will not build its config
 dataclasses without a visible device — so it will not work on a machine that has
 none. `scripts/setup.sh` notices when the checked-in schema does not match the
 configured image and offers to run it for you.
+
+A companion generator extracts the architectures the same image can load:
+
+```bash
+.venv/bin/python tools/gen_vllm_archs.py \
+    --image nvcr.io/nvidia/vllm:26.07-py3 \
+    --out app/data/vllm_archs.json
+```
+
+The Serve page checks a model's `architectures` against that list, so a model
+this build cannot load says so before the four minutes it would otherwise take
+to find out from a traceback. Only the names come out offline — every richer
+registry predicate takes a built `ModelConfig`, which means an engine process.
+`setup.sh` regenerates both together.
+
+## What the Serve page works out for you
+
+Picking a model reads the files that came with it — `config.json`,
+`tokenizer_config.json`, `chat_template.jinja` — and answers the questions the
+form used to make you answer from memory:
+
+* the server name and served name, from the model's own name;
+* what the model is: architecture, context length, quantisation, whether it has
+  a chat template and where it came from, and whether vLLM will run it as a
+  generator or an embedder — which is not a flag anyone can override;
+* which of the ~190 flags actually decide whether it starts, with the reason for
+  each, and one button to apply them.
+
+It sets as little as it can. vLLM detects the quantisation method, resolves the
+dtype, reads `generation_config.json` and loads the repo's chat template on its
+own, and a flag set to what vLLM would have chosen is a second source of truth
+that goes stale on the next image upgrade — so those are listed as deliberately
+left alone, with the reason. What it does set is
+`--gpu-memory-utilization`, sized to the model rather than to the machine, and
+`--max-model-len auto`, which lets vLLM fit the context to the KV cache actually
+left after it has profiled the weights. Tool and reasoning parsers are added
+when the chat template's own tokens name them unambiguously.
+
+What no flag rescues is said plainly: a LoRA adapter, GGUF-only weights, weights
+larger than free memory, a checkpoint whose quantisation this build cannot load.
 
 The sampling schema has an equivalent, pointed at a *running* server:
 
