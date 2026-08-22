@@ -1358,6 +1358,67 @@ function applyFilter(query) {
   }
 }
 
+/* --- naming ---------------------------------------------------------------
+
+   A server's name and its served name are both derivable from the model, and
+   typing them is the first of the several steps between "I want this model" and
+   "it is serving". They fill themselves in — but only while they still hold
+   what a previous model put there, so an edit is never overwritten. */
+
+/** The tail of a model reference, as a container-safe slug.
+ *  `Qwen/Qwen3-Embedding-8B` and `/outputs/heretic/Qwen3-Embedding-8B/` both
+ *  become `qwen3-embedding-8b`. */
+function slugFromModel(model) {
+  const trimmed = String(model || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  const tail = trimmed.split('/').filter(Boolean).pop() || '';
+  const slug = tail.toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+    .replace(/-+$/, '');
+  // Docker will not take a name that starts with a digit-free rule of its own,
+  // but the dashboard's container name is llmd-vllm-<id>; this is the display
+  // name, so the only real requirement is that it is not empty.
+  return slug;
+}
+
+/** A name nothing else is already using. Two servers may legitimately point at
+ *  one model — a long-context one and a fast one — so the second gets a -2. */
+function uniqueName(base, selfId) {
+  if (!base) return '';
+  const taken = new Set((state.status.servers || [])
+    .filter((server) => server.id !== selfId)
+    .map((server) => String(server.name || '').toLowerCase()));
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 100; n += 1) {
+    if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+  }
+  return base;
+}
+
+/** Fill name and served name from the model, without ever clobbering an edit.
+ *  A field is considered "still ours" while it is empty or still equal to what
+ *  the previously selected model derived. */
+function autoName(model) {
+  const editor = state.editor;
+  if (!editor) return;
+  const slug = slugFromModel(model);
+  const previous = editor.derived || { name: '', served: '' };
+
+  const ours = (value, was) => !String(value || '').trim() || value === was;
+
+  if (ours(editor.form.name, previous.name)) {
+    editor.form.name = uniqueName(slug, editor.id);
+    if (editor.refs?.name) editor.refs.name.value = editor.form.name;
+  }
+  if (ours(editor.form.served_name, previous.served)) {
+    editor.form.served_name = slug;
+    if (editor.refs?.served_name) editor.refs.served_name.value = slug;
+  }
+  editor.derived = { name: editor.form.name, served: editor.form.served_name };
+}
+
 /* --- editor -------------------------------------------------------------- */
 
 async function openEditor(server, prefill = {}) {
@@ -1374,6 +1435,12 @@ async function openEditor(server, prefill = {}) {
     syncChecks: new Map(),
     fields: new Map(),
     setters: new Map(),
+    // The basics are plain inputs rather than generated flags, so autofill needs
+    // its own handles on them.
+    refs: {},
+    // What the currently selected model derived. A field still holding this is
+    // fair game to refill; anything else is the user's and is left alone.
+    derived: null,
     sections: [],
     searchable: [],
     paths: EMPTY_PATHS,
@@ -1396,6 +1463,10 @@ async function openEditor(server, prefill = {}) {
 
   await Promise.all([loadPaths(), loadCluster(), server ? null : suggest()]);
   if (state.mode !== 'edit' || state.stopped) return;
+  // A new definition arriving with a model already chosen — the Models page's
+  // Serve button, or a preset — gets its names before it is ever shown. An
+  // existing server keeps whatever it was saved with.
+  if (!server && state.editor.form.model) autoName(state.editor.form.model);
   renderEditor();
   scheduleSafety();
   if (state.editor.form.pooled) runPlan();
@@ -1421,12 +1492,16 @@ function closeEditor() {
 
 function renderEditor() {
   const editor = state.editor;
-  const input = (key, props = {}) => h('input', {
-    type: 'text',
-    value: String(editor.form[key] ?? ''),
-    onInput: (e) => { editor.form[key] = e.target.value; },
-    ...props,
-  });
+  const input = (key, props = {}) => {
+    const el = h('input', {
+      type: 'text',
+      value: String(editor.form[key] ?? ''),
+      onInput: (e) => { editor.form[key] = e.target.value; },
+      ...props,
+    });
+    editor.refs[key] = el;
+    return el;
+  };
 
   state.nodes.safety = h('div', { class: 'row', style: { flex: '1 1 340px' } },
     h('span', { class: 'faint small' }, 'checking the memory budget…'));
@@ -1446,7 +1521,11 @@ function renderEditor() {
     value: editor.form.model,
     lead: 'choose a model…',
     placeholder: 'org/repo, or a path the container can see',
-    onChange: (next) => { editor.form.model = next; schedulePlan(); },
+    onChange: (next) => {
+      editor.form.model = next;
+      autoName(next);
+      schedulePlan();
+    },
     extra: h('button', {
       class: 'btn-sm',
       title: 'Re-read the model cache and the outputs directory',
