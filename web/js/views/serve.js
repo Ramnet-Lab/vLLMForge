@@ -1480,8 +1480,11 @@ function profileFacts(profile) {
   const arch = (profile.architectures || [])[0] || profile.model_type;
   if (arch) facts.push(['Architecture', arch, profile.model_type || '']);
   if (profile.max_position_embeddings) {
+    // The KV cost of that context is the number that decides whether the
+    // default max-model-len is a plan or a wish, so it is shown beside it.
+    const kv = profile.kv_bytes_full;
     facts.push(['Context', `${CTX_FMT(profile.max_position_embeddings)} tokens`,
-      profile.max_position_embeddings.toLocaleString()]);
+      kv ? `${bytes(kv)} of KV cache at full length` : 'full length']);
   }
   facts.push(['Weights', profile.weight_bytes ? bytes(profile.weight_bytes) : '—',
     profile.quant_method ? `${profile.quant_method} quantised` : (profile.dtype || '')]);
@@ -1493,6 +1496,7 @@ function profileFacts(profile) {
 
 function profileFlags(profile) {
   const flags = [];
+  if (profile.runner === 'pooling') flags.push(badge('starting', 'embeddings, not chat'));
   if (profile.is_multimodal) flags.push(badge('info', 'multimodal'));
   if (profile.requires_remote_code) flags.push(badge('starting', 'needs trust-remote-code'));
   if (profile.is_adapter) flags.push(badge('failed', 'LoRA adapter, not a model'));
@@ -1534,6 +1538,7 @@ function renderProfile(options = {}) {
   }
 
   const adapter = profile.is_adapter;
+  const pooling = profile.runner === 'pooling';
   mount(host, h('div', { class: `serve-profile${adapter ? ' bad' : ''}` },
     h('div', { class: 'sp-head' },
       h('strong', null, 'What this model is'),
@@ -1549,6 +1554,15 @@ function renderProfile(options = {}) {
       ? h('p', { class: 'ov-note' },
         `This is a LoRA adapter. Serve ${profile.base_model || 'its base model'} with `
         + '--enable-lora and attach it there.')
+      : null,
+    // Not a flag anyone can override — it is resolved from the repo, and it
+    // decides which endpoints exist. Better said here than discovered by a 400
+    // four minutes after the engine started loading.
+    pooling
+      ? notice('warn',
+        h('strong', null, 'This serves embeddings, not chat. '),
+        h('span', null, `vLLM will run it as a pooling model: ${profile.runner_reason}. `
+          + '/v1/embeddings works, /v1/chat/completions will refuse.'))
       : null,
     (profile.notes || []).length
       ? h('p', { class: 'ov-note' }, profile.notes.join(' · '))

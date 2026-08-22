@@ -154,7 +154,13 @@ class Profile:
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
 
-        return asdict(self)
+        payload = asdict(self)
+        # The two numbers every caller derives anyway, computed once here so a
+        # browser never has to reimplement the hybrid-layer arithmetic.
+        context = self.max_position_embeddings or 0
+        payload["kv_bytes_full"] = self.kv_bytes(context) if context else None
+        payload["kv_bytes_per_token"] = self.kv_bytes_per_token()
+        return payload
 
     # --- derived arithmetic ------------------------------------------------
 
