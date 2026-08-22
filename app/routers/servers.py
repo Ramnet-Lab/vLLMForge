@@ -246,16 +246,20 @@ async def launch(server_id: int, force: bool = False) -> dict:
 
 @router.post("/{server_id}/start")
 async def start(server_id: int, force: bool = False) -> dict:
-    try:
-        result = await svc.start(server_id, force=force)
-    except KeyError:
-        raise HTTPException(404, "no such server") from None
+    if await asyncio.to_thread(svc.get_server, server_id) is None:
+        raise HTTPException(404, "no such server")
+    # Deliberately not wrapped in `except KeyError`. It used to be, and any
+    # KeyError raised anywhere inside the launch — including by this function's
+    # own result handling — came back to the operator as "no such server" for a
+    # server that plainly existed.
+    result = await svc.start(server_id, force=force)
     if not result["started"]:
+        safety = result.get("safety") or {}
         if result.get("error"):
             # docker refused the launch itself — a bound port, a missing image.
-            raise HTTPException(502, detail={"message": result["error"], **result["safety"]})
+            raise HTTPException(502, detail={"message": result["error"], **safety})
         # 409: the request was well-formed, the host just cannot take it.
-        raise HTTPException(409, detail=result["safety"])
+        raise HTTPException(409, detail=safety)
     return result
 
 

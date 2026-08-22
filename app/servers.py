@@ -222,6 +222,33 @@ def container_path(host_path: str | Path) -> str:
 
 # --- lifecycle ----------------------------------------------------------
 
+def _pool_safety(plan: dict) -> dict:
+    """A pooled plan in the shape the single-node verdict has.
+
+    Callers — the router, and through it the form — read `safety` off every
+    start result. A pooled failure used to omit it, and the router's
+    `**result["safety"]` turned that into a KeyError, which its own
+    `except KeyError` then reported as "no such server". A launch refused for
+    running out of memory therefore came back as a 404.
+    """
+    refused = [node for node in plan.get("nodes") or []
+               if (node.get("verdict") or {}).get("ok") is False]
+    worst = next((node["verdict"] for node in refused), None)
+    return {
+        "ok": bool(plan.get("ok")),
+        "level": "block" if refused else ("ok" if plan.get("ok") else "warn"),
+        "message": plan.get("reason") or "",
+        "requested_util": (worst or {}).get("requested_util", 0.0),
+        "requested_bytes": (worst or {}).get("requested_bytes", 0),
+        "suggested_util": plan.get("free_util"),
+        "budget": (worst or {}).get("budget", {}),
+        "nodes": [
+            {"name": node["name"], "verdict": node.get("verdict")}
+            for node in plan.get("nodes") or []
+        ],
+    }
+
+
 async def start_pooled(server: dict, *, force: bool = False) -> dict:
     """One engine across several machines: bring up Ray, then vLLM on the head.
 
@@ -235,8 +262,19 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
     # free reached vLLM and died four minutes in.
     plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {})
     if not plan["ok"] and not force:
-        return {"started": False, "error": plan.get("reason", "cannot pool across these nodes"),
-                "plan": plan}
+        safety_block = _pool_safety(plan)
+        # A plan refused because the memory would not fit is the same kind of
+        # answer the single-node path gives — the request was well-formed and
+        # the machines cannot take it. Anything else (a missing image, no
+        # cluster interface) is an environment fault and reads as an error.
+        refused_for_memory = safety_block["level"] == "block"
+        return {
+            "started": False,
+            "error": "" if refused_for_memory
+                     else plan.get("reason", "cannot pool across these nodes"),
+            "safety": safety_block,
+            "plan": plan,
+        }
 
 
     prefix = cluster._subnet_prefix()
@@ -282,13 +320,15 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         except Exception as exc:
             await cluster.stop_workers(wirings)
             await docker_ctl.remove(name, force=True, host=head.node.docker_host)
-            return {"started": False, "error": str(exc)[-800:], "plan": plan}
+            return {"started": False, "error": str(exc)[-800:],
+                    "safety": _pool_safety(plan), "plan": plan}
 
     db.execute("UPDATE servers SET last_started_at = ? WHERE id = ?", (db.now(), server["id"]))
     await events.broker.publish(events.SERVERS, {"type": "started", "id": server["id"]})
     return {
         "started": True,
         "pooled": True,
+        "safety": _pool_safety(plan),
         "container": name,
         "head": head.node.name,
         "pipeline_parallel_size": len(pool),

@@ -133,3 +133,76 @@ def test_renaming_onto_a_taken_name_is_a_conflict_not_a_crash():
 
     for row in (first, second):
         servers.delete_server(int(row["id"]))
+
+
+def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
+    """The bug this pins: start_pooled returned a failure with no `safety` key,
+    the route did `**result["safety"]`, and the route's own `except KeyError`
+    turned that into 404 "no such server" — for a server that plainly existed.
+    A launch refused for running out of memory came back as not found."""
+    from fastapi.testclient import TestClient
+
+    from app import servers as svc
+    from app.main import app
+
+    row = servers.create_server({
+        "name": f"pooled-{db.now():.6f}", "model": "org/model", "port": 8409,
+        "pool_nodes": ["local", "node2"],
+    })
+
+    async def refused(pool, model="", args=None):
+        return {
+            "ok": False,
+            "reason": "local: 0.92 would reserve more than is free",
+            "free_util": 0.73,
+            "nodes": [{"name": "local", "verdict": {"ok": False, "level": "block",
+                                                    "message": "too much", "requested_util": 0.92,
+                                                    "requested_bytes": 1, "budget": {}}},
+                      {"name": "node2", "verdict": {"ok": False, "level": "block",
+                                                   "message": "too much", "requested_util": 0.92,
+                                                   "requested_bytes": 1, "budget": {}}}],
+        }
+
+    from app import cluster
+
+    monkeypatch.setattr(cluster, "plan", refused)
+    client = TestClient(app)
+    try:
+        response = client.post(f"/api/servers/{row['id']}/start")
+        # Not 404, and not a bare 502: the machines cannot take it.
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["level"] == "block"
+        assert "would reserve more than is free" in detail["message"]
+        assert detail["suggested_util"] == 0.73
+        assert [n["name"] for n in detail["nodes"]] == ["local", "node2"]
+
+        # A server id that really is missing still answers 404.
+        assert client.post("/api/servers/999999/start").status_code == 404
+    finally:
+        servers.delete_server(int(row["id"]))
+
+
+def test_an_environment_failure_stays_a_502(monkeypatch):
+    """A missing image is not the host declining; it is something to go fix."""
+    from fastapi.testclient import TestClient
+
+    from app import cluster
+    from app.main import app
+
+    row = servers.create_server({
+        "name": f"pooled-{db.now():.6f}", "model": "org/model", "port": 8410,
+        "pool_nodes": ["local", "node2"],
+    })
+
+    async def no_image(pool, model="", args=None):
+        return {"ok": False, "reason": "ray image is not built on: node2", "nodes": []}
+
+    monkeypatch.setattr(cluster, "plan", no_image)
+    client = TestClient(app)
+    try:
+        response = client.post(f"/api/servers/{row['id']}/start")
+        assert response.status_code == 502
+        assert "not built on" in response.json()["detail"]["message"]
+    finally:
+        servers.delete_server(int(row["id"]))
