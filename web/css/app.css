@@ -29,6 +29,13 @@
   --danger-dim:    #2d1518;
   --info:          #a371f7;
 
+  /* Chart series. Two hues, assigned to nodes in registry order and never
+     recycled, so a node keeps its colour as the cluster changes size. Checked
+     with the palette validator against #131a23: lightness band, chroma floor,
+     deuteranope/protanope/tritanope separation (dE 26.8) and contrast all pass. */
+  --series-1:      #3987e5;
+  --series-2:      #d95926;
+
   --radius:   7px;
   --radius-s: 4px;
   --gap:      14px;
@@ -62,6 +69,11 @@
   --danger:        #cf222e;
   --danger-dim:    #ffe2e0;
   --info:          #8250df;
+
+  /* Re-stepped for the light surface rather than reused — the dark pair fails
+     the contrast check on #ffffff. Same hues, same order, dE 24.7. */
+  --series-1:      #2a78d6;
+  --series-2:      #eb6834;
 
   --shadow: 0 6px 20px rgba(20, 35, 60, .12);
   color-scheme: light;

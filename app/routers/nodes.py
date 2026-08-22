@@ -25,6 +25,12 @@ async def list_nodes() -> dict:
     return await svc.summary()
 
 
+@router.get("/history")
+async def node_history(minutes: float = 30.0) -> dict:
+    """Recent readings from every node, for the time-series panels."""
+    return await asyncio.to_thread(svc.history, minutes)
+
+
 @router.get("/discover")
 async def discover(scan_subnet: bool = False) -> dict:
     """Boxes this machine can already ssh into. Adding one stays deliberate."""

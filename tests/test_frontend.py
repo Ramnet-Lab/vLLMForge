@@ -197,6 +197,64 @@ def test_no_interpolated_innerhtml(path: Path):
 TOOLKIT = sorted(exported_names(WEB / "js" / "ui.js") | exported_names(WEB / "js" / "api.js"))
 
 
+# Anything a browser or the language already provides. Everything else a module
+# calls by a bare name has to come from an import or a definition in that file.
+JS_GLOBALS = {
+    "Array", "Boolean", "Date", "Error", "Intl", "JSON", "Map", "Math", "Number",
+    "Object", "Promise", "RegExp", "Set", "String", "Symbol", "WeakMap",
+    "AbortController", "Blob", "CustomEvent", "Event", "EventSource", "FormData",
+    "Headers", "Image", "IntersectionObserver", "MouseEvent", "MutationObserver",
+    "Request", "Response", "ResizeObserver", "TextDecoder", "TextEncoder", "URL",
+    "URLSearchParams", "WebSocket", "Worker",
+    "addEventListener", "alert", "atob", "btoa", "cancelAnimationFrame", "clearInterval",
+    "clearTimeout", "confirm", "decodeURIComponent", "encodeURIComponent", "fetch",
+    "isFinite", "isNaN", "parseFloat", "parseInt", "prompt", "queueMicrotask",
+    "removeEventListener", "requestAnimationFrame", "setInterval", "setTimeout",
+    "structuredClone", "import",
+    # keywords and class syntax the regex sees as calls
+    "if", "for", "while", "switch", "catch", "return", "typeof", "function", "await",
+    "of", "in", "new", "do", "else", "case", "delete", "void", "yield", "async",
+    "constructor", "super", "this",
+}
+
+# A brace group holding nothing but names, colons, commas and defaults is a
+# destructuring pattern or an object literal; either way its names are in scope.
+PATTERN_GROUP = re.compile(r"\{([^{};()]*)\}")
+
+
+@pytest.mark.parametrize("path", JS_FILES, ids=lambda p: str(p.relative_to(WEB)))
+def test_every_called_name_is_defined_or_imported(path: Path):
+    """A call to a helper that no longer exists is a blank page, not a stack trace
+    the tests would catch — nothing imports these modules but the browser. This
+    walks the bare `name(` calls and insists each one has somewhere to come from."""
+    if path.name == "ui.js":
+        return
+    text = path.read_text()
+    source = strip_js(text)
+
+    known = set(JS_GLOBALS)
+    for block in re.findall(r"import\s*\{([^}]*)\}", text):
+        known |= {n.strip().split(" as ")[-1].strip() for n in block.split(",") if n.strip()}
+    known |= set(re.findall(r"import\s+([A-Za-z_$][\w$]*)\s+from", text))
+    known |= set(re.findall(r"\b(?:const|let|var|class|function\s*\*?)\s+([A-Za-z_$][\w$]*)", source))
+    # Destructured bindings, object shorthand, and every parameter are in scope
+    # too — a name that any of those introduces is not a missing helper.
+    for group in PATTERN_GROUP.findall(source):
+        known |= {n.strip().split(":")[-1].split("=")[0].strip().lstrip(". ")
+                  for n in group.split(",")}
+    for params in re.findall(r"\(([^()]*)\)", source):
+        known |= {p.strip().split("=")[0].strip().lstrip(". ") for p in params.split(",")}
+    known |= set(re.findall(r"([A-Za-z_$][\w$]*)\s*=>", source))
+    # Class and object methods are defined by `name(args) {`, which the call
+    # regex also matches; the definition counts as the declaration.
+    known |= set(re.findall(r"^\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{",
+                            source, re.M))
+
+    called = set(re.findall(r"(?<![.\w$'\"`])([a-z_$][\w$]*)\s*\(", source))
+    missing = sorted(name for name in called if name not in known)
+    assert not missing, f"{path.name} calls undefined helper(s): {missing}"
+
+
 @pytest.mark.parametrize("path", JS_FILES, ids=lambda p: str(p.relative_to(WEB)))
 def test_every_toolkit_helper_used_is_imported(path: Path):
     if path.name in ("ui.js", "api.js"):

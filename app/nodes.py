@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import shutil
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -512,3 +514,66 @@ async def ensure_workers(node: Node) -> str:
             f"could not copy the workers to {target}: {stdout.decode(errors='replace')[-300:]}"
         )
     return f"{home}/{remote}"
+
+
+# --- telemetry history ----------------------------------------------------
+#
+# A ring buffer, not a database. The chart wants a recent window and nothing
+# else; keeping it in memory means no schema, no growth, and no cleanup, and
+# losing it on restart costs a few minutes of lines.
+
+HISTORY_SECONDS = 30 * 60
+HISTORY_INTERVAL = 10.0
+_history: deque[dict] = deque(maxlen=int(HISTORY_SECONDS / HISTORY_INTERVAL))
+
+# What the chart plots. Each is its own panel because they are different units,
+# and putting two units on one axis makes a chart that cannot be read.
+METRICS = [
+    {"key": "gpu_util", "label": "GPU utilisation", "unit": "%", "max": 100},
+    {"key": "temperature", "label": "GPU temperature", "unit": "°C", "max": None},
+    {"key": "power", "label": "Board power", "unit": "W", "max": None},
+    {"key": "memory_pct", "label": "Host memory used", "unit": "%", "max": 100},
+]
+
+
+def _reading(telemetry: dict) -> dict:
+    gpu = telemetry.get("gpu") or {}
+    memory = telemetry.get("memory") or {}
+    load = telemetry.get("load") or []
+    return {
+        "gpu_util": gpu.get("utilization_gpu"),
+        "temperature": gpu.get("temperature_gpu"),
+        "power": gpu.get("power_draw"),
+        "memory_pct": round(memory.get("used_fraction", 0) * 100, 1) if memory else None,
+        "memory_used_bytes": memory.get("used_bytes"),
+        "load": load[0] if load else None,
+    }
+
+
+async def record_sample() -> dict:
+    """One reading from every node, appended to the window."""
+    statuses = await status_all()
+    sample = {"ts": time.time(), "nodes": {}}
+    for status in statuses:
+        if not status.get("reachable"):
+            continue
+        sample["nodes"][status["name"]] = _reading(status.get("telemetry") or {})
+    _history.append(sample)
+    return sample
+
+
+def history(minutes: float = 30.0) -> dict:
+    cutoff = time.time() - minutes * 60
+    samples = [s for s in _history if s["ts"] >= cutoff]
+    seen: list[str] = []
+    for sample in samples:
+        for name in sample["nodes"]:
+            if name not in seen:
+                seen.append(name)
+    return {
+        "samples": samples,
+        "nodes": seen,
+        "metrics": METRICS,
+        "interval_seconds": HISTORY_INTERVAL,
+        "window_seconds": HISTORY_SECONDS,
+    }

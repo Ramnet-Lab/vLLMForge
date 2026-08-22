@@ -54,6 +54,25 @@ async def telemetry_loop() -> None:
         await asyncio.sleep(settings.telemetry_interval)
 
 
+async def node_history_loop() -> None:
+    """Sample every node on a slow cadence.
+
+    Separate from the telemetry stream: that one polls this machine twice a
+    second for a live readout, while each peer costs an ssh round trip, and the
+    chart only needs a point every few seconds.
+    """
+    from app import nodes
+
+    while True:
+        try:
+            await nodes.record_sample()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("node history sample failed")
+        await asyncio.sleep(nodes.HISTORY_INTERVAL)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings.ensure_dirs()
@@ -66,6 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await jobs.manager.reconcile()
 
     BACKGROUND.append(asyncio.create_task(telemetry_loop(), name="telemetry"))
+    BACKGROUND.append(asyncio.create_task(node_history_loop(), name="node-history"))
     if settings.memguard_enabled:
         BACKGROUND.append(asyncio.create_task(memguard.watch(), name="memguard"))
     await server_service.autostart()

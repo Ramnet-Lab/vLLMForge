@@ -11,7 +11,7 @@
 import { get, stream } from '../api.js';
 import {
   ago, badge, bytes, copyButton, duration, empty, ensureStyles, h, mount, notice,
-  panel, pct, spinner, stat, toast, when,
+  panel, pct, spinner, stat, svg, toast, when,
 } from '../ui.js';
 
 const POLL_MS = 10000;
@@ -28,8 +28,9 @@ const region = {};
 
 const utilText = (value) => (Number.isFinite(value) ? value.toFixed(2) : '—');
 
+// One decimal, and only when it says something: 48°C not 48.0°C, 12.1W not 12W.
 const reading = (value, suffix) =>
-  (Number.isFinite(value) ? `${Math.round(value)}${suffix}` : '—');
+  (Number.isFinite(value) ? `${Math.round(value * 10) / 10}${suffix}` : '—');
 
 /* --- cluster memory ----------------------------------------------------- */
 
@@ -51,88 +52,16 @@ function memoryBars(segments, total) {
 /* Only the machine this dashboard runs on can be broken down this far:
    nvidia-smi reports per-process memory for its own box, and the committed
    fractions come from containers we can inspect without ssh. */
-function localMemory(budget) {
-  const total = budget.total_bytes || 1;
-  const engines = Math.max(0, budget.committed_bytes || 0);
-  // occupied_bytes is max(committed, measured), so the excess is allocation by
-  // something that never declared a util fraction — a trainer, a stray process.
-  const other = Math.max(0, (budget.occupied_bytes || 0) - engines);
-  const reserve = Math.min(budget.reserve_bytes || 0, total);
-  const headroom = Math.max(0, total - engines - other - reserve);
+/* Both nodes get the same four readings, in the same order, so the cards can be
+   compared at a glance. The local card adds what only this machine can know —
+   which engines committed what — underneath, rather than in a different shape. */
 
-  const segments = [
-    {
-      key: 'engine',
-      label: 'Engines committed',
-      value: engines,
-      note: `${utilText(budget.committed_util)} util summed over ${budget.tenants.length} engine(s)`,
-    },
-    {
-      key: 'other',
-      label: 'Other GPU processes',
-      value: other,
-      note: 'measured allocation with no utilisation fraction behind it',
-    },
-    {
-      key: 'free',
-      label: 'Free to allocate',
-      value: headroom,
-      note: `the largest new --gpu-memory-utilization that fits is ${utilText(budget.free_util)}`,
-    },
-    {
-      key: 'reserve',
-      label: 'Held back for the OS',
-      value: reserve,
-      note: 'the dashboard refuses any launch that would eat into this',
-    },
-  ];
-
-  const tight = budget.free_util <= 0.02;
-  const warm = !tight && budget.occupied_util > budget.warn_util;
-
-  return h('div', { class: 'stack' },
-    h('div', { class: 'ov-tiles' },
-      stat('Host memory', bytes(total), 'shared by the CPU and the GPU'),
-      stat('Committed', utilText(budget.committed_util), bytes(budget.committed_bytes)),
-      stat('Free to allocate', utilText(budget.free_util), `of a ${utilText(budget.max_util)} ceiling`),
-      stat('MemAvailable', bytes(budget.available_bytes), `${bytes(budget.free_bytes)} actually free`)),
-    memoryBars(segments, total),
-    tight || warm
-      ? notice(tight ? 'danger' : 'warn',
-          h('strong', null, tight ? 'No room for another engine here. ' : 'Getting tight. '),
-          h('span', null, tight
-            ? `Everything above ${utilText(budget.max_util)} total utilisation is refused; stop a `
-              + 'server before starting or fine-tuning anything, or place the next one on a peer.'
-            : `Total utilisation has passed the ${utilText(budget.warn_util)} warning line. Keep `
-              + '--max-num-seqs low; concurrency spikes are what actually kill this box.'))
-      : null,
-    budget.tenants.length
-      ? h('div', { class: 'table-wrap' },
-          h('table', null,
-            h('thead', null, h('tr', null,
-              h('th', null, 'Holding memory'),
-              h('th', null, 'Origin'),
-              h('th', { class: 'num' }, 'Util'),
-              h('th', { class: 'num' }, 'Reserved'))),
-            h('tbody', null, budget.tenants.map((tenant) => h('tr', null,
-              h('td', null,
-                h('span', { class: 'nowrap' }, tenant.name),
-                tenant.note ? h('div', { class: 'ov-note' }, tenant.note) : null),
-              h('td', null, badge(tenant.managed ? 'info' : 'absent',
-                tenant.managed ? 'managed' : 'hand-launched')),
-              h('td', { class: 'num' }, `${utilText(tenant.util)}${tenant.implicit ? ' *' : ''}`),
-              h('td', { class: 'num' }, bytes(tenant.bytes_committed)))))))
-      : h('p', { class: 'ov-note' }, 'No vLLM engine is holding a reservation right now.'));
-}
-
-/* A peer is read over ssh: /proc/meminfo and docker ps, nothing else. Used is
-   whatever the kernel does not count as available, which is a coarser split
-   than the local card and is labelled as such. */
-function peerMemory(node) {
+function nodeMemory(node, budget) {
   const total = node.total_bytes || 0;
   const available = Math.max(0, node.available_bytes || 0);
   const used = Math.max(0, total - available);
   const running = node.containers || [];
+  const isLocal = node.local && budget && budget.total_bytes;
 
   const segments = [
     {
@@ -145,24 +74,44 @@ function peerMemory(node) {
       key: 'free',
       label: 'Available',
       value: available,
-      note: 'what a new engine on this node could take before the guard steps in',
+      note: 'what a new engine here could take before the guard steps in',
     },
   ];
 
   return h('div', { class: 'stack' },
     h('div', { class: 'ov-tiles' },
       stat('Host memory', bytes(total), 'shared by the CPU and the GPU'),
-      stat('In use', bytes(used), `${Math.round((used / (total || 1)) * 100)}% of the node`),
-      stat('MemAvailable', bytes(available), `${bytes(node.free_bytes)} actually free`),
-      stat('Containers', String(running.length), 'running under its docker daemon')),
+      stat('In use', bytes(used), total ? pct(used / total) : ''),
+      stat('Available', bytes(available), total ? pct(available / total) : ''),
+      stat('Containers', String(running.length),
+        running.length ? running.map((c) => c.name).join(', ').slice(0, 40) : 'none running')),
     memoryBars(segments, total),
-    running.length
-      ? h('p', { class: 'ov-note' }, running.map((container) => container.name).join(', '))
-      : h('p', { class: 'ov-note' }, 'Nothing is running on this node.'),
-    h('p', { class: 'ov-note' },
-      'No per-process GPU figure: nvidia-smi reports on the machine it runs on, and this peer is '
-      + 'reached over ssh. What it has committed through vLLM flags is on the Serve tab, next to '
-      + 'the servers placed there.'));
+    isLocal ? localCommitment(budget) : null);
+}
+
+/** What only this machine can report: which engines have committed what, from
+ *  their own command lines, and how much is left to give. */
+function localCommitment(budget) {
+  const tenants = budget.tenants || [];
+  return h('div', { class: 'ov-commit' },
+    h('div', { class: 'row wrap' },
+      h('span', { class: 'faint small' },
+        `Committed ${utilText(budget.committed_util)} of a ${utilText(budget.max_util)} ceiling · `
+        + `largest new --gpu-memory-utilization that fits is ${utilText(budget.free_util)}`)),
+    tenants.length
+      ? h('div', { class: 'table-wrap' },
+          h('table', null,
+            h('thead', null, h('tr', null,
+              h('th', null, 'Engine'), h('th', { class: 'num' }, 'util'),
+              h('th', { class: 'num' }, 'reserves'), h('th', null, ''))),
+            h('tbody', null, tenants.map((t) =>
+              h('tr', null,
+                h('td', { class: 'mono' }, t.name),
+                h('td', { class: 'num' }, utilText(t.util)),
+                h('td', { class: 'num' }, bytes(t.bytes_committed)),
+                h('td', { class: 'faint small' },
+                  (t.managed ? '' : 'not managed here') + (t.note ? ` · ${t.note}` : '')))))))
+      : h('div', { class: 'faint small' }, 'no engine has committed memory here'));
 }
 
 function nodeHeader(node) {
@@ -202,45 +151,159 @@ function nodeCard(node, budget) {
     // /proc/meminfo is read locally and stays readable when the docker socket is
     // not, so this card keeps its figures. A peer's numbers come over the same
     // ssh that just failed, and 0 GiB would be a lie rather than a measurement.
-    node.local ? localMemory(budget) : (down ? null : peerMemory(node)),
-    down ? null : nodeTelemetry(node));
+    // Utilisation, temperature and power used to repeat here per node. They are
+    // in the shared panel above now — the same reading for both machines on one
+    // axis says more than two copies of it in two cards.
+    down ? null : nodeMemory(node, budget));
 }
 
-/** The same readings the Live telemetry panel shows for this machine, for every
- *  node. A peer is a machine before it is a cluster member: how hot it is and
- *  what is holding its GPU matters whether or not anything is pooled onto it,
- *  and most of the time nothing is. Fetched over ssh, so it needs no Ray. */
-function nodeTelemetry(node) {
-  const t = node.telemetry || {};
-  const gpu = t.gpu || {};
-  if (!Object.keys(gpu).length && !(t.load || []).length) return null;
+/* --- time series ---------------------------------------------------------
+   One panel per metric, both nodes drawn on it. That split is deliberate: the
+   two machines share a unit and belong on the same axis, but GPU percent,
+   degrees and watts do not — a single axis carrying all of them produces a
+   line whose height means nothing. Colour follows the node, held constant
+   across every panel, so a colour means the same machine wherever it appears.
 
-  const reading = (value, suffix, digits = 0) =>
-    (Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : '—');
+   Palette: categorical slots 1 and 2, validated for both surfaces
+   (CVD ΔE 26.8 dark / 24.7 light, contrast >= 3:1). */
 
-  const procs = t.gpu_processes || [];
-  const held = procs.reduce((sum, p) => sum + (p.used_bytes || 0), 0);
+const SERIES_COLOURS = ['var(--series-1)', 'var(--series-2)'];
+const PLOT = { w: 560, h: 150, padL: 40, padR: 8, padT: 12, padB: 22 };
 
-  return h('div', { class: 'ov-node-tel' },
-    h('div', { class: 'grid cols-4' },
-      stat('GPU', reading(gpu.utilization_gpu, '%'),
-        gpu.name || (node.has_nvidia_runtime ? 'nvidia runtime' : 'no GPU reported')),
-      stat('Temp', reading(gpu.temperature_gpu, '°C'),
-        gpu.pstate ? `pstate ${gpu.pstate}` : ''),
-      stat('Power', reading(gpu.power_draw, ' W', 1),
-        Number.isFinite(gpu.clocks_sm) ? `${Math.round(gpu.clocks_sm)} MHz SM` : ''),
-      stat('Load', (t.load || []).length ? t.load[0].toFixed(2) : '—',
-        t.cpu_count ? `over ${t.cpu_count} cores` : '')),
-    procs.length
-      ? h('div', { class: 'faint small', style: { marginTop: '8px' } },
-          `${procs.length} process${procs.length === 1 ? '' : 'es'} holding ${bytes(held)} of GPU memory`
-          + ` (pid ${procs.map((p) => p.pid).join(', ')})`)
-      : h('div', { class: 'faint small', style: { marginTop: '8px' } },
-          'nothing is holding GPU memory here'),
-    t.disk && t.disk.free_bytes
-      ? h('div', { class: 'faint small' },
-          `${bytes(t.disk.free_bytes)} free on the model cache volume`)
-      : null);
+function seriesColour(index) {
+  return SERIES_COLOURS[index % SERIES_COLOURS.length];
+}
+
+/** Round a peak up to something a human reads off an axis. */
+function niceMax(values, floor) {
+  const peak = Math.max(floor, ...values.filter(Number.isFinite));
+  const step = peak <= 10 ? 2 : peak <= 50 ? 10 : peak <= 120 ? 25 : 50;
+  return Math.ceil(peak / step) * step;
+}
+
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString([], {
+  hour: '2-digit', minute: '2-digit',
+});
+
+function metricPanel(metric, hist) {
+  const nodes = hist.nodes || [];
+  const samples = hist.samples || [];
+  if (samples.length < 2) {
+    return h('div', { class: 'ov-plot' },
+      h('div', { class: 'ov-plot-head' }, h('strong', null, metric.label)),
+      h('div', { class: 'faint small ov-plot-empty' },
+        'collecting — the first line appears once there are two samples'));
+  }
+
+  const t0 = samples[0].ts;
+  const span = Math.max(1, samples[samples.length - 1].ts - t0);
+  const at = (sample, node) => sample.nodes[node]?.[metric.key];
+  const all = samples.flatMap((sample) => nodes.map((node) => at(sample, node)));
+  // A percentage keeps its full 0-100 axis: an idle GPU should look idle, not
+  // like a mountain range of rescaled jitter. Everything else follows the data.
+  const max = metric.max || niceMax(all, 1);
+
+  const x = (ts) => PLOT.padL + ((ts - t0) / span) * (PLOT.w - PLOT.padL - PLOT.padR);
+  const y = (v) => PLOT.h - PLOT.padB - (Math.min(v, max) / max) * (PLOT.h - PLOT.padT - PLOT.padB);
+
+  const gridlines = [0, 0.25, 0.5, 0.75, 1].map((f) =>
+    svg('line', { x1: PLOT.padL, x2: PLOT.w - PLOT.padR, y1: y(max * f), y2: y(max * f),
+      class: 'ov-grid' }));
+  const ticks = [0, 0.5, 1].map((f) =>
+    svg('text', { x: PLOT.padL - 6, y: y(max * f) + 4, 'text-anchor': 'end', class: 'ov-tick' },
+      String(Math.round(max * f))));
+  const times = [
+    svg('text', { x: PLOT.padL, y: PLOT.h - 6, class: 'ov-tick' }, clock(t0)),
+    svg('text', { x: PLOT.w - PLOT.padR, y: PLOT.h - 6, 'text-anchor': 'end', class: 'ov-tick' },
+      clock(samples[samples.length - 1].ts)),
+  ];
+
+  const lines = [];
+  const dots = [];
+  const values = [];
+  nodes.forEach((node, index) => {
+    const colour = seriesColour(index);
+    const points = samples
+      .filter((sample) => Number.isFinite(at(sample, node)))
+      .map((sample) => `${x(sample.ts).toFixed(1)},${y(at(sample, node)).toFixed(1)}`);
+    if (points.length >= 2) {
+      lines.push(svg('polyline', { points: points.join(' '), fill: 'none', stroke: colour,
+        'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+    }
+    // The hover dot rides the line; it is parked off-canvas until the pointer
+    // arrives, so it costs one node per series and no re-render.
+    dots.push(svg('circle', { r: 4, fill: colour, stroke: 'var(--bg-raised)',
+      'stroke-width': 2, class: 'ov-dot', cx: -20, cy: -20 }));
+    const last = [...samples].map((sample) => at(sample, node)).reverse().find(Number.isFinite);
+    values.push(h('b', null, reading(last, metric.unit)));
+  });
+
+  const keys = nodes.map((node, index) => h('span', { class: 'ov-key' },
+    h('i', { style: { background: seriesColour(index) } }),
+    h('span', null, node), values[index]));
+
+  const cursor = svg('line', { y1: PLOT.padT, y2: PLOT.h - PLOT.padB, class: 'ov-cursor',
+    x1: -20, x2: -20 });
+  const stamp = h('span', { class: 'ov-stamp' }, '');
+
+  // Grafana's habit: the legend doubles as the readout. Rather than float a
+  // tooltip box, the numbers already on screen change to the sample under the
+  // pointer, and go back to live when it leaves.
+  const restore = () => {
+    nodes.forEach((node, index) => {
+      const last = [...samples].map((sample) => at(sample, node)).reverse().find(Number.isFinite);
+      values[index].textContent = reading(last, metric.unit);
+      dots[index].setAttribute('cx', -20);
+      dots[index].setAttribute('cy', -20);
+    });
+    cursor.setAttribute('x1', -20);
+    cursor.setAttribute('x2', -20);
+    stamp.textContent = '';
+  };
+
+  const hover = (event) => {
+    const box = event.currentTarget.getBoundingClientRect();
+    if (!box.width) return;
+    const vx = ((event.clientX - box.left) / box.width) * PLOT.w;
+    const wanted = t0 + ((vx - PLOT.padL) / (PLOT.w - PLOT.padL - PLOT.padR)) * span;
+    let hit = samples[0];
+    for (const sample of samples) {
+      if (Math.abs(sample.ts - wanted) < Math.abs(hit.ts - wanted)) hit = sample;
+    }
+    const hx = x(hit.ts);
+    cursor.setAttribute('x1', hx);
+    cursor.setAttribute('x2', hx);
+    stamp.textContent = clock(hit.ts);
+    nodes.forEach((node, index) => {
+      const value = at(hit, node);
+      values[index].textContent = reading(value, metric.unit);
+      dots[index].setAttribute('cx', Number.isFinite(value) ? hx : -20);
+      dots[index].setAttribute('cy', Number.isFinite(value) ? y(value) : -20);
+    });
+  };
+
+  return h('div', { class: 'ov-plot' },
+    h('div', { class: 'ov-plot-head' },
+      h('strong', null, metric.label),
+      stamp,
+      h('span', { class: 'ov-keys' }, keys)),
+    svg('svg', { viewBox: `0 0 ${PLOT.w} ${PLOT.h}`, class: 'ov-svg',
+      role: 'img', 'aria-label': `${metric.label} over the last ${Math.round(span / 60)} minutes, `
+        + `one line per node: ${nodes.join(', ')}`,
+      onMousemove: hover, onMouseleave: restore },
+      gridlines, ticks, times, cursor, lines, dots,
+      svg('rect', { x: 0, y: 0, width: PLOT.w, height: PLOT.h, fill: 'transparent' })));
+}
+
+function timeSeries(hist) {
+  if (!hist || !(hist.nodes || []).length) return null;
+  const minutes = Math.round((hist.window_seconds || 1800) / 60);
+  return h('div', { class: 'stack' },
+    h('div', { class: 'ov-plot-grid' }, (hist.metrics || []).map((m) => metricPanel(m, hist))),
+    h('div', { class: 'faint small' },
+      `Both machines on every panel, one colour each. Last ${minutes} minutes, `
+      + `sampled every ${hist.interval_seconds}s; hover to read a point. `
+      + 'A node that goes unreachable stops contributing and its line simply ends.'));
 }
 
 /** The cluster as one pool. A pooled engine's memory is the sum of what each
@@ -284,12 +347,15 @@ function clusterSection(payload) {
         h('strong', null, 'No node list. '),
         h('span', null, 'GET /api/nodes named no machines, which it cannot do while it is '
           + 'working. Only this one is shown until it answers again.')),
-      localMemory(payload.budget));
+      nodeMemory({ local: true, total_bytes: payload.budget.total_bytes,
+                   available_bytes: payload.budget.available_bytes, containers: [] },
+                 payload.budget));
   }
   const local = registry.find((node) => node.local) || {};
 
   return h('div', { class: 'stack' },
     combinedPool(payload.combined, registry),
+    timeSeries(payload.history),
     registry.map((node) => nodeCard(node, payload.budget)),
     notice('info',
       h('strong', null, 'GPU memory is host memory on these machines. '),
@@ -314,12 +380,13 @@ function telemetrySection(snapshot) {
 
   return h('div', { class: 'stack' },
     h('div', { class: 'ov-tiles' },
-      stat('GPU', reading(gpu.utilization_gpu, '%'), gpu.name || 'accelerator'),
-      stat('Temperature', reading(gpu.temperature_gpu, '°C'),
-        gpu.pstate ? `pstate ${gpu.pstate}` : ''),
-      stat('Power', reading(gpu.power_draw, ' W'), 'no power cap is readable here'),
-      stat('SM clock', reading(gpu.clocks_sm, ' MHz'),
+      // Utilisation, temperature and power live in the shared panel above, for
+      // both machines at once. What is left here is what only this box has:
+      // the device it is, the clock it is running at, and who is holding it.
+      stat('Device', gpu.name || 'accelerator',
         gpu.driver_version ? `driver ${gpu.driver_version}` : ''),
+      stat('SM clock', reading(gpu.clocks_sm, ' MHz'),
+        gpu.pstate ? `pstate ${gpu.pstate}` : ''),
       stat('Load', load.length ? load.map((value) => value.toFixed(2)).join('  ') : '—',
         `${snapshot.cpu_count || 0} cores`)),
     h('p', { class: 'ov-note' },
@@ -521,9 +588,10 @@ function fill(node, settled, build) {
 }
 
 async function refresh({ withImages = false } = {}) {
-  const [budget, registry, servers, jobs, guard, imageResult] = await Promise.allSettled([
+  const [budget, registry, history, servers, jobs, guard, imageResult] = await Promise.allSettled([
     get('/system/budget'),
     get('/nodes'),
+    get('/nodes/history?minutes=30'),
     get('/servers'),
     get('/jobs?limit=8'),
     get('/system/memguard'),
@@ -539,6 +607,7 @@ async function refresh({ withImages = false } = {}) {
     value: {
       ...(registry.status === 'fulfilled' ? registry.value : {}),
       budget: budget.value,
+      history: history.status === 'fulfilled' ? history.value : null,
     },
   };
 
@@ -637,6 +706,39 @@ export function dispose() {
 }
 
 const CSS = `
+/* One panel per metric, both machines drawn into it. Two columns on a normal
+   window: at four across, a 560-unit viewBox scales down far enough that the
+   axis labels stop being readable. */
+.ov-plot-grid {
+  display: grid; gap: var(--gap);
+  grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+}
+.ov-plot {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-raised); padding: 10px 12px 4px;
+}
+.ov-plot-head {
+  display: flex; align-items: baseline; gap: 10px;
+  flex-wrap: wrap; margin-bottom: 2px;
+}
+.ov-plot-empty { padding: 24px 0 28px; }
+.ov-svg { display: block; width: 100%; height: auto; }
+.ov-svg .ov-grid { stroke: var(--border); stroke-width: 1; }
+.ov-svg .ov-tick { fill: var(--text-faint); font-size: 10px; font-family: var(--mono); }
+.ov-svg .ov-cursor { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.ov-svg .ov-dot { pointer-events: none; }
+
+.ov-keys { display: flex; gap: 12px; flex-wrap: wrap; margin-left: auto; }
+/* The swatch carries the identity; the text stays in ink tokens so it keeps its
+   contrast against the panel no matter which hue the node drew. */
+.ov-key { display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-dim); }
+.ov-key i { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.ov-key b { font-family: var(--mono); color: var(--text); font-weight: 600; }
+.ov-stamp { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+
+.ov-commit { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.ov-commit .table-wrap { margin-top: 8px; }
 .ov-node-tel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 .ov-pool { border: 1px solid var(--border-strong); border-radius: var(--radius);
   padding: 13px 14px; background: var(--bg-raised); }
