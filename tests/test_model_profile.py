@@ -223,3 +223,114 @@ def test_unreadable_json_does_not_take_the_profile_down(cache):
     assert profile.found is True
     assert profile.architectures == []
     assert any("config.json" in note for note in profile.notes)
+
+
+# --- the shapes a real cache actually contains ----------------------------
+
+GEMMA4 = {
+    "architectures": ["Gemma4ForConditionalGeneration"],
+    "model_type": "gemma4",
+    "dtype": "bfloat16",
+    "vision_config": {"hidden_size": 1152},
+    "text_config": {
+        "max_position_embeddings": 262144,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 16,
+        "head_dim": 256,
+        "num_global_key_value_heads": 4,
+        "global_head_dim": 512,
+        "sliding_window": 1024,
+        "layer_types": ["sliding_attention"] * 50 + ["full_attention"] * 10,
+        "rope_parameters": {
+            "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        },
+    },
+}
+
+
+def test_a_hybrid_models_kv_is_carried_by_its_full_attention_layers(cache):
+    """Gemma-class models are mostly sliding-window layers, which stop growing
+    at the window. Charging all sixty layers for the full context reports a
+    20 GiB cache as 240 and sends the operator hunting for memory they have."""
+    cache("google/gemma-like", {"config.json": GEMMA4})
+    profile = model_profile.read("google/gemma-like")
+
+    assert profile.layer_types == {"sliding_attention": 50, "full_attention": 10}
+    # Only the 10 full layers grow, and they carry their own head geometry.
+    assert profile.kv_bytes_per_token() == 10 * 2 * 4 * 512 * 2
+    full = 10 * 2 * 4 * 512 * 2 * 262144
+    sliding = 50 * 2 * 16 * 256 * 2 * 1024
+    assert profile.kv_bytes(262144) == full + sliding
+    assert profile.kv_bytes(262144) / 2 ** 30 == pytest.approx(20.78, abs=0.05)
+
+
+def test_recurrent_layers_hold_no_kv_cache(cache):
+    """A Qwen3.5-class model is 48 Mamba layers and 16 attention layers. The
+    Mamba state is real memory but it is sized by concurrency, not context."""
+    cache("org/hybrid", {"config.json": {
+        "architectures": ["HybridForCausalLM"], "model_type": "hybrid",
+        "num_hidden_layers": 64, "num_attention_heads": 24,
+        "num_key_value_heads": 4, "head_dim": 256,
+        "max_position_embeddings": 262144,
+        "layer_types": ["linear_attention"] * 48 + ["full_attention"] * 16,
+    }})
+    profile = model_profile.read("org/hybrid")
+
+    assert profile.kv_bytes_per_token() == 16 * 2 * 4 * 256 * 2
+    assert profile.kv_bytes(262144) == 16 * 2 * 4 * 256 * 2 * 262144
+    assert any("recurrent" in note for note in profile.notes)
+
+
+def test_rope_is_read_under_either_spelling(cache):
+    cache("org/new", {"config.json": GEMMA4})
+    cache("org/old", {"config.json": {
+        **LLAMA, "rope_scaling": {"rope_type": "yarn", "factor": 4.0}, "rope_theta": 500000.0}})
+
+    # Nested by layer type: several kinds at once, and the honest word is mixed.
+    assert model_profile.read("org/new").rope_kind == "mixed"
+    old = model_profile.read("org/old")
+    assert old.rope_kind == "yarn" and old.rope_theta == 500000.0
+
+
+def test_a_null_rope_scaling_is_not_a_rope_block(cache):
+    """Qwen ships `rope_scaling: null` — present, and meaning nothing is scaled."""
+    cache("org/qwen", {"config.json": {**LLAMA, "rope_scaling": None, "rope_theta": 1000000.0}})
+    profile = model_profile.read("org/qwen")
+    assert profile.rope_scaling is None and profile.rope_kind == ""
+    assert profile.rope_theta == 1000000.0
+
+
+def test_a_sentence_transformers_repo_is_a_pooling_server(cache):
+    """vLLM checks for a Pooling module before it looks at the architecture, so
+    a repo whose architectures say ForCausalLM still comes up serving
+    /v1/embeddings. Discovering that after a four-minute load is the whole
+    complaint this page exists to answer."""
+    cache("Qwen/Embedder", {
+        "config.json": LLAMA,
+        "modules.json": [
+            {"idx": 0, "name": "0", "type": "sentence_transformers.models.Transformer"},
+            {"idx": 1, "name": "1", "type": "sentence_transformers.models.Pooling"},
+        ],
+    })
+    profile = model_profile.read("Qwen/Embedder")
+    assert profile.runner == "pooling"
+    assert "Pooling" in profile.runner_reason
+
+
+def test_a_config_with_no_architecture_resolves_to_pooling(cache):
+    """No architectures key means vLLM synthesises a bare `...Model` name from
+    model_type, and a bare Model suffix is itself a pooling default — so a
+    GPT-2 text model comes up as an embedding server."""
+    cache("org/gpt2ish", {"config.json": {"model_type": "gpt2", "n_layer": 5, "n_embd": 32,
+                                          "n_head": 4, "n_positions": 512}})
+    profile = model_profile.read("org/gpt2ish")
+    assert profile.runner == "pooling"
+    assert "no architecture" in profile.runner_reason
+
+
+def test_an_ordinary_causal_model_is_a_generator(cache):
+    cache("org/plain", {"config.json": LLAMA})
+    profile = model_profile.read("org/plain")
+    assert profile.runner == "generate" and profile.runner_reason == ""

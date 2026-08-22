@@ -50,6 +50,13 @@ MULTIMODAL_FILES = ("preprocessor_config.json", "processor_config.json",
 
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".gguf")
 
+# Layer kinds, by what they cost to remember a context.
+FULL_ATTENTION = "full_attention"
+# A recurrent layer keeps a fixed-size state per sequence instead of a cache
+# that grows with the context, so it contributes nothing per token. Its state
+# is real memory, but it is sized by max_num_seqs and not by context length.
+RECURRENT_KINDS = ("linear_attention", "mamba", "mamba2", "recurrent", "ssm")
+
 # What a cache directory may be called. The name is interpolated into a remote
 # shell command, so it is matched rather than escaped: nothing but this shape
 # reaches the peer.
@@ -87,6 +94,9 @@ class Profile:
     dtype: str = ""
     max_position_embeddings: int | None = None
     rope_scaling: dict[str, Any] | None = None
+    """The rope block, under whichever of the two names the repo used."""
+    rope_kind: str = ""
+    """A one-word summary — `default`, `yarn`, `proportional`, `mixed`."""
     rope_theta: float | None = None
     quantization: dict[str, Any] | None = None
     quant_method: str = ""
@@ -97,6 +107,13 @@ class Profile:
     head_dim: int | None = None
     vocab_size: int | None = None
     sliding_window: int | None = None
+    layer_types: dict[str, int] = field(default_factory=dict)
+    """How many layers of each attention kind, when the config says. A hybrid
+    model's sliding layers cost a fixed amount of KV rather than growing with
+    the context, and getting that wrong overstates a Gemma-class model by 10x."""
+    global_kv_heads: int | None = None
+    global_head_dim: int | None = None
+    """Full-attention layers can have their own head geometry."""
     tie_word_embeddings: bool | None = None
     num_experts: int | None = None
     requires_remote_code: bool = False
@@ -105,6 +122,12 @@ class Profile:
     is_multimodal: bool = False
     is_adapter: bool = False
     base_model: str = ""
+
+    runner: str = "generate"
+    """How vLLM will run this: `generate` or `pooling`. Not a free choice — it
+    is resolved from the repo, and a model that resolves to `pooling` serves
+    /v1/embeddings and refuses /v1/chat/completions no matter what is asked."""
+    runner_reason: str = ""
 
     # --- tokenizer --------------------------------------------------------
     tokenizer_class: str = ""
@@ -143,24 +166,73 @@ class Profile:
             return self.hidden_size // self.num_attention_heads
         return None
 
-    def kv_bytes_per_token(self, kv_dtype_bytes: int = 2) -> int | None:
-        """How much KV cache one token of context costs, across all layers.
+    def _per_layer_bytes(self, kind: str, kv_dtype_bytes: int) -> int | None:
+        """KV bytes one token costs in one layer of this kind.
 
-        Two tensors per layer (keys and values), one entry per KV head. Grouped
-        query attention is exactly why this reads num_key_value_heads rather
-        than num_attention_heads: the KV cache is sized by the smaller number.
+        Two tensors, keys and values, one entry per KV head. Grouped query
+        attention is exactly why this reads num_key_value_heads and not
+        num_attention_heads: the cache is sized by the smaller number. A
+        full-attention layer in a hybrid model may carry its own geometry.
         """
-        heads = self.num_key_value_heads or self.num_attention_heads
-        dim = self.effective_head_dim()
-        if not (self.num_hidden_layers and heads and dim):
+        if kind == "full_attention" and self.global_kv_heads and self.global_head_dim:
+            heads, dim = self.global_kv_heads, self.global_head_dim
+        else:
+            heads = self.num_key_value_heads or self.num_attention_heads
+            dim = self.effective_head_dim()
+        if not (heads and dim):
             return None
-        return 2 * self.num_hidden_layers * heads * dim * kv_dtype_bytes
+        return 2 * heads * dim * kv_dtype_bytes
+
+    def kv_bytes(self, tokens: int, kv_dtype_bytes: int = 2) -> int | None:
+        """Total KV cache for one sequence of `tokens`, across every layer.
+
+        A sliding-window layer never holds more than its window, so on a model
+        that is mostly sliding layers — every Gemma-class model here — the cost
+        of a long context is carried by the handful of full-attention layers
+        alone. Treating all sixty layers as full is how a 20 GiB cache gets
+        reported as 240 GiB.
+        """
+        if not self.num_hidden_layers or tokens <= 0:
+            return None
+
+        kinds = self.layer_types or {FULL_ATTENTION: self.num_hidden_layers}
+        total = 0
+        for kind, count in kinds.items():
+            if kind in RECURRENT_KINDS:
+                continue
+            per_token = self._per_layer_bytes(kind, kv_dtype_bytes)
+            if per_token is None:
+                return None
+            held = tokens
+            if kind != FULL_ATTENTION and self.sliding_window:
+                held = min(tokens, self.sliding_window)
+            total += count * per_token * held
+        return total
+
+    def kv_bytes_per_token(self, kv_dtype_bytes: int = 2) -> int | None:
+        """What one more token of context costs once the windows are full.
+
+        The marginal rate, not the average: sliding layers stop growing, so only
+        the full-attention layers keep charging per token.
+        """
+        kinds = self.layer_types or {FULL_ATTENTION: self.num_hidden_layers or 0}
+        total = 0
+        for kind, count in kinds.items():
+            if kind in RECURRENT_KINDS:
+                continue
+            if kind != FULL_ATTENTION and self.sliding_window:
+                continue
+            per_token = self._per_layer_bytes(kind, kv_dtype_bytes)
+            if per_token is None:
+                return None
+            total += count * per_token
+        return total or None
 
 
 # The small files worth carrying across an ssh connection. Everything else in a
 # repo is weights, and none of it changes what the flags should be.
 READABLE = ("config.json", "tokenizer_config.json", "generation_config.json",
-            "adapter_config.json", *TEMPLATE_FILES)
+            "adapter_config.json", "modules.json", *TEMPLATE_FILES)
 
 
 @dataclass
@@ -332,6 +404,7 @@ def _profile(profile: Profile, snapshot: Snapshot) -> Profile:
     profile.path = snapshot.path
     _read_files(profile, snapshot)
     _read_config(profile, snapshot)
+    _read_runner(profile, snapshot)
     _read_tokenizer(profile, snapshot)
     profile.generation = snapshot.json("generation_config.json")
     return profile
@@ -386,8 +459,15 @@ def _read_config(profile: Profile, snapshot: Snapshot) -> None:
     profile.model_type = str(raw.get("model_type") or "")
     profile.dtype = str(pick("torch_dtype") or pick("dtype") or "")
     profile.max_position_embeddings = _int(pick("max_position_embeddings"))
-    profile.rope_scaling = pick("rope_scaling") or None
+    # Two spellings live side by side in one cache: the legacy flat
+    # `rope_scaling`, and `rope_parameters`, which transformers v5 writes and
+    # which a hybrid model nests one level deeper, keyed by layer type.
+    rope = pick("rope_parameters") or pick("rope_scaling") or None
+    profile.rope_scaling = rope if isinstance(rope, dict) else None
+    profile.rope_kind = _rope_kind(profile.rope_scaling)
     theta = pick("rope_theta")
+    if theta is None and isinstance(profile.rope_scaling, dict):
+        theta = profile.rope_scaling.get("rope_theta")
     profile.rope_theta = float(theta) if isinstance(theta, (int, float)) else None
     profile.num_hidden_layers = _int(pick("num_hidden_layers"))
     profile.hidden_size = _int(pick("hidden_size"))
@@ -398,6 +478,20 @@ def _read_config(profile: Profile, snapshot: Snapshot) -> None:
     profile.head_dim = _int(pick("head_dim"))
     profile.vocab_size = _int(pick("vocab_size"))
     profile.sliding_window = _int(pick("sliding_window"))
+    profile.global_kv_heads = _int(pick("num_global_key_value_heads"))
+    profile.global_head_dim = _int(pick("global_head_dim"))
+    kinds = pick("layer_types")
+    if isinstance(kinds, list) and kinds:
+        counts: dict[str, int] = {}
+        for kind in kinds:
+            counts[str(kind)] = counts.get(str(kind), 0) + 1
+        profile.layer_types = counts
+        recurrent = sum(n for kind, n in counts.items() if kind in RECURRENT_KINDS)
+        if recurrent:
+            profile.notes.append(
+                f"{recurrent} of {sum(counts.values())} layers are recurrent — they hold a "
+                "fixed state per sequence rather than a KV cache, so their memory is set by "
+                "how many sequences run at once, not by the context length")
     tied = pick("tie_word_embeddings")
     profile.tie_word_embeddings = bool(tied) if isinstance(tied, bool) else None
     profile.num_experts = _int(
@@ -412,6 +506,61 @@ def _read_config(profile: Profile, snapshot: Snapshot) -> None:
     # transformers loads modelling code from the repo when config.json maps it,
     # and vLLM will not do that without being told it may.
     profile.requires_remote_code = bool(raw.get("auto_map") or text.get("auto_map"))
+
+
+def _rope_kind(rope: dict[str, Any] | None) -> str:
+    """One word for what the rope block does.
+
+    A hybrid model keys it by layer type, so several kinds can be in play at
+    once and the honest single word for that is `mixed`.
+    """
+    if not rope:
+        return ""
+    named = rope.get("rope_type") or rope.get("type")
+    if isinstance(named, str) and named:
+        return named
+    kinds = {
+        str(value.get("rope_type") or value.get("type") or "")
+        for value in rope.values() if isinstance(value, dict)
+    } - {""}
+    if not kinds:
+        return "scaled"
+    return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
+def _read_runner(profile: Profile, snapshot: Snapshot) -> None:
+    """Whether vLLM will serve this as a generator or as an embedder.
+
+    This is not an option the operator gets to pick, and it is the difference
+    between a chat endpoint and a 400. Two ways a model that looks like a chat
+    model comes up as an embedder:
+
+    * sentence-transformers repos ship a modules.json naming a Pooling module,
+      and vLLM checks for that BEFORE it looks at the architecture, so a repo
+      whose architectures say ...ForCausalLM still resolves to pooling;
+    * a config with no `architectures` at all has one synthesised from
+      model_type, and the bare `...Model` suffix that produces is itself a
+      pooling default.
+    """
+    modules = snapshot.texts.get("modules.json") or ""
+    if '"Pooling"' in modules or "sentence_transformers.models.Pooling" in modules:
+        profile.runner = "pooling"
+        profile.runner_reason = (
+            "modules.json declares a sentence-transformers Pooling module, which vLLM "
+            "reads before it looks at the architecture")
+        return
+
+    if not profile.architectures and profile.model_type:
+        profile.runner = "pooling"
+        profile.runner_reason = (
+            "config.json names no architecture, so vLLM synthesises a bare "
+            f"'{profile.model_type.title().replace('_', '')}Model' name, and a plain "
+            "Model suffix defaults to pooling")
+        return
+
+    if any(name.endswith("Model") for name in profile.architectures):
+        profile.runner = "pooling"
+        profile.runner_reason = "a bare ...Model architecture defaults to pooling"
 
 
 def _read_tokenizer(profile: Profile, snapshot: Snapshot) -> None:
