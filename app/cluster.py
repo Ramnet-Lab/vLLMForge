@@ -149,6 +149,16 @@ async def plan(node_names: list[str], model: str = "",
     reasons = []
     if missing_image:
         reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
+    # Checked before anything is torn down, because starting this would take the
+    # running engine's Ray worker away and kill it on the way to failing itself.
+    occupied = await running_pooled([w.node for w in wirings], exclude=replacing or "")
+    if occupied:
+        where = ", ".join(f"{container} on {node}" for node, container in occupied)
+        reasons.append(
+            f"a pooled engine is already running ({where}) and there can only be one: it holds "
+            f"Ray's port {RAY_PORT} on the host network, and every peer runs its worker under "
+            f"the single name {WORKER}. Starting this one would abort that engine and then fail "
+            "itself. Stop it first, or run one of the two on a single machine")
     incompatible = _pipeline_incompatible(model)
     if incompatible:
         reasons.append(incompatible)
@@ -186,6 +196,57 @@ async def plan(node_names: list[str], model: str = "",
         "single_node_bytes": int(budgets[0].max_util * budgets[0].total_bytes),
         "missing_image": missing_image,
     }
+
+
+_RAY_HEAD = re.compile(r"ray\s+start\s+--head")
+
+
+def is_pooled_command(command: list[str] | None) -> bool:
+    """Whether a running container is a pooled engine — its own Ray head.
+
+    Read off the argv rather than the database, so an engine somebody started
+    by hand counts exactly like one this dashboard started. The same reason
+    safety.argv_of looks inside the shell wrapper.
+    """
+    return any(_RAY_HEAD.search(str(token)) for token in (command or []))
+
+
+async def running_pooled(targets: list[nodes.Node], exclude: str = "") -> list[tuple[str, str]]:
+    """Pooled engines already up, as (node name, container name).
+
+    There can be exactly one per cluster, and nothing in Ray or vLLM says so
+    politely. A pooled engine *is* a Ray head: it binds RAY_PORT on the host
+    network, and every peer runs its worker under the one name WORKER. So a
+    second pooled launch does two destructive things before it fails — it force
+    removes the worker the first engine's far rank is running in, which aborts
+    that engine on a world size it can no longer make, and then it dies itself
+    on a head that cannot have the port:
+
+        AssertionError: Session name session_...96 does not match persisted
+        value b'session_...94'
+
+    Two crashes for one mistake, and the one that reads as the failure is the
+    innocent party. Hence a blocker rather than a warning.
+
+    Only the machines this launch would touch are scanned: those are exactly the
+    ones whose port and worker name it would take.
+    """
+    found: list[tuple[str, str]] = []
+    for node in targets:
+        try:
+            rows = await docker_ctl.ps(all_containers=False, host=node.docker_host)
+        except Exception:
+            # An unreachable peer is the wiring check's business to report, not
+            # this one's. Staying quiet here beats blocking a launch on a probe.
+            continue
+        for row in rows:
+            name = str(row.get("Names", ""))
+            if not name or name == exclude:
+                continue
+            info = await docker_ctl.state(name, node.docker_host)
+            if is_pooled_command(info.command):
+                found.append((node.name, name))
+    return found
 
 
 def _pipeline_incompatible(model: str) -> str:

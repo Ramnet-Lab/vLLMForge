@@ -202,10 +202,16 @@ async def test_the_plan_reports_a_model_missing_from_a_node(monkeypatch):
         return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
                              reserve_bytes=32 * GIB, warn_reserve_bytes=38 * GIB)
 
+    async def nothing_pooled(targets, exclude=""):
+        return []
+
     monkeypatch.setattr(cluster, "missing_model", only_here)
     monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", fine)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
+    # Otherwise this reaches a real `docker ps`, and the answer depends on what
+    # happens to be running on the machine the suite is on.
+    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
 
     async def wired(node, prefix):
         return cluster.NodeWiring(node=node, interface="eth0", address="10.0.0.1")
@@ -364,6 +370,11 @@ async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
     async def has_image(*a, **k):
         return True
 
+    async def nothing_pooled(targets, exclude=""):
+        # Otherwise this reaches a real `docker ps` and the answer depends on
+        # whatever happens to be running on the machine the suite is on.
+        return []
+
     async def budget(node=None, exclude=None):
         # max_util and free_util are derived; 12% held back leaves 0.88 free.
         return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
@@ -380,6 +391,7 @@ async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
             budget={}, requested_util=util or 0.0)
 
     monkeypatch.setattr(cluster, "wiring", fake_wiring)
+    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
     monkeypatch.setattr(cluster.safety, "check_launch", check)
@@ -420,6 +432,11 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
     async def has_image(*a, **k):
         return True
 
+    async def nothing_pooled(targets, exclude=""):
+        # Otherwise this reaches a real `docker ps` and the answer depends on
+        # whatever happens to be running on the machine the suite is on.
+        return []
+
     async def budget(node=None, exclude=None):
         return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL, free_bytes=TOTAL,
                              reserve_bytes=int(TOTAL * 0.12))
@@ -428,6 +445,7 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
         return []
 
     monkeypatch.setattr(cluster, "wiring", fake_wiring)
+    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
     monkeypatch.setattr(cluster, "missing_model", no_missing)
@@ -448,3 +466,68 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
 
     fine = await cluster.plan(["node1", "node2"], "org/ordinary")
     assert fine["ok"] is True
+
+
+def test_a_ray_head_is_recognised_from_the_argv():
+    """Read off the command, so an engine started by hand counts too."""
+    from app import cluster
+
+    pooled = ["-lc", "ray start --head --node-ip-address=10.0.0.1 --port=6379 "
+                     "&& exec vllm serve org/m --port 8010"]
+    assert cluster.is_pooled_command(pooled)
+    assert not cluster.is_pooled_command(["vllm", "serve", "org/m", "--port", "8010"])
+    # A worker is not a head; only the head takes the port.
+    assert not cluster.is_pooled_command(["start", "--block", "--address=10.0.0.1:6379"])
+    assert not cluster.is_pooled_command(None)
+
+
+@pytest.mark.asyncio
+async def test_a_second_pooled_engine_is_refused_rather_than_allowed_to_kill_the_first(
+        monkeypatch):
+    """The failure this prevents, both halves of it: starting a second pooled
+    engine force-removes the worker container the first one's far rank lives in
+    — aborting an engine that was serving — and then dies itself on a Ray head
+    that cannot have port 6379, with "Session name ... does not match persisted
+    value". The innocent party is the one that looks like the failure."""
+    from app import cluster, db
+
+    async def fine(*a, **k):
+        return True
+
+    async def budget(node=None, exclude=None):
+        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
+                             reserve_bytes=32 * GIB, warn_reserve_bytes=38 * GIB)
+
+    async def wired(node, prefix):
+        return cluster.NodeWiring(node=node, interface="eth0", address="10.0.0.1")
+
+    async def none_missing(model, node_names):
+        return []
+
+    occupied = [("local", "llmd-vllm-44")]
+
+    async def already_pooled(targets, exclude=""):
+        return [row for row in occupied if row[1] != exclude]
+
+    monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
+    monkeypatch.setattr(cluster.docker_ctl, "image_exists", fine)
+    monkeypatch.setattr(cluster.safety, "current_budget", budget)
+    monkeypatch.setattr(cluster, "wiring", wired)
+    monkeypatch.setattr(cluster, "missing_model", none_missing)
+    monkeypatch.setattr(cluster, "running_pooled", already_pooled)
+
+    previous = db.get_setting("nodes", [])
+    try:
+        nodes.add("peer-z", address="10.0.0.2")
+        refused = await cluster.plan(["local", "peer-z"], "org/model")
+        assert not refused["ok"]
+        assert "already running" in refused["reason"]
+        assert "llmd-vllm-44" in refused["reason"], "name the engine that would be killed"
+
+        # Restarting that very engine is not a conflict with itself — the same
+        # reason the memory guard excludes a server from its own budget.
+        itself = await cluster.plan(["local", "peer-z"], "org/model",
+                                    replacing="llmd-vllm-44")
+        assert itself["ok"], "a pooled restart must not be blocked by its own container"
+    finally:
+        db.set_setting("nodes", previous)
