@@ -23,6 +23,23 @@ import {
 } from '../ui.js';
 
 const STYLES = `
+/* What the model is, read off disk. Sits directly under the basics so the
+   answer is beside the question that provoked it. */
+.serve-profile {
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: var(--radius); background: var(--bg-raised);
+  padding: 11px 13px; margin-bottom: var(--gap);
+}
+.serve-profile.bad { border-left-color: var(--danger); }
+.sp-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.sp-head .truncate { max-width: 42ch; }
+.sp-facts { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.sp-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.sp-label { font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--text-faint); }
+.sp-value { font-family: var(--mono); font-size: 14px; color: var(--text); }
+.sp-hint { font-size: 11px; color: var(--text-dim); }
+
 .serve-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
 .serve-row { cursor: pointer; }
 .serve-row.sel > td { background: var(--accent-dim); }
@@ -1419,6 +1436,125 @@ function autoName(model) {
   editor.derived = { name: editor.form.name, served: editor.form.served_name };
 }
 
+/* --- what the model is ----------------------------------------------------
+
+   Everything under here is read from the files a pull already fetched. It is
+   reported, not acted on: the operator is the one deciding, and the reason
+   this page was a guessing game is that the answers were never shown. */
+
+const scheduleProfile = debounce(() => loadProfile(), 250);
+
+async function loadProfile() {
+  const editor = state.editor;
+  if (state.mode !== 'edit' || !editor) return;
+  const model = String(editor.form.model || '').trim();
+  // A pooled engine reads the model from its head, which is the first node.
+  const node = editor.form.pooled ? (editor.form.pool[0] || LOCAL) : editor.form.node;
+  const key = `${node}\u0000${model}`;
+  if (key === editor.profileFor) return;
+
+  editor.profileFor = key;
+  if (!model) {
+    editor.profile = null;
+    renderProfile();
+    return;
+  }
+  renderProfile({ loading: true });
+  try {
+    const params = new URLSearchParams({ model });
+    if (node && node !== LOCAL) params.set('node', node);
+    const profile = await get(`/servers/profile?${params}`);
+    if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
+    state.editor.profile = profile;
+  } catch (error) {
+    if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
+    state.editor.profile = { found: false, error: error.message };
+  }
+  renderProfile();
+}
+
+const CTX_FMT = (tokens) => (tokens >= 1024 ? `${Math.round(tokens / 1024)}k` : String(tokens));
+
+function profileFacts(profile) {
+  const facts = [];
+  const arch = (profile.architectures || [])[0] || profile.model_type;
+  if (arch) facts.push(['Architecture', arch, profile.model_type || '']);
+  if (profile.max_position_embeddings) {
+    facts.push(['Context', `${CTX_FMT(profile.max_position_embeddings)} tokens`,
+      profile.max_position_embeddings.toLocaleString()]);
+  }
+  facts.push(['Weights', profile.weight_bytes ? bytes(profile.weight_bytes) : '—',
+    profile.quant_method ? `${profile.quant_method} quantised` : (profile.dtype || '')]);
+  facts.push(['Chat template',
+    profile.chat_template ? 'present' : 'none',
+    profile.chat_template ? profile.chat_template_source : '/v1/chat/completions will refuse']);
+  return facts;
+}
+
+function profileFlags(profile) {
+  const flags = [];
+  if (profile.is_multimodal) flags.push(badge('info', 'multimodal'));
+  if (profile.requires_remote_code) flags.push(badge('starting', 'needs trust-remote-code'));
+  if (profile.is_adapter) flags.push(badge('failed', 'LoRA adapter, not a model'));
+  if (profile.has_gguf && !profile.has_safetensors) flags.push(badge('failed', 'GGUF only'));
+  if (profile.num_experts) flags.push(badge('plain', `${profile.num_experts} experts`));
+  if (profile.rope_scaling) {
+    flags.push(badge('plain', `rope ${profile.rope_scaling.rope_type
+      || profile.rope_scaling.type || 'scaled'}`));
+  }
+  if (profile.source === 'peer') flags.push(badge('plain', 'read over ssh'));
+  return flags;
+}
+
+function renderProfile(options = {}) {
+  const host = state.nodes.profileBox;
+  if (!host) return;
+  const editor = state.editor;
+  const model = String(editor?.form.model || '').trim();
+
+  if (!model) return mount(host);
+  if (options.loading) {
+    return mount(host, h('div', { class: 'serve-profile' },
+      h('div', { class: 'row' }, spinner(), h('span', { class: 'faint small' },
+        'reading the files beside the weights…'))));
+  }
+
+  const profile = editor.profile;
+  if (!profile) return mount(host);
+
+  if (!profile.found) {
+    // Not an error. A model that has never been pulled is a normal thing to
+    // define a server for; the launch fetches it first.
+    const where = editor.form.pooled ? (editor.form.pool[0] || LOCAL) : editor.form.node;
+    return mount(host, notice('warn',
+      h('strong', null, 'Not cached on '), h('strong', null, where), h('span', null, '. '),
+      h('span', null, profile.error
+        || 'Nothing is known about it until it is pulled — the first start downloads it, '
+           + 'and the flags below cannot be checked against it until then.')));
+  }
+
+  const adapter = profile.is_adapter;
+  mount(host, h('div', { class: `serve-profile${adapter ? ' bad' : ''}` },
+    h('div', { class: 'sp-head' },
+      h('strong', null, 'What this model is'),
+      h('span', { class: 'row wrap' }, profileFlags(profile)),
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'faint small mono truncate', title: profile.path }, profile.path)),
+    h('div', { class: 'sp-facts' }, profileFacts(profile).map(([label, value, hint]) =>
+      h('div', { class: 'sp-fact' },
+        h('span', { class: 'sp-label' }, label),
+        h('span', { class: 'sp-value' }, value),
+        hint ? h('span', { class: 'sp-hint' }, hint) : null))),
+    adapter
+      ? h('p', { class: 'ov-note' },
+        `This is a LoRA adapter. Serve ${profile.base_model || 'its base model'} with `
+        + '--enable-lora and attach it there.')
+      : null,
+    (profile.notes || []).length
+      ? h('p', { class: 'ov-note' }, profile.notes.join(' · '))
+      : null));
+}
+
 /* --- editor -------------------------------------------------------------- */
 
 async function openEditor(server, prefill = {}) {
@@ -1441,6 +1577,9 @@ async function openEditor(server, prefill = {}) {
     // What the currently selected model derived. A field still holding this is
     // fair game to refill; anything else is the user's and is left alone.
     derived: null,
+    // What the files beside the chosen model's weights say it is.
+    profile: null,
+    profileFor: '',
     sections: [],
     searchable: [],
     paths: EMPTY_PATHS,
@@ -1511,6 +1650,7 @@ function renderEditor() {
   state.nodes.planBox = h('div', { class: 'serve-pool-plan' });
   state.nodes.syncBox = h('div');
   state.nodes.poolBox = h('div', { class: 'param-section' });
+  state.nodes.profileBox = h('div');
 
   const flagCount = [...state.schema.featured, ...state.schema.advanced]
     .reduce((total, section) => total + section.flags.length, 0);
@@ -1524,6 +1664,7 @@ function renderEditor() {
     onChange: (next) => {
       editor.form.model = next;
       autoName(next);
+      scheduleProfile();
       schedulePlan();
     },
     extra: h('button', {
@@ -1596,6 +1737,7 @@ function renderEditor() {
       actions: h('button', { onClick: closeEditor }, 'Cancel'),
       body: h('div', { class: 'serve-form' },
         basics,
+        state.nodes.profileBox,
         state.nodes.poolBox,
         h('div', { class: 'param-section' },
           h('h3', null, 'Presets'),
@@ -1620,6 +1762,8 @@ function renderEditor() {
   renderPoolBox();
   syncPlacement();
   renderFootActions();
+  renderProfile();
+  loadProfile();
 }
 
 /** A select over the registry. Unreachable peers stay selectable: a node that
@@ -1638,6 +1782,9 @@ function nodePicker() {
   const select = h('select', {
     onChange: (event) => {
       editor.form.node = event.target.value;
+      // A model cached here and a model cached on a peer are different
+      // questions, and it is the peer that is about to load it.
+      scheduleProfile();
       scheduleSafety();
     },
   },
