@@ -519,7 +519,7 @@ function serverRow(server) {
   h('td', { class: 'num' }, String(server.port)),
   h('td', { class: 'num' }, utilCell(server.util)),
   h('td', null,
-    badge(server.status),
+    statusBadge(server.status),
     server.oom_killed ? h('div', { class: 'faint small' }, 'OOM-killed') : null,
     !server.oom_killed && server.exit_code
       ? h('div', { class: 'faint small' }, `exit ${server.exit_code}`)
@@ -565,7 +565,7 @@ function foreignRow(item) {
       h('div', { class: 's-model truncate', title: item.model }, item.model || item.image)),
     h('td', { class: 'num' }, item.port ? String(item.port) : '—'),
     h('td', { class: 'num' }, utilCell(item.util)),
-    h('td', null, badge(item.status)),
+    h('td', null, statusBadge(item.status)),
     h('td', null, servingCell(item)),
     h('td', null, h('div', { class: 'serve-actions' },
       h('button', { class: 'btn-sm', onClick: () => showForeignCommand(item) }, 'Command'),
@@ -661,7 +661,7 @@ function renderDetail() {
       pool.length
         ? badge('info', `pooled · ${poolLabel(pool)}`)
         : badge(peer ? 'info' : 'absent', server.node || LOCAL),
-      badge(server.status),
+      statusBadge(server.status),
       live
         ? h('button', { class: 'btn-sm', onClick: () => stopServer(server.id) }, 'Stop')
         : h('button', {
@@ -1420,6 +1420,18 @@ function applyFilter(query) {
     if (needle && visible && section.el.tagName === 'DETAILS') section.el.open = true;
   }
 }
+
+/** Docker's word for a state, in the operator's words.
+ *  "absent" is accurate — no container exists — and reads like a fault to
+ *  someone who has simply not pressed start yet. */
+const STATUS_LABEL = {
+  absent: 'not started',
+  exited: 'stopped',
+  failed: 'crashed',
+  'oom-killed': 'out of memory',
+};
+
+const statusBadge = (status) => badge(status, STATUS_LABEL[status] || status);
 
 /* --- naming ---------------------------------------------------------------
 
