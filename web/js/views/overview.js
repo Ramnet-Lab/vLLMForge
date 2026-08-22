@@ -11,7 +11,7 @@
 import { get, stream } from '../api.js';
 import {
   ago, badge, bytes, copyButton, duration, empty, ensureStyles, h, mount, notice,
-  panel, spinner, stat, toast, when,
+  panel, pct, spinner, stat, toast, when,
 } from '../ui.js';
 
 const POLL_MS = 10000;
@@ -205,6 +205,36 @@ function nodeCard(node, budget) {
     node.local ? localMemory(budget) : (down ? null : peerMemory(node)));
 }
 
+/** The cluster as one pool. A pooled engine's memory is the sum of what each
+ *  node can commit, so "will this model fit" is answered by the combined
+ *  ceiling, not by any single machine's. Only shown once there is more than one
+ *  node — on a single box it would just restate the card below it. */
+function combinedPool(combined, registry) {
+  if (!combined || registry.length < 2) return null;
+
+  const total = combined.total_bytes || 1;
+  const used = combined.used_bytes || 0;
+  const perNode = combined.reserve_bytes_per_node || 0;
+
+  return h('div', { class: 'ov-pool' },
+    h('div', { class: 'ov-pool-head' },
+      h('strong', null, 'Pooled across the cluster'),
+      h('span', { class: 'faint small' },
+        `${combined.nodes} node${combined.nodes === 1 ? '' : 's'}`
+        + (combined.unreachable ? ` · ${combined.unreachable} unreachable, not counted` : ''))),
+    h('div', { class: 'grid cols-4' },
+      stat('Combined memory', bytes(total), `${bytes(combined.available_bytes)} available`),
+      stat('One pooled engine', bytes(combined.pooled_ceiling_bytes),
+        `each node's ceiling summed, less ${bytes(perNode)} held back per node`),
+      stat('Largest single node', bytes(combined.single_node_ceiling_bytes),
+        'what fits without pooling'),
+      stat('In use', bytes(used), pct(used / total))),
+    h('p', { class: 'help' },
+      'Pooling splits a model by layer across these machines, so a model larger than any one '
+      + 'of them still fits. It is not free: the engine spans every node in the pool, and if one '
+      + 'leaves, the engine aborts and has to be relaunched.'));
+}
+
 function clusterSection(payload) {
   const registry = payload.nodes || [];
   if (!registry.length) {
@@ -221,6 +251,7 @@ function clusterSection(payload) {
   const local = registry.find((node) => node.local) || {};
 
   return h('div', { class: 'stack' },
+    combinedPool(payload.combined, registry),
     registry.map((node) => nodeCard(node, payload.budget)),
     notice('info',
       h('strong', null, 'GPU memory is host memory on these machines. '),
@@ -568,6 +599,12 @@ export function dispose() {
 }
 
 const CSS = `
+.ov-pool { border: 1px solid var(--border-strong); border-radius: var(--radius);
+  padding: 13px 14px; background: var(--bg-raised); }
+.ov-pool-head { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 12px; }
+.ov-pool .help { margin: 12px 0 0; }
+
 .ov-track {
   display: flex; height: 26px; border-radius: var(--radius-s); overflow: hidden;
   background: var(--bg-sunken); border: 1px solid var(--border);

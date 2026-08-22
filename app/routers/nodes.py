@@ -22,7 +22,7 @@ class NodeIn(BaseModel):
 
 @router.get("")
 async def list_nodes() -> dict:
-    return {"nodes": await svc.status_all(), "local": svc.LOCAL}
+    return await svc.summary()
 
 
 @router.get("/discover")

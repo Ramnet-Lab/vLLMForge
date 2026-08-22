@@ -88,6 +88,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.middleware("http")
+async def revalidate_assets(request, call_next):
+    """Make the browser check before reusing a module.
+
+    There is no build step and therefore no content-hashed filenames, so
+    nothing tells a browser that app.js changed. Without a Cache-Control header
+    browsers fall back to heuristic caching and can serve a module for hours
+    after it was edited — which looks exactly like a feature that was never
+    built. `no-cache` still allows a 304, so revalidation costs a round trip,
+    not a re-download.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/") or path.endswith((".js", ".css", ".html")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

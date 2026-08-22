@@ -188,3 +188,36 @@ def test_no_interpolated_innerhtml(path: Path):
     for line in path.read_text().splitlines():
         if "innerHTML" in line and ("${" in line or "+" in line):
             pytest.fail(f"{path.name}: innerHTML built from data — use h() instead: {line.strip()}")
+
+
+# Every helper the toolkit exports. A view that calls one without importing it
+# throws at render time and the tab comes up blank — which is exactly what
+# happened, and what the import test above could not see, because it only
+# checked that the names a file DOES import are real.
+TOOLKIT = sorted(exported_names(WEB / "js" / "ui.js") | exported_names(WEB / "js" / "api.js"))
+
+
+@pytest.mark.parametrize("path", JS_FILES, ids=lambda p: str(p.relative_to(WEB)))
+def test_every_toolkit_helper_used_is_imported(path: Path):
+    if path.name in ("ui.js", "api.js"):
+        return
+    source = strip_js(path.read_text())
+
+    imported: set[str] = set()
+    for block in re.findall(r"import\s*\{([^}]*)\}", path.read_text()):
+        imported |= {n.strip().split(" as ")[0].strip() for n in block.split(",") if n.strip()}
+
+    # A view may legitimately bind its own `put` or `stat`; only an unbound call
+    # is a mistake.
+    local = set(re.findall(r"\b(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)", source))
+    for params in re.findall(r"function\s+[\w$]*\s*\(([^)]*)\)", source):
+        local |= {p.strip().split("=")[0].strip() for p in params.split(",") if p.strip()}
+    for params in re.findall(r"\(([^)]*)\)\s*=>", source):
+        local |= {p.strip().split("=")[0].strip() for p in params.split(",") if p.strip()}
+
+    for name in TOOLKIT:
+        if name in imported or name in local:
+            continue
+        # A bare call to the helper, not a property access like foo.stat(...).
+        if re.search(rf"(?<![.\w]){re.escape(name)}\s*\(", source):
+            pytest.fail(f"{path.name} calls {name}() but does not import it from the toolkit")

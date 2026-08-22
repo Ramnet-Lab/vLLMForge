@@ -25,6 +25,7 @@ from app import db, docker_ctl
 from app.config import settings
 
 LOCAL = "local"
+GIB = 1024 ** 3
 SSH_TIMEOUT = 8
 PROBE_CONCURRENCY = 16
 
@@ -354,5 +355,37 @@ async def discover(scan_subnet: bool = False) -> dict:
             "interface": settings.roce_interface, "scanned_subnet": scan_subnet}
 
 
+def combine(statuses: list[dict]) -> dict[str, Any]:
+    """The cluster as one pool.
+
+    A pooled engine's memory is the sum of what each node can commit, so the
+    number that matters for "will this model fit" is the combined ceiling, not
+    any one machine's. Unreachable nodes contribute nothing rather than being
+    counted optimistically.
+    """
+    from app.config import settings
+
+    live = [s for s in statuses if s.get("reachable") and s.get("total_bytes")]
+    reserve = int(settings.mem_reserve_gib * GIB)
+    total = sum(s["total_bytes"] for s in live)
+    available = sum(s["available_bytes"] for s in live)
+    ceiling = sum(max(0, s["total_bytes"] - reserve) for s in live)
+    biggest = max((max(0, s["total_bytes"] - reserve) for s in live), default=0)
+    return {
+        "nodes": len(live),
+        "unreachable": len(statuses) - len(live),
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": max(0, total - available),
+        # What one pooled engine could claim across every reachable node.
+        "pooled_ceiling_bytes": ceiling,
+        # What the largest single machine could claim, for the comparison that
+        # tells you whether pooling is worth it for a given model.
+        "single_node_ceiling_bytes": biggest,
+        "reserve_bytes_per_node": reserve,
+    }
+
+
 async def summary() -> dict[str, Any]:
-    return {"nodes": await status_all(), "local": LOCAL}
+    statuses = await status_all()
+    return {"nodes": statuses, "local": LOCAL, "combined": combine(statuses)}
