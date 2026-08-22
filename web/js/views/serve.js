@@ -2021,6 +2021,9 @@ function setPooled(pooled) {
   syncPlacement();
   renderPoolBox();
   renderFootActions();
+  // Placement is part of what the recommendation answers — whether spreading
+  // this model across machines buys anything depends on how many there are.
+  scheduleProfile();
   if (pooled) runPlan();
   else scheduleSafety();
 }
@@ -2058,6 +2061,7 @@ function movePoolNode(index, delta) {
 function removePoolNode(index) {
   state.editor.form.pool.splice(index, 1);
   renderPoolBox();
+  scheduleProfile();
   runPlan();
 }
 
@@ -2065,6 +2069,7 @@ function addPoolNode(name) {
   if (!name || state.editor.form.pool.includes(name)) return;
   state.editor.form.pool.push(name);
   renderPoolBox();
+  scheduleProfile();
   runPlan();
 }
 
