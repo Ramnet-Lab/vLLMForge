@@ -118,6 +118,34 @@ FEATURED: list[dict[str, Any]] = [
 # Flags the dashboard owns. Setting them by hand would fight the launcher.
 MANAGED_FLAGS = {"host", "port", "model", "model_tag", "config"}
 
+# Flags whose value is something on disk. The form renders these as a list of
+# what is actually there rather than a text box, because a mistyped path is only
+# discovered minutes later, when the engine has already started and failed.
+#
+# The values offered are what the *container* sees: vLLM runs with the model
+# cache at /hf and the output directory at /outputs, so a host path would not
+# resolve inside it.
+PATH_KINDS = {
+    "model": "model",
+    "tokenizer": "model",
+    "hf_config_path": "model",
+    "generation_config": "model",
+    "lora_modules": "adapter",
+    "chat_template": "template",
+    "tool_parser_plugin": "plugin",
+    "reasoning_parser_plugin": "plugin",
+    "logits_processors": "plugin",
+    "download_dir": "directory",
+    "allowed_local_media_path": "directory",
+    "ssl_certfile": "cert",
+    "ssl_keyfile": "cert",
+    "ssl_ca_certs": "cert",
+    "mm_encoder_fp8_scale_path": "json",
+    "mm_encoder_fp8_scale_save_path": "directory",
+    "speculative_config": "json",
+}
+
+
 # vLLM leaves a handful of Frontend flags with no help text of their own.
 HELP_OVERLAY = {
     "enable_auto_tool_choice": (
@@ -157,6 +185,8 @@ def schema() -> dict[str, Any]:
     for arg in data["args"]:
         if not arg.get("help") and arg["dest"] in HELP_OVERLAY:
             arg["help"] = HELP_OVERLAY[arg["dest"]]
+        if arg["dest"] in PATH_KINDS:
+            arg["path_kind"] = PATH_KINDS[arg["dest"]]
     return data
 
 

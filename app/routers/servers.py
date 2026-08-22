@@ -25,6 +25,7 @@ class ServerIn(BaseModel):
     env: dict = Field(default_factory=dict)
     notes: str = ""
     autostart: bool = False
+    node: str = "local"
 
     @field_validator("args")
     @classmethod
@@ -45,6 +46,7 @@ class ServerPatch(BaseModel):
     env: dict | None = None
     notes: str | None = None
     autostart: bool | None = None
+    node: str | None = None
 
 
 @router.get("/schema")
@@ -61,6 +63,19 @@ async def list_servers() -> dict:
 @router.get("/endpoints")
 async def endpoints() -> dict:
     return {"endpoints": await svc.endpoints()}
+
+
+@router.get("/paths")
+async def paths() -> dict:
+    """What each path-valued serve flag can be set to, as the container sees it.
+
+    Every entry is a value that can be handed to vLLM verbatim: a Hub id it will
+    resolve through the mounted cache, or a path under /hf or /outputs. A host
+    path would start the engine and then fail to find its file.
+    """
+    from app import catalog
+
+    return await catalog.path_options()
 
 
 @router.get("/suggest")

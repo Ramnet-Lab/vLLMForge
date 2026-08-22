@@ -17,7 +17,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from app import hf, jobs
+from app import hf, jobs, servers
+from app.config import settings
 
 # A directory only counts as a model if transformers could actually open it.
 REQUIRED_FILE = "config.json"
@@ -134,4 +135,147 @@ async def loadable_models() -> dict[str, Any]:
         "count": sum(len(group["items"]) for group in groups),
         "cache_ok": bool(local.get("ok")),
         "cache_error": local.get("error", ""),
+    }
+
+
+# --- what a path-valued server flag can be set to -------------------------
+#
+# Everything here is expressed the way the vLLM container sees it. The engine
+# runs with the model cache bind-mounted at /hf and the output directory at
+# /outputs, so offering a host path would produce a launch that starts and then
+# fails to find its file — minutes later, in a log.
+
+CACHE_MOUNT = "/hf"
+
+# Only these are worth walking; the model cache holds tens of thousands of blob
+# files and is never the right answer for a template or a plugin.
+SCAN_ROOTS = ("output_dir", "dataset_dir")
+
+SUFFIXES = {
+    "template": (".jinja", ".jinja2", ".j2"),
+    "plugin": (".py",),
+    "cert": (".pem", ".crt", ".key", ".cer"),
+    "json": (".json",),
+}
+MAX_DEPTH = 4
+MAX_HITS = 200
+
+
+def _roots() -> list[Path]:
+    return [getattr(settings, name) for name in SCAN_ROOTS]
+
+
+def _walk(root: Path, keep) -> list[Path]:
+    """Bounded walk. An unbounded one over a model directory would enumerate
+    every shard and every blob for no benefit."""
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    stack = [(root, 0)]
+    while stack and len(found) < MAX_HITS:
+        current, depth = stack.pop()
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                if depth < MAX_DEPTH:
+                    stack.append((entry, depth + 1))
+            elif keep(entry):
+                found.append(entry)
+    return found
+
+
+def _file_options(kind: str) -> list[dict]:
+    suffixes = SUFFIXES[kind]
+    out = []
+    for root in _roots():
+        for path in _walk(root, lambda p: p.suffix.lower() in suffixes):
+            out.append(
+                _entry(
+                    servers.container_path(path),
+                    str(path.relative_to(root)),
+                    kind="path",
+                    detail=f"{path.stat().st_size / 1024:.0f} KiB",
+                    note=str(path),
+                )
+            )
+    return sorted(out, key=lambda e: e["label"])
+
+
+def _directory_options() -> list[dict]:
+    out = [
+        _entry(CACHE_MOUNT, "the shared model cache", kind="path", note=str(settings.hf_cache)),
+        _entry("/outputs", "the output directory", kind="path", note=str(settings.output_dir)),
+    ]
+    for root in _roots():
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                out.append(
+                    _entry(servers.container_path(entry), entry.name, kind="path", note=str(entry))
+                )
+    return out
+
+
+def _adapter_options(local: dict) -> list[dict]:
+    """LoRA adapters: cached ones from the Hub, and what fine-tuning produced."""
+    out = []
+    for repo in local.get("repos", []) if local.get("ok") else []:
+        if repo.get("repo_type") != "model":
+            continue
+        if any(rev.get("kind") == "adapter" for rev in repo.get("revisions", [])):
+            out.append(
+            _entry(repo["repo_id"], repo["repo_id"], kind="hub", detail="cached adapter")
+        )
+
+    for job in jobs.manager.list("finetune", limit=100):
+        if job["status"] != jobs.SUCCEEDED:
+            continue
+        meta = (job.get("spec") or {}).get("meta") or {}
+        adapter = Path(meta.get("run_dir") or "") / "adapter"
+        if not (adapter / "adapter_config.json").is_file():
+            continue
+        name = (meta.get("config") or {}).get("name") or job["id"]
+        # vLLM takes --lora-modules as name=path.
+        out.append(
+            _entry(
+                f"{name}={servers.container_path(adapter)}",
+                f"{name} (fine-tune {job['id']})",
+                kind="path",
+                detail=f"{_dir_bytes(adapter) / 1024 ** 2:.0f} MiB",
+                note=str(adapter),
+            )
+        )
+    return out
+
+
+async def path_options() -> dict[str, Any]:
+    """Everything a path-valued serve flag could be set to, by kind."""
+    try:
+        local = await hf.local_models()
+    except Exception as exc:
+        local = {"ok": False, "error": str(exc), "repos": []}
+
+    def build() -> dict[str, list[dict]]:
+        models = _cached_models(local) + _heretic_outputs() + _finetune_outputs()
+        return {
+            "model": models,
+            "adapter": _adapter_options(local),
+            "template": _file_options("template"),
+            "plugin": _file_options("plugin"),
+            "cert": _file_options("cert"),
+            "json": _file_options("json"),
+            "directory": _directory_options(),
+        }
+
+    options = await asyncio.to_thread(build)
+    return {
+        "options": options,
+        "counts": {kind: len(items) for kind, items in options.items()},
+        "cache_ok": bool(local.get("ok")),
     }

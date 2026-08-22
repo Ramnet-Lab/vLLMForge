@@ -118,9 +118,20 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
+# exists, so anything added after the first release needs an explicit step.
+MIGRATIONS = [
+    ("servers", "node", "ALTER TABLE servers ADD COLUMN node TEXT NOT NULL DEFAULT 'local'"),
+]
+
+
 def init_db() -> None:
     conn = connect()
     conn.executescript(SCHEMA)
+    for table, column, statement in MIGRATIONS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(statement)
     conn.commit()
 
 

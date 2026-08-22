@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from app import db, docker_ctl, events, hf, safety, vllm_spec
+from app import db, docker_ctl, events, hf, nodes, safety, vllm_spec
 from app.config import settings
 
 JSON_FIELDS = ("args", "env")
@@ -69,7 +69,7 @@ def create_server(payload: dict) -> dict:
     now = db.now()
     cursor = db.execute(
         "INSERT INTO servers (name, model, served_name, port, image, args, env, notes, autostart,"
-        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " node, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             payload["name"],
             payload["model"],
@@ -80,6 +80,7 @@ def create_server(payload: dict) -> dict:
             db.dumps(payload.get("env") or {}),
             payload.get("notes", ""),
             1 if payload.get("autostart") else 0,
+            payload.get("node") or nodes.LOCAL,
             now,
             now,
         ),
@@ -94,7 +95,7 @@ def update_server(server_id: int, payload: dict) -> dict | None:
     merged = {**existing, **{k: v for k, v in payload.items() if v is not None}}
     db.execute(
         "UPDATE servers SET name = ?, model = ?, served_name = ?, port = ?, image = ?, args = ?,"
-        " env = ?, notes = ?, autostart = ?, updated_at = ? WHERE id = ?",
+        " env = ?, notes = ?, autostart = ?, node = ?, updated_at = ? WHERE id = ?",
         (
             merged["name"],
             merged["model"],
@@ -105,6 +106,7 @@ def update_server(server_id: int, payload: dict) -> dict | None:
             db.dumps(merged.get("env") or {}),
             merged.get("notes", ""),
             1 if merged.get("autostart") else 0,
+            merged.get("node") or nodes.LOCAL,
             db.now(),
             server_id,
         ),
@@ -118,6 +120,14 @@ def delete_server(server_id: int) -> None:
 
 def container_name(server: dict) -> str:
     return settings.container_name("vllm", server["id"])
+
+
+def node_of(server: dict) -> nodes.Node:
+    return nodes.by_name(server.get("node"))
+
+
+def host_of(server: dict) -> str | None:
+    return node_of(server).docker_host
 
 
 def used_ports() -> set[int]:
@@ -203,12 +213,13 @@ async def start(server_id: int, *, force: bool = False) -> dict:
     args = server.get("args") or {}
     util = vllm_spec.gpu_memory_utilization(args)
 
+    node = node_of(server)
     async with LAUNCH_LOCK:
-        verdict = await safety.check_launch(util, replacing=name, params=args)
+        verdict = await safety.check_launch(util, replacing=name, params=args, node=node)
         if not verdict.ok and not force:
             return {"started": False, "safety": verdict.as_dict()}
 
-        await docker_ctl.remove(name, force=True)
+        await docker_ctl.remove(name, force=True, host=node.docker_host)
         settings.output_dir.mkdir(parents=True, exist_ok=True)
         try:
             await docker_ctl.run_detached(
@@ -219,6 +230,7 @@ async def start(server_id: int, *, force: bool = False) -> dict:
                 mounts=_mounts(),
                 gpu=True,
                 network="host",
+                host=node.docker_host,
             )
         except docker_ctl.DockerError as exc:
             # docker's own refusal is the useful message here — a port already
@@ -228,28 +240,28 @@ async def start(server_id: int, *, force: bool = False) -> dict:
                     "safety": verdict.as_dict()}
     db.execute("UPDATE servers SET last_started_at = ? WHERE id = ?", (db.now(), server_id))
     await events.broker.publish(events.SERVERS, {"type": "started", "id": server_id})
-    return {"started": True, "safety": verdict.as_dict(), "container": name}
+    return {"started": True, "safety": verdict.as_dict(), "container": name, "node": node.name}
 
 
 async def stop(server_id: int) -> None:
     server = get_server(server_id)
     if server is None:
         raise KeyError(server_id)
-    await docker_ctl.stop(container_name(server))
+    await docker_ctl.stop(container_name(server), host=host_of(server))
     await events.broker.publish(events.SERVERS, {"type": "stopped", "id": server_id})
 
 
 async def remove_container(server_id: int) -> None:
     server = get_server(server_id)
     if server is not None:
-        await docker_ctl.remove(container_name(server), force=True)
+        await docker_ctl.remove(container_name(server), force=True, host=host_of(server))
 
 
 async def logs(server_id: int, tail: int = 400) -> str:
     server = get_server(server_id)
     if server is None:
         raise KeyError(server_id)
-    return await docker_ctl.logs(container_name(server), tail=tail)
+    return await docker_ctl.logs(container_name(server), tail=tail, host=host_of(server))
 
 
 # --- health & metrics ---------------------------------------------------
@@ -369,43 +381,62 @@ async def discover_foreign() -> list[dict]:
 # --- aggregate view -----------------------------------------------------
 
 async def status_all() -> dict:
-    servers = list_servers()
-    names = [container_name(s) for s in servers]
-    states, foreign = await asyncio.gather(docker_ctl.states(names), discover_foreign())
+    registry = nodes.registered()
+    by_host: dict[str | None, list[dict]] = {}
+    for server in list_servers():
+        by_host.setdefault(node_of(server).docker_host, []).append(server)
+
+    states: dict[str, docker_ctl.ContainerState] = {}
+    for host, group in by_host.items():
+        states |= await docker_ctl.states([container_name(s) for s in group], host=host)
 
     async def decorate(server: dict) -> dict:
+        node = node_of(server)
         state = states.get(container_name(server))
+        # A server on a peer answers on that peer's address, not on loopback.
+        base_host = "127.0.0.1" if node.is_local else (node.address or node.name)
         entry = {
             **server,
             "container": container_name(server),
+            "node": node.name,
+            "node_local": node.is_local,
             "status": state.ui_status if state else "absent",
             "exit_code": state.exit_code if state else None,
             "oom_killed": state.oom_killed if state else False,
             "started_at": state.started_at if state else None,
             "util": vllm_spec.gpu_memory_utilization(server.get("args") or {}),
-            "url": f"http://127.0.0.1:{server['port']}",
+            "url": f"http://{base_host}:{server['port']}",
         }
         if entry["status"] in ("running", "starting", "unhealthy"):
-            entry["health"] = await probe(int(server["port"]))
-            # vLLM does not bind its port until the weights are loaded and CUDA
-            # graphs are captured, which on a 27B model is minutes. A refused
-            # connection therefore means "still loading", not "broken".
+            entry["health"] = await probe(int(server["port"]), host=base_host)
+            # vLLM does not bind its port until the weights are loaded and the
+            # CUDA graphs captured, so a refused connection means "still
+            # loading", not "broken".
             if entry["status"] == "running" and not entry["health"]["reachable"]:
                 entry["status"] = "loading"
         else:
             entry["health"] = {"reachable": False, "healthy": False, "models": []}
         return entry
 
-    decorated = await asyncio.gather(*(decorate(s) for s in servers)) if servers else []
+    servers_out = await asyncio.gather(*(decorate(s) for s in list_servers())) if by_host else []
 
+    foreign = await discover_foreign()
     for item in foreign:
         if item.get("port"):
             item["health"] = await probe(int(item["port"]))
 
+    budgets = {}
+    for node in registry:
+        budgets[node.name] = (await safety.current_budget(node=node)).as_dict()
+
     return {
-        "servers": list(decorated),
+        "servers": list(servers_out),
         "foreign": foreign,
-        "budget": (await safety.current_budget()).as_dict(),
+        "nodes": [n.as_dict() for n in registry],
+        "budgets": budgets,
+        # The local budget stays at the top level so anything reading the old
+        # shape keeps working.
+        "budget": budgets.get(nodes.LOCAL, {}),
     }
 
 
@@ -418,7 +449,8 @@ async def endpoints() -> list[dict]:
             out.append(
                 {
                     "id": f"server:{server['id']}",
-                    "label": server["name"],
+                    "label": server["name"] if server["node_local"]
+                             else f"{server['name']} on {server['node']}",
                     "url": server["url"],
                     "models": server["health"]["models"],
                     "managed": True,

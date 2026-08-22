@@ -22,6 +22,7 @@ from app import servers as server_service
 from app.config import settings
 from app.routers import chat, finetune, heretic, hub, servers, system
 from app.routers import jobs as jobs_router
+from app.routers import nodes as nodes_router
 
 log = logging.getLogger("llmd")
 
@@ -97,6 +98,7 @@ app.add_middleware(
 
 for router in (
     system.router,
+    nodes_router.router,
     jobs_router.router,
     servers.router,
     hub.router,

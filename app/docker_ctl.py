@@ -20,6 +20,18 @@ from pathlib import Path
 DOCKER = "docker"
 
 
+def docker_argv(host: str | None, *rest: str) -> list[str]:
+    """`docker -H <host> ...`, or plain docker for this machine.
+
+    The whole module drives the docker CLI, so pointing an operation at a peer
+    is one flag rather than a second transport. `docker -H ssh://node2` runs the
+    client locally and talks to the remote daemon over the existing ssh key,
+    which means no daemon socket is exposed on the network.
+    """
+    prefix = [DOCKER] + (["-H", host] if host else [])
+    return prefix + list(rest)
+
+
 class DockerError(RuntimeError):
     def __init__(self, argv: Sequence[str], returncode: int, stderr: str):
         self.argv = list(argv)
@@ -81,14 +93,16 @@ async def _run(argv: Sequence[str], *, check: bool = True) -> tuple[int, str, st
     return proc.returncode or 0, stdout, stderr
 
 
-async def version() -> str:
-    _, out, _ = await _run([DOCKER, "version", "--format", "{{.Server.Version}}"])
+async def version(host: str | None = None) -> str:
+    _, out, _ = await _run(
+        docker_argv(host, "version", "--format", "{{.Server.Version}}")
+    )
     return out.strip()
 
 
-async def available() -> bool:
+async def available(host: str | None = None) -> bool:
     try:
-        await version()
+        await version(host)
         return True
     except (DockerError, FileNotFoundError, OSError):
         return False
@@ -111,6 +125,7 @@ def build_run_argv(
     workdir: str | None = None,
     shm_size: str | None = None,
     extra: Sequence[str] = (),
+    host: str | None = None,
 ) -> list[str]:
     """Assemble a `docker run` invocation.
 
@@ -118,7 +133,7 @@ def build_run_argv(
     networking (vLLM binds the port directly), host IPC and unlimited memlock
     (vLLM's shared-memory transport needs both), and the nvidia runtime.
     """
-    argv = [DOCKER, "run", "--name", name]
+    argv = docker_argv(host, "run", "--name", name)
     if detach:
         argv.append("-d")
     if remove:
@@ -182,8 +197,8 @@ async def run_capture(
         raise DockerError(argv, -1, f"timed out after {timeout}s; container removed") from None
 
 
-async def inspect(name: str) -> dict | None:
-    code, out, _ = await _run([DOCKER, "inspect", name], check=False)
+async def inspect(name: str, host: str | None = None) -> dict | None:
+    code, out, _ = await _run(docker_argv(host, "inspect", name), check=False)
     if code != 0:
         return None
     try:
@@ -193,8 +208,8 @@ async def inspect(name: str) -> dict | None:
     return payload[0] if payload else None
 
 
-async def state(name: str) -> ContainerState:
-    info = await inspect(name)
+async def state(name: str, host: str | None = None) -> ContainerState:
+    info = await inspect(name, host)
     if info is None:
         return ContainerState(name=name, exists=False)
     st = info.get("State", {}) or {}
@@ -215,15 +230,17 @@ async def state(name: str) -> ContainerState:
     )
 
 
-async def states(names: Sequence[str]) -> dict[str, ContainerState]:
+async def states(names: Sequence[str], host: str | None = None) -> dict[str, ContainerState]:
     if not names:
         return {}
-    results = await asyncio.gather(*(state(n) for n in names))
+    results = await asyncio.gather(*(state(n, host) for n in names))
     return {s.name: s for s in results}
 
 
-async def ps(prefix: str | None = None, *, all_containers: bool = True) -> list[dict]:
-    argv = [DOCKER, "ps", "--format", "{{json .}}"]
+async def ps(
+    prefix: str | None = None, *, all_containers: bool = True, host: str | None = None
+) -> list[dict]:
+    argv = docker_argv(host, "ps", "--format", "{{json .}}")
     if all_containers:
         argv.append("-a")
     code, out, _ = await _run(argv, check=False)
@@ -244,27 +261,27 @@ async def ps(prefix: str | None = None, *, all_containers: bool = True) -> list[
     return rows
 
 
-async def stop(name: str, timeout: int = 30) -> None:
-    await _run([DOCKER, "stop", "-t", str(timeout), name], check=False)
+async def stop(name: str, timeout: int = 30, host: str | None = None) -> None:
+    await _run(docker_argv(host, "stop", "-t", str(timeout), name), check=False)
 
 
-async def kill(name: str) -> None:
-    await _run([DOCKER, "kill", name], check=False)
+async def kill(name: str, host: str | None = None) -> None:
+    await _run(docker_argv(host, "kill", name), check=False)
 
 
-async def remove(name: str, *, force: bool = True) -> None:
-    argv = [DOCKER, "rm", name]
+async def remove(name: str, *, force: bool = True, host: str | None = None) -> None:
+    argv = docker_argv(host, "rm", name)
     if force:
-        argv.insert(2, "-f")
+        argv.insert(-1, "-f")
     await _run(argv, check=False)
 
 
-async def set_restart_policy(name: str, policy: str) -> None:
-    await _run([DOCKER, "update", "--restart", policy, name], check=False)
+async def set_restart_policy(name: str, policy: str, host: str | None = None) -> None:
+    await _run(docker_argv(host, "update", "--restart", policy, name), check=False)
 
 
-async def logs(name: str, *, tail: int | str = 400) -> str:
-    _, out, err = await _run([DOCKER, "logs", "--tail", str(tail), name], check=False)
+async def logs(name: str, *, tail: int | str = 400, host: str | None = None) -> str:
+    _, out, err = await _run(docker_argv(host, "logs", "--tail", str(tail), name), check=False)
     return out + err
 
 
@@ -274,6 +291,7 @@ async def stream_logs(
     tail: int | str = 200,
     since: str | None = None,
     progress_interval: float = 0.4,
+    host: str | None = None,
 ) -> AsyncIterator[tuple[str, bool]]:
     """Follow a container's output as (text, transient) pairs.
 
@@ -289,7 +307,7 @@ async def stream_logs(
     stderr and the container's own output goes to stdout, and a log pane wants
     them interleaved in arrival order.
     """
-    argv = [DOCKER, "logs", "-f", "--tail", str(tail)]
+    argv = docker_argv(host, "logs", "-f", "--tail", str(tail))
     if since:
         argv += ["--since", since]
     argv.append(name)
@@ -353,8 +371,8 @@ async def stream_logs(
                 proc.kill()
 
 
-async def image_exists(tag: str) -> bool:
-    code, _, _ = await _run([DOCKER, "image", "inspect", tag], check=False)
+async def image_exists(tag: str, host: str | None = None) -> bool:
+    code, _, _ = await _run(docker_argv(host, "image", "inspect", tag), check=False)
     return code == 0
 
 

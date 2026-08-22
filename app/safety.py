@@ -221,26 +221,42 @@ def _gib(value: float) -> str:
     return f"{value / GIB:.1f} GiB"
 
 
-async def current_budget(exclude: str | None = None) -> Budget:
-    """Survey every running container and process that has taken GPU memory."""
-    memory = read_meminfo()
+async def current_budget(exclude: str | None = None, node: Any = None) -> Budget:
+    """Survey every running container and process that has taken GPU memory.
+
+    `node` is an app.nodes.Node; omitted means this machine. A launch aimed at a
+    peer has to be measured against that peer's memory, not against ours.
+    """
+    host = getattr(node, "docker_host", None)
+    if host is None:
+        memory = read_meminfo()
+        total, available, free = memory.total_bytes, memory.available_bytes, memory.free_bytes
+    else:
+        from app import nodes as node_registry
+
+        total, available, free = await node_registry._remote_memory(node)
+
     budget = Budget(
-        total_bytes=memory.total_bytes,
-        available_bytes=memory.available_bytes,
-        free_bytes=memory.free_bytes,
+        total_bytes=total,
+        available_bytes=available,
+        free_bytes=free,
         reserve_bytes=int(settings.mem_reserve_gib * GIB),
         warn_reserve_bytes=int(settings.mem_warn_reserve_gib * GIB),
     )
 
-    processes = await read_gpu_processes()
-    budget.measured_gpu_bytes = sum(p.used_bytes for p in processes)
+    # Per-process GPU accounting comes from nvidia-smi, which reports on THIS
+    # machine. Counting it against a peer made an idle peer look half full and
+    # refused launches it had ample room for.
+    if host is None:
+        processes = await read_gpu_processes()
+        budget.measured_gpu_bytes = sum(p.used_bytes for p in processes)
 
     fallback = default_util()
-    for row in await docker_ctl.ps(all_containers=False):
+    for row in await docker_ctl.ps(all_containers=False, host=host):
         name = str(row.get("Names", ""))
         if not name or (exclude and name == exclude):
             continue
-        info = await docker_ctl.state(name)
+        info = await docker_ctl.state(name, host)
         if not is_vllm_command(info.command):
             continue
 
@@ -278,13 +294,14 @@ async def check_launch(
     *,
     replacing: str | None = None,
     params: dict[str, Any] | None = None,
+    node: Any = None,
 ) -> Verdict:
     """Decide whether a launch is safe right now.
 
     Pass `params` — the whole stored argument dict — wherever it is available:
     the utilisation fraction alone does not describe what a config will take.
     """
-    budget = await current_budget(exclude=replacing)
+    budget = await current_budget(exclude=replacing, node=node)
     payload = budget.as_dict()
     fallback = default_util()
 

@@ -73,3 +73,39 @@ async def test_the_catalogue_survives_a_cache_that_cannot_be_read(monkeypatch):
     assert "unreadable" in payload["cache_error"]
     # Job outputs are still offered — a bad cache must not empty the whole picker.
     assert "groups" in payload
+
+
+def test_path_options_are_container_paths_not_host_paths(tmp_path, monkeypatch):
+    """vLLM runs with the cache at /hf and outputs at /outputs. A host path here
+    starts an engine that then cannot find its file, minutes later, in a log."""
+    from app import servers
+    from app.config import settings
+
+    produced = settings.output_dir / "run-xyz" / "chat_template.jinja"
+    assert servers.container_path(produced).startswith("/outputs/")
+    assert not servers.container_path(produced).startswith(str(settings.output_dir))
+
+
+def test_the_walk_is_bounded(tmp_path):
+    # The model cache holds tens of thousands of blobs; an unbounded walk would
+    # enumerate every one of them for no benefit.
+    deep = tmp_path
+    for level in range(8):
+        deep = deep / f"level{level}"
+    deep.mkdir(parents=True)
+    (deep / "deep.jinja").write_text("x")
+    (tmp_path / "shallow.jinja").write_text("x")
+
+    found = catalog._walk(tmp_path, lambda p: p.suffix == ".jinja")
+    names = {p.name for p in found}
+    assert "shallow.jinja" in names
+    assert "deep.jinja" not in names, "the walk should stop before MAX_DEPTH"
+
+
+def test_an_adapter_is_offered_in_the_form_vllm_wants():
+    # --lora-modules takes name=path, so the option has to arrive that way or the
+    # user has to hand-assemble it, which is the typing this exists to avoid.
+    entry = catalog._entry("myrun=/outputs/x/adapter", "myrun", kind="path")
+    assert "=" in entry["value"]
+    name, _, path = entry["value"].partition("=")
+    assert name and path.startswith("/outputs/")

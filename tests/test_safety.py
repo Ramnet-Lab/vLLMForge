@@ -72,7 +72,7 @@ def test_the_validated_configuration_fits():
 
 @pytest.mark.asyncio
 async def test_check_launch_blocks_an_overcommit(monkeypatch):
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([("vllm-qwen", 0.52), ("vllm-embed", 0.16)])
 
     monkeypatch.setattr(safety, "current_budget", fake)
@@ -86,7 +86,7 @@ async def test_check_launch_blocks_an_overcommit(monkeypatch):
 async def test_an_unset_util_is_evaluated_as_vllm_s_default(monkeypatch):
     # Leaving the flag off is not "unspecified", it is 0.92 — 112 GiB here, which
     # cannot fit beside the OS reserve on an otherwise idle host.
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([])
 
     monkeypatch.setattr(safety, "current_budget", fake)
@@ -97,7 +97,7 @@ async def test_an_unset_util_is_evaluated_as_vllm_s_default(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_live_headroom_blocks_even_a_budget_legal_launch(monkeypatch):
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([], available_gib=4.0)
 
     monkeypatch.setattr(safety, "current_budget", fake)
@@ -123,7 +123,7 @@ def test_the_declared_utils_win_when_engines_have_not_finished_allocating():
 async def test_a_serve_command_without_a_util_flag_is_not_free(monkeypatch):
     # vLLM applies its own 0.92 default, which is over 100 GiB on this host.
     # Treating such a container as contributing zero was the dangerous bug here.
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([("vllm-nodefault", safety.default_util())])
 
     monkeypatch.setattr(safety, "current_budget", fake)
@@ -135,7 +135,7 @@ async def test_a_serve_command_without_a_util_flag_is_not_free(monkeypatch):
 async def test_free_versus_available_is_surfaced_not_ignored(monkeypatch):
     # vLLM's own guard compares against free memory; page cache does not count
     # for it even though MemAvailable includes it.
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([], available_gib=80.0, free_gib=5.0)
 
     monkeypatch.setattr(safety, "current_budget", fake)
@@ -196,7 +196,7 @@ def test_a_running_container_is_read_back_the_way_a_stored_config_is(command, ke
 
 @pytest.mark.asyncio
 async def test_a_huge_explicit_kv_cache_cannot_walk_past_the_guard(monkeypatch):
-    async def fake(exclude=None):
+    async def fake(exclude=None, node=None):
         return budget([])
 
     monkeypatch.setattr(safety, "current_budget", fake)

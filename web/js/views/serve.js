@@ -43,6 +43,9 @@ const STYLES = `
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
 .serve-unmanaged td:first-child { border-left: 3px solid var(--info); }
 .serve-tenants { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.serve-pick { display: flex; flex-direction: column; gap: 6px; }
+.serve-pick-row { display: flex; align-items: center; gap: 6px; }
+.serve-pick-row select { flex: 1 1 auto; min-width: 0; }
 `;
 
 /* Two of these three are configurations that have actually run co-resident on
@@ -669,6 +672,170 @@ async function stopForeign(item) {
   await refreshStatus();
 }
 
+/* --- disk pickers -------------------------------------------------------- */
+
+/* The backend tags every flag whose value is something on disk with a
+   `path_kind`, and GET /servers/paths lists what is actually there for each
+   kind. A mistyped path is only discovered minutes later, when the engine has
+   already pulled the weights in and then died, so the form offers the real
+   thing instead of a text box wherever it can. */
+
+// Sentinel for the escape option, matching the Heretic picker. Not a null byte:
+// browsers may replace one in an attribute value with U+FFFD, and the equality
+// check would then never fire.
+const OTHER = '__llmd_other__';
+
+const EMPTY_PATHS = { options: {}, counts: {}, cache_ok: true };
+
+const pathOptions = (kind) => state.editor?.paths.options[kind] || [];
+
+/** One scan feeds every picker in the form — sixteen path flags must not mean
+ *  sixteen requests. */
+async function loadPaths() {
+  let payload;
+  try {
+    payload = await get('/servers/paths');
+  } catch (error) {
+    // A failed scan costs the operator nothing but the list: an empty kind
+    // falls through to its text box, so the form stays usable.
+    toast(error.message, { level: 'warn', title: 'Could not list what is on disk' });
+    return;
+  }
+  if (!state.editor) return;
+  state.editor.paths = payload;
+  if (!payload.cache_ok) {
+    toast('The Hub cache could not be read, so only local paths are listed.', { level: 'warn' });
+  }
+}
+
+/** The list goes stale the moment a download finishes or a fine-tune exports,
+ *  and the form outlives both. */
+async function refreshPaths(button) {
+  button.disabled = true;
+  await loadPaths();
+  button.disabled = false;
+  if (!state.editor) return;
+  for (const sync of state.editor.pathViews) sync();
+  const counts = state.editor.paths.counts;
+  toast(`${counts.model || 0} model(s), ${counts.adapter || 0} adapter(s), `
+    + `${counts.template || 0} template(s) on disk.`);
+}
+
+function optionNodes(kind, { lead, current = '', custom = false }) {
+  const options = pathOptions(kind);
+  return [
+    h('option', { value: '', selected: !custom && !current }, lead),
+    options.map((option) => h('option', {
+      value: option.value,
+      selected: !custom && option.value === current,
+      title: option.note || '',
+    }, option.detail ? `${option.label} — ${option.detail}` : option.label)),
+    // plugin and cert are empty on a box where nobody has written one. Saying so
+    // beats a dropdown that opens onto nothing.
+    options.length
+      ? null
+      : h('option', { value: OTHER, disabled: true }, 'nothing on this box'),
+    h('option', { value: OTHER, selected: custom }, 'Other — type it'),
+  ];
+}
+
+/** Returns [control element, setter], like every other widget here. */
+function diskPicker(kind, { value = '', lead, placeholder = '', extra = null, onChange }) {
+  let current = value === undefined || value === null ? '' : String(value);
+  let custom = false;
+
+  const text = h('input', {
+    type: 'text',
+    placeholder,
+    onInput: (event) => {
+      current = event.target.value.trim();
+      onChange(current);
+    },
+  });
+
+  const select = h('select', {
+    onChange: (event) => {
+      const picked = event.target.value;
+      custom = picked === OTHER;
+      current = custom ? text.value.trim() : picked;
+      onChange(current);
+      sync();
+      if (custom) text.focus();
+    },
+  });
+
+  function sync() {
+    // A value the scan did not turn up — a Hub id nobody has pulled, a path that
+    // a refresh has since removed — stays the value: it selects the escape and
+    // prefills the box rather than silently becoming whatever is first in the
+    // list. With nothing on disk at all there is nothing else it could be.
+    const options = pathOptions(kind);
+    const known = options.some((option) => option.value === current);
+    custom = custom || !options.length || (Boolean(current) && !known);
+    mount(select, optionNodes(kind, { lead, current, custom }));
+    text.hidden = !custom;
+    // Only the escape owns the box; a pick from the list leaves it empty, so
+    // reaching for "Other" afterwards starts a fresh entry rather than
+    // resurrecting the last thing typed.
+    const typed = custom ? current : '';
+    if (text.value !== typed) text.value = typed;
+  }
+
+  sync();
+  state.editor.pathViews.push(sync);
+
+  return [
+    h('div', { class: 'serve-pick' },
+      h('div', { class: 'serve-pick-row' }, select, extra),
+      text),
+    (next) => {
+      current = next === undefined || next === null ? '' : String(next);
+      custom = false;
+      sync();
+    },
+  ];
+}
+
+/** A list flag takes several values — --lora-modules preloads more than one
+ *  adapter — so a pick adds to what the box already holds instead of replacing
+ *  it. The box stays the value the form stores, exactly as it was before. */
+function pathListControl(arg, asText, put) {
+  const box = h('input', {
+    type: 'text',
+    placeholder: `${formatDefault(arg)} — space or comma separated`,
+    value: asText(state.editor.args[arg.dest]),
+    onInput: (event) => {
+      const text = event.target.value.trim();
+      put(text === '' ? undefined : text);
+    },
+  });
+
+  const select = h('select', {
+    onChange: (event) => {
+      const picked = event.target.value;
+      // The box is the value; the select is only a way of filling it, so it
+      // snaps back and stays ready for the next adapter.
+      event.target.selectedIndex = 0;
+      box.focus();
+      if (picked === '' || picked === OTHER) return;
+      const items = box.value.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
+      if (items.includes(picked)) return;
+      items.push(picked);
+      box.value = items.join(' ');
+      put(box.value);
+    },
+  });
+
+  const sync = () => mount(select, optionNodes(arg.path_kind, { lead: 'Add one from disk…' }));
+  sync();
+  state.editor.pathViews.push(sync);
+
+  return [
+    h('div', { class: 'serve-pick' }, select, box),
+    (v) => { box.value = asText(v); },
+  ];
+}
+
 /* --- parameter widgets --------------------------------------------------- */
 
 /** Mirrors vllm_spec._is_default: these values are never rendered into argv. */
@@ -697,6 +864,15 @@ function setArg(arg, value) {
 function controlFor(arg) {
   const value = state.editor.args[arg.dest];
   const put = (v) => setArg(arg, v);
+
+  if (arg.path_kind && arg.widget !== 'list') {
+    return diskPicker(arg.path_kind, {
+      value,
+      lead: `default (${formatDefault(arg)})`,
+      placeholder: formatDefault(arg),
+      onChange: (next) => put(next === '' ? undefined : next),
+    });
+  }
 
   if (arg.widget === 'bool' && arg.default === null) {
     // Tri-state in vLLM: unset lets the engine decide, which is not the same as
@@ -762,6 +938,7 @@ function controlFor(arg) {
 
   if (arg.widget === 'list') {
     const asText = (v) => (Array.isArray(v) ? v.join(' ') : (v === undefined ? '' : String(v)));
+    if (arg.path_kind) return pathListControl(arg, asText, put);
     const box = h('input', {
       type: 'text',
       placeholder: `${formatDefault(arg)} — space or comma separated`,
@@ -855,6 +1032,8 @@ async function openEditor(server, prefill = {}) {
     setters: new Map(),
     sections: [],
     searchable: [],
+    paths: EMPTY_PATHS,
+    pathViews: [],
     form: {
       name: server?.name || '',
       model: server?.model || prefill.model || '',
@@ -867,18 +1046,21 @@ async function openEditor(server, prefill = {}) {
     },
   };
 
-  if (!server) {
-    try {
-      const suggestion = await get('/servers/suggest');
-      state.editor.form.port = state.editor.form.port || suggestion.port;
-      state.editor.form.image = state.editor.form.image || suggestion.image;
-    } catch (error) {
-      console.error('port suggestion failed', error);
-    }
-  }
+  await Promise.all([loadPaths(), server ? null : suggest()]);
   if (state.mode !== 'edit' || state.stopped) return;
   renderEditor();
   scheduleSafety();
+}
+
+async function suggest() {
+  try {
+    const suggestion = await get('/servers/suggest');
+    if (!state.editor) return;
+    state.editor.form.port = state.editor.form.port || suggestion.port;
+    state.editor.form.image = state.editor.form.image || suggestion.image;
+  } catch (error) {
+    console.error('port suggestion failed', error);
+  }
 }
 
 function closeEditor() {
@@ -903,14 +1085,29 @@ function renderEditor() {
   const flagCount = [...state.schema.featured, ...state.schema.advanced]
     .reduce((total, section) => total + section.flags.length, 0);
 
+  // The field that gets typed most, so the one that most wants a list. Refresh
+  // lives here rather than on all seventeen pickers: one scan feeds them all.
+  const [modelPicker] = diskPicker('model', {
+    value: editor.form.model,
+    lead: 'choose a model…',
+    placeholder: 'org/repo, or a path the container can see',
+    onChange: (next) => { editor.form.model = next; },
+    extra: h('button', {
+      class: 'btn-sm',
+      title: 'Re-read the model cache and the outputs directory',
+      onClick: (event) => refreshPaths(event.currentTarget),
+    }, 'Refresh'),
+  });
+
   const basics = h('div', { class: 'param-grid' },
     field('Name', input('name', { placeholder: 'qwen3-chat' }), {
       help: 'Names the container and identifies the server everywhere in this dashboard.',
     }),
-    field('Model', input('model', { placeholder: 'org/repo or /outputs/my-model' }), {
+    field('Model', modelPicker, {
       flag: 'positional',
-      help: 'A Hub repo id, or a path as the container sees it. Models built by the Fine-tune '
-        + 'and Heretic tabs land under /outputs.',
+      help: 'What is cached on this box, plus what the Fine-tune and Heretic tabs have written '
+        + 'under /outputs. Paths are as the container sees them. A Hub id that has never been '
+        + 'pulled goes under "Other" and is downloaded when the server first starts.',
     }),
     field('Port', input('port', { type: 'number', min: '1024', max: '65535' }), {
       flag: '--port',
