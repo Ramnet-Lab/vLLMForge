@@ -251,15 +251,54 @@ async def test_a_shorter_context_than_advertised_is_stated_not_warned(box):
 
 
 @pytest.mark.anyio
-async def test_fp8_block_weights_are_flagged_for_this_gpu(box):
+async def test_fp8_block_weights_ask_for_the_deep_gemm_switch(box):
+    """The failure this prevents, measured on Qwen/Qwen3.8-27B-FP8: vLLM
+    auto-disables DeepGemm for the layers on Blackwell and builds them for
+    CUTLASS, but kernel_warmup is gated on VLLM_USE_DEEP_GEMM alone, so the
+    warmup still hands DeepGEMM a layout it does not know and the engine dies on
+    "Unknown recipe" — four and a half minutes in, with every shard read."""
     place, mp = box
     place(mp.Profile(reference="org/fp8", found=True, architectures=["LlamaForCausalLM"],
                      quant_method="compressed-tensors", weight_bytes=30 * GIB,
+                     block_scaled_fp8=True,
                      quantization={"config_groups": {"FP8_BLOCK": {
                          "weights": {"strategy": "block", "block_structure": [128, 128]}}}},
                      has_safetensors=True, chat_template=True, supported=True))
     rec = (await recommend.build("org/fp8")).to_dict()
     assert any("DeepGEMM" in f["text"] for f in rec["findings"])
+    assert rec["env"] == {"VLLM_USE_DEEP_GEMM": "0"}
+    assert "VLLM_USE_DEEP_GEMM=0" in rec["headline"], "it has to be findable from the headline"
+
+
+@pytest.mark.anyio
+async def test_a_variable_already_in_the_environment_box_is_not_asked_for_again(box):
+    """A recommendation says what to change. Repeating a variable the operator
+    has already typed in is how the panel trains them to stop reading it."""
+    place, mp = box
+    profile = dict(found=True, architectures=["LlamaForCausalLM"], weight_bytes=30 * GIB,
+                   block_scaled_fp8=True, quant_method="fp8", has_safetensors=True,
+                   chat_template=True, supported=True)
+    place(mp.Profile(reference="org/fp8", **profile))
+
+    rec = (await recommend.build("org/fp8", env={"VLLM_USE_DEEP_GEMM": "0"})).to_dict()
+    # Still explained — the reason it must stay set does not go away — but no
+    # longer something the headline asks for.
+    assert rec["env"] == {"VLLM_USE_DEEP_GEMM": "0"}
+    assert "VLLM_USE_DEEP_GEMM" not in rec["headline"]
+
+
+@pytest.mark.anyio
+async def test_a_per_tensor_fp8_checkpoint_is_left_alone(box):
+    """Only the block layout reaches the kernel that fails. Asking every FP8
+    model to disable DeepGEMM would cost throughput on the ones it serves."""
+    place, mp = box
+    place(mp.Profile(reference="org/fp8-tensor", found=True,
+                     architectures=["LlamaForCausalLM"], quant_method="fp8",
+                     weight_bytes=30 * GIB, has_safetensors=True, chat_template=True,
+                     supported=True))
+    rec = (await recommend.build("org/fp8-tensor")).to_dict()
+    assert rec["env"] == {}
+    assert not any("DeepGEMM" in f["text"] for f in rec["findings"])
 
 
 @pytest.mark.anyio
@@ -539,3 +578,4 @@ async def test_weights_that_do_not_fit_one_machine_may_fit_two(box):
 
     spread = (await recommend.build("org/huge", "", {}, ["local", "node2"])).to_dict()
     assert spread["ok"] is True, "50 GiB a machine fits where 100 does not"
+

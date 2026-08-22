@@ -1527,6 +1527,10 @@ async function loadProfile() {
       pool: editor.form.pooled ? editor.form.pool : [],
       // So an existing server's own container is not counted against itself.
       server_id: editor.id,
+      // Some of what decides whether an engine starts is an environment
+      // variable rather than a flag, so what is already in that box is part of
+      // the question too.
+      env: parseEnv(editor.form.env || ''),
     });
     if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
     state.editor.profile = rec.profile;
@@ -1566,16 +1570,44 @@ function applyArgs(args) {
   return { applied, missing };
 }
 
+/** Merge {NAME: value} into the Environment box, leaving everything else alone.
+ *  Rewriting the whole textarea would drop the operator's own variables and any
+ *  comments in it, so each name is replaced in place and only a genuinely new
+ *  one is appended. */
+function applyEnv(vars) {
+  const entries = Object.entries(vars || {});
+  if (!entries.length) return 0;
+  const lines = String(state.editor.form.env || '').split('\n');
+  let applied = 0;
+  for (const [name, value] of entries) {
+    const line = `${name}=${value}`;
+    const at = lines.findIndex((text) => text.trim().split('=')[0].trim() === name);
+    if (at >= 0) {
+      if (lines[at] === line) continue;
+      lines[at] = line;
+    } else {
+      lines.push(line);
+    }
+    applied += 1;
+  }
+  state.editor.form.env = lines.filter((text) => text.trim()).join('\n');
+  if (state.editor.refs.env) state.editor.refs.env.value = state.editor.form.env;
+  return applied;
+}
+
 function applyRecommendation() {
   const rec = state.editor?.rec;
   if (!rec) return;
   const { applied, missing } = applyArgs(rec.args);
+  const envApplied = applyEnv(rec.env);
   if (missing.length) {
     toast(`This vLLM build has no ${missing.join(', ')}; the rest was applied.`,
       { level: 'warn' });
   }
-  toast(applied ? `Applied ${applied} flag${applied === 1 ? '' : 's'}.` : 'Nothing to change.',
-    { level: 'ok' });
+  const parts = [];
+  if (applied) parts.push(`${applied} flag${applied === 1 ? '' : 's'}`);
+  if (envApplied) parts.push(`${envApplied} environment variable${envApplied === 1 ? '' : 's'}`);
+  toast(parts.length ? `Applied ${parts.join(' and ')}.` : 'Nothing to change.', { level: 'ok' });
   scheduleSafety();
   if (state.editor.form.pooled) schedulePlan();
   // The recommendation is relative to what is set, so re-ask it.
@@ -1604,14 +1636,18 @@ function renderRecommendation(options = {}) {
 
   const pending = Object.entries(rec.args || {})
     .filter(([dest, value]) => editor.args[dest] !== value);
+  const currentEnv = parseEnv(editor.form.env || '');
+  const pendingEnv = Object.entries(rec.env || {})
+    .filter(([name, value]) => currentEnv[name] !== value);
+  const outstanding = pending.length + pendingEnv.length;
 
   mount(host, h('div', { class: `serve-rec lv-${recLevelClass(rec.level)}` },
     h('div', { class: 'sr-head' },
       h('strong', null, rec.headline),
       h('span', { class: 'spacer' }),
-      rec.ok && pending.length
+      rec.ok && outstanding
         ? h('button', { class: 'btn-primary btn-sm', onClick: applyRecommendation },
-          `Apply ${pending.length} flag${pending.length === 1 ? '' : 's'}`)
+          `Apply ${outstanding} setting${outstanding === 1 ? '' : 's'}`)
         : null),
     (rec.suggestions || []).length
       ? h('div', { class: 'sr-list' }, rec.suggestions.map((s) => {
@@ -1620,6 +1656,18 @@ function renderRecommendation(options = {}) {
           h('code', null, `${flagOf(s.dest)} ${formatValue(s.value)}`),
           already ? badge('succeeded', 'set') : null,
           h('span', { class: 'sr-why' }, s.why));
+      }))
+      : null,
+    // Environment variables read as what you type into the box below, not as
+    // flags, because that is where they have to go — they are not in the schema
+    // the flag form is generated from.
+    (rec.env_suggestions || []).length
+      ? h('div', { class: 'sr-list' }, rec.env_suggestions.map((e) => {
+        const already = currentEnv[e.name] === e.value;
+        return h('div', { class: `sr-item${already ? ' done' : ''}` },
+          h('code', null, `${e.name}=${e.value}`),
+          already ? badge('succeeded', 'set') : badge('info', 'env'),
+          h('span', { class: 'sr-why' }, e.why));
       }))
       : null,
     (rec.findings || []).map((f) => notice(
@@ -1898,12 +1946,15 @@ function renderEditor() {
     field('Notes', input('notes', { placeholder: 'why this configuration exists' }), {
       help: 'Free text for whoever reads this in three months.',
     }),
-    field('Environment', h('textarea', {
+    // Kept in refs so the recommendation can write into it: some of what
+    // decides whether an engine starts is read from the environment and is not
+    // a flag at all, so Apply has to be able to reach this box.
+    field('Environment', (editor.refs.env = h('textarea', {
       rows: 3,
       placeholder: 'KEY=value, one per line',
       value: editor.form.env,
       onInput: (e) => { editor.form.env = e.target.value; },
-    }), {
+    })), {
       help: 'Extra container environment. HF_HOME, HF_TOKEN and the NCCL variables are '
         + 'already set for you.',
     }),

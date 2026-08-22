@@ -385,7 +385,13 @@ form used to make you answer from memory:
   a chat template and where it came from, and whether vLLM will run it as a
   generator or an embedder — which is not a flag anyone can override;
 * which of the ~190 flags actually decide whether it starts, with the reason for
-  each, and one button to apply them.
+  each, and one button to apply them;
+* and the container environment variables that do the same job, for the cases
+  where the setting that decides it is not a flag at all. vLLM reads about forty
+  knobs from the environment, and because they are not in the argparse schema
+  `tools/gen_vllm_schema.py` cannot see them and the form cannot offer them —
+  so the recommendation names them, and Apply writes them into the Environment
+  box alongside the flags.
 
 It sets as little as it can. vLLM detects the quantisation method, resolves the
 dtype, reads `generation_config.json` and loads the repo's chat template on its
@@ -399,6 +405,17 @@ when the chat template's own tokens name them unambiguously.
 
 What no flag rescues is said plainly: a LoRA adapter, GGUF-only weights, weights
 larger than free memory, a checkpoint whose quantisation this build cannot load.
+
+One worked example of why the environment matters. An FP8 checkpoint whose
+scales are per *block* — `Qwen/Qwen3.8-27B-FP8`, `RedHatAI/gemma-4-31B-it-FP8-block`
+— lands on a contradiction in vLLM 0.24 on Blackwell: the engine auto-disables
+DeepGemm for the layers and builds them for CUTLASS, but `kernel_warmup` is
+gated on `VLLM_USE_DEEP_GEMM` alone and never hears about it, so the warmup
+hands DeepGEMM a scale layout it does not know and the whole engine dies on
+`Unknown recipe` — four and a half minutes in, with every shard already read.
+`VLLM_USE_DEEP_GEMM=0` fixes it, costs nothing at run time because the layers
+were not using DeepGEMM anyway, and saves the couple of minutes the warmup
+takes. The Serve page now says so before the launch instead of after it.
 
 The sampling schema has an equivalent, pointed at a *running* server:
 

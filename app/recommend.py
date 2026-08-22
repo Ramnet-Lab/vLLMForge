@@ -58,6 +58,7 @@ MULTIMODAL_OVERHEAD_BYTES = 2 * 1024 ** 3
 # conversation is not one anybody wanted.
 CONCURRENCY = 2
 
+
 # Flags a recommendation deliberately leaves alone, with the reason. Shown to
 # the operator, because "why didn't it set the quantisation" is the obvious
 # question and the answer is that setting it makes things worse.
@@ -85,6 +86,21 @@ class Suggestion:
 
 
 @dataclass
+class EnvSuggestion:
+    """A container environment variable, for what no flag can express.
+
+    Some of what decides whether an engine starts is not an argument at all.
+    vLLM reads about forty knobs from the environment, and because they are not
+    in the argparse schema, `tools/gen_vllm_schema.py` cannot see them and the
+    Serve form cannot offer them — so the only place they can be surfaced is
+    here, next to the flags.
+    """
+    name: str
+    value: str
+    why: str
+
+
+@dataclass
 class Finding:
     level: str
     """ok, warn or block."""
@@ -99,6 +115,7 @@ class Recommendation:
     level: str = "ok"
     headline: str = ""
     suggestions: list[Suggestion] = field(default_factory=list)
+    env: list[EnvSuggestion] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     left_alone: list[dict[str, str]] = field(default_factory=list)
     profile: dict[str, Any] = field(default_factory=dict)
@@ -113,6 +130,9 @@ class Recommendation:
             "args": {s.dest: s.value for s in self.suggestions},
             "suggestions": [{"dest": s.dest, "value": s.value, "why": s.why}
                             for s in self.suggestions],
+            "env": {e.name: e.value for e in self.env},
+            "env_suggestions": [{"name": e.name, "value": e.value, "why": e.why}
+                                for e in self.env],
             "findings": [{"level": f.level, "text": f.text} for f in self.findings],
             "left_alone": self.left_alone,
             "profile": self.profile,
@@ -190,13 +210,19 @@ def safe_utilisation(total_bytes: int, available_bytes: int, budget_free_util: f
 
 async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
                 pool: list[str] | None = None,
-                server_id: int | None = None) -> Recommendation:
+                server_id: int | None = None,
+                env: dict[str, Any] | None = None) -> Recommendation:
     """What to set for this model on this node, and what stands in the way.
 
     `server_id` names the definition being configured, if there is one. Its own
     running container is then excluded from the budget — a server counted
     against itself leaves nothing free and turns every recommendation for it
     into "there is no room".
+
+    `env` is the definition's container environment, for the same reason `args`
+    is passed: a recommendation says what to *change*, so it has to know what is
+    already set — otherwise the headline keeps asking for a variable that is
+    sitting in the form.
     """
     from app import nodes
 
@@ -254,7 +280,7 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
     _existing(rec, args or {})
 
     rec.left_alone = [{"dest": dest, "why": why} for dest, why in LEFT_ALONE]
-    _finish(rec, profile, args or {})
+    _finish(rec, profile, args or {}, env or {})
     return rec
 
 
@@ -433,22 +459,26 @@ def _context_note(rec: Recommendation, profile: Profile, util: float, total: int
 def _quantisation(rec: Recommendation, profile: Profile) -> None:
     """Two checkpoint shapes that load and then fail, both present in this cache.
 
-    Neither is a configuration problem — no flag rescues either — so they are
-    said before a launch rather than discovered from an abort partway through
-    weight loading.
+    Both are discovered minutes in, after every shard has been read, so both are
+    said here instead. They differ in what can be done about them: the first has
+    a fix, and it is an environment variable rather than a flag — which is
+    exactly why it needs saying, since no amount of reading the Serve form
+    reveals a knob that is not in the form.
     """
-    quant = profile.quantization or {}
-    groups = quant.get("config_groups") or {}
-    strategies = {
-        str((group.get("weights") or {}).get("strategy") or "")
-        for group in groups.values() if isinstance(group, dict)
-    }
-
-    if profile.quant_method == "compressed-tensors" and "block" in strategies:
+    if profile.block_scaled_fp8:
+        rec.env.append(EnvSuggestion(
+            "VLLM_USE_DEEP_GEMM", "0",
+            "block-scaled FP8 weights abort this engine in DeepGEMM's warmup, and this is the "
+            "switch vLLM's own message names"))
         rec.findings.append(Finding("warn", (
-            "These are FP8 block-quantised weights, and block layouts hit a DeepGEMM assertion "
-            "on this GPU in vLLM 0.24 — the engine loads them and then aborts. A per-channel or "
-            "per-tensor FP8 build of the same model avoids it, as does the unquantised one.")))
+            "These are FP8 block-scaled weights, and DeepGEMM owns that path on Blackwell. vLLM "
+            "auto-disables DeepGemm for the layers here and builds them for CUTLASS instead, but "
+            "the kernel warmup is gated on VLLM_USE_DEEP_GEMM alone and does not hear about it — "
+            "so it hands the CUTLASS scale layout back to DeepGEMM and the engine dies on "
+            "\"Unknown recipe\" after the whole checkpoint has been read. Set "
+            "VLLM_USE_DEEP_GEMM=0 under Environment. It costs nothing at run time, because the "
+            "layers were not using DeepGEMM anyway, and it skips a warmup that vLLM's own source "
+            "says adds a couple of minutes to startup.")))
 
     # No ignore-list clause here, and that is deliberate. ModelOpt never
     # quantises embed_tokens — get_quant_method returns None for a
@@ -569,7 +599,8 @@ def _existing(rec: Recommendation, args: dict[str, Any]) -> None:
         rec.findings.append(Finding("warn", warning))
 
 
-def _finish(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None:
+def _finish(rec: Recommendation, profile: Profile, args: dict[str, Any],
+            env: dict[str, Any] | None = None) -> None:
     worst = "ok"
     for finding in rec.findings:
         if finding.level == "block":
@@ -578,11 +609,16 @@ def _finish(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None
             worst = "warn"
     rec.level = worst
 
+    env = env or {}
     changes = [s for s in rec.suggestions if args.get(s.dest) != s.value]
+    # An environment variable is named the way it is typed, not as a flag, so
+    # the operator can find it in the Environment box rather than hunting the
+    # ~190 flags for something that was never there.
+    env_changes = [e for e in rec.env if str(env.get(e.name, "")) != e.value]
     if not rec.headline:
-        if not changes:
+        if not (changes or env_changes):
             rec.headline = "Already configured to start."
         else:
-            names = ", ".join(vllm_spec.by_dest().get(s.dest, {}).get("flag", s.dest)
-                              for s in changes)
-            rec.headline = f"Set {names} and it should start on the first try."
+            names = [vllm_spec.by_dest().get(s.dest, {}).get("flag", s.dest) for s in changes]
+            names += [f"{e.name}={e.value}" for e in env_changes]
+            rec.headline = f"Set {', '.join(names)} and it should start on the first try."

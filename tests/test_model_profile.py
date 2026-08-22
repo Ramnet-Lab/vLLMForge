@@ -410,3 +410,42 @@ def test_a_custom_sampler_architecture_is_flagged(cache, monkeypatch):
 
     cache("org/plain", {"config.json": LLAMA})
     assert model_profile.read("org/plain").custom_sampler is False
+
+
+def test_block_scaled_fp8_is_read_under_both_spellings(cache):
+    """The same scale layout, and the same DeepGEMM path, written two ways: a
+    plain fp8 checkpoint names weight_block_size, compressed-tensors names a
+    per-group strategy. Qwen3.8-27B-FP8 is the first spelling and was missed by
+    a rule that only knew the second."""
+    cache("qwen/blocked", {"config.json": {**LLAMA, "quantization_config": {
+        "quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}}})
+    assert model_profile.read("qwen/blocked").block_scaled_fp8 is True
+
+    cache("org/ct-blocked", {"config.json": {**LLAMA, "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"g": {"weights": {"strategy": "block",
+                                            "block_structure": [128, 128]}}}}}})
+    assert model_profile.read("org/ct-blocked").block_scaled_fp8 is True
+
+
+def test_scales_that_are_not_per_block_fp8_are_not_claimed(cache):
+    """Turning DeepGEMM off costs throughput on the checkpoints it serves
+    correctly, so this has to be the narrow answer rather than the safe one."""
+    cache("org/per-tensor", {"config.json": {**LLAMA, "quantization_config": {
+        "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic"}}})
+    assert model_profile.read("org/per-tensor").block_scaled_fp8 is False
+
+    cache("org/channel", {"config.json": {**LLAMA, "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"g": {"weights": {"strategy": "channel", "num_bits": 8}}}}}})
+    assert model_profile.read("org/channel").block_scaled_fp8 is False
+
+    # Block is not exclusive to FP8, and a block-scaled int4 checkpoint fails in
+    # its own way rather than this one.
+    cache("org/int4-block", {"config.json": {**LLAMA, "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"g": {"weights": {"strategy": "block", "num_bits": 4}}}}}})
+    assert model_profile.read("org/int4-block").block_scaled_fp8 is False
+
+    cache("org/unquantised", {"config.json": LLAMA})
+    assert model_profile.read("org/unquantised").block_scaled_fp8 is False

@@ -125,6 +125,13 @@ class Profile:
     rope_theta: float | None = None
     quantization: dict[str, Any] | None = None
     quant_method: str = ""
+    block_scaled_fp8: bool = False
+    """FP8 weights whose scales are per block rather than per tensor or channel.
+
+    Two spellings reach the same kernel: a plain `fp8` checkpoint says so with
+    `weight_block_size`, and compressed-tensors says it per group with a weights
+    strategy of `block`. Worth a field of its own because DeepGEMM owns the
+    block path on Blackwell, and that is where these checkpoints come apart."""
     num_hidden_layers: int | None = None
     hidden_size: int | None = None
     num_attention_heads: int | None = None
@@ -564,10 +571,40 @@ def _read_config(profile: Profile, snapshot: Snapshot) -> None:
         profile.quantization = quant
         profile.quant_method = str(
             quant.get("quant_method") or quant.get("format") or "").lower()
+        profile.block_scaled_fp8 = _block_scaled_fp8(quant)
 
     # transformers loads modelling code from the repo when config.json maps it,
     # and vLLM will not do that without being told it may.
     profile.requires_remote_code = bool(raw.get("auto_map") or text.get("auto_map"))
+
+
+def _block_scaled_fp8(quant: dict[str, Any]) -> bool:
+    """Whether the weights carry per-block FP8 scales, under either spelling.
+
+    A plain fp8 checkpoint declares `weight_block_size: [128, 128]`;
+    compressed-tensors declares it per group, as a weights strategy of `block`.
+    The two produce the same scale layout and the same kernel selection.
+
+    A group that names a width other than 8 bits is not this: the block
+    strategy is not exclusive to FP8, and a block-scaled int4 checkpoint fails
+    in its own way rather than this one. A group that names no width at all is
+    taken as FP8, which is what every such checkpoint on this box is.
+    """
+    if quant.get("weight_block_size"):
+        return True
+    groups = quant.get("config_groups") or {}
+    if not isinstance(groups, dict):
+        return False
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        weights = group.get("weights") or {}
+        if str(weights.get("strategy") or "").lower() != "block":
+            continue
+        bits = weights.get("num_bits")
+        if bits is None or _int(bits) == 8:
+            return True
+    return False
 
 
 def _rope_kind(rope: dict[str, Any] | None) -> str:
