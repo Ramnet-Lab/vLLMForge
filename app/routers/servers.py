@@ -115,6 +115,24 @@ async def suggest() -> dict:
     return {"port": await asyncio.to_thread(svc.suggest_port), "image": settings.vllm_image}
 
 
+@router.post("/recommend")
+async def recommend(payload: dict) -> dict:
+    """Which of the ~190 flags to set for this model on this node, and why.
+
+    A POST because the current argument set is part of the question: a
+    recommendation says what to change, and that depends on what is already set.
+    """
+    from app import recommend as recommender
+
+    args = payload.get("args")
+    result = await recommender.build(
+        str(payload.get("model") or ""),
+        str(payload.get("node") or ""),
+        args if isinstance(args, dict) else None,
+    )
+    return result.to_dict()
+
+
 @router.get("/profile")
 async def profile(model: str = Query(""), node: str = Query("")) -> dict:
     """What the files beside a model's weights say it is.
