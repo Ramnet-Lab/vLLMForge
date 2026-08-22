@@ -218,12 +218,15 @@ async def test_the_plan_reports_a_model_missing_from_a_node(monkeypatch):
     try:
         nodes.add("peer-y", address="10.0.0.2")
         result = await cluster.plan(["local", "peer-y"], "org/model")
-        assert not result["ok"]
+        # A model missing from a node is work, not a refusal: the launch copies
+        # it over the cluster link before starting the engine. The plan has to
+        # say which nodes need it and that it will be handled.
+        assert result["ok"], "a missing model must not block the plan"
         assert result["missing_model_on"] == ["peer-y"]
-        assert "not cached on" in result["reason"]
+        assert "will be copied to peer-y" in result["will_sync"]
 
         clean = await cluster.plan(["local", "peer-y"], "")
-        assert clean["ok"], "with no model named there is nothing to be missing"
+        assert clean["ok"] and not clean["will_sync"]
     finally:
         db.set_setting("nodes", previous)
 

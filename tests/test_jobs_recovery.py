@@ -32,7 +32,7 @@ def orphan():
 
 @pytest.mark.asyncio
 async def test_a_job_whose_container_vanished_is_marked_failed(orphan, monkeypatch):
-    async def gone(name):
+    async def gone(name, host=None):
         return docker_ctl.ContainerState(name=name, exists=False)
 
     monkeypatch.setattr(jobs.docker_ctl, "state", gone)
@@ -48,7 +48,7 @@ async def test_a_job_whose_container_vanished_is_marked_failed(orphan, monkeypat
 async def test_a_still_running_container_is_reattached_not_restarted(orphan, monkeypatch):
     started = asyncio.Event()
 
-    async def alive(name):
+    async def alive(name, host=None):
         return docker_ctl.ContainerState(
             name=name, exists=True, status="running", running=True, command=["true"]
         )
@@ -82,7 +82,7 @@ async def test_a_still_running_container_is_reattached_not_restarted(orphan, mon
 async def test_reattach_resumes_from_where_the_log_stopped(orphan, monkeypatch):
     asked: dict = {}
 
-    async def alive(name):
+    async def alive(name, host=None):
         return docker_ctl.ContainerState(
             name=name, exists=True, status="running", running=True, command=["true"]
         )
