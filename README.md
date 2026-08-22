@@ -83,9 +83,15 @@ reattaches to their logs when it comes back.
 
 ## Requirements
 
+`BUILD.sh` installs the first two of these for you; the rest are yours.
+
 * Linux with a working `docker` (no sudo required, but your user must be able to
   talk to the daemon) and an NVIDIA runtime.
 * Python 3.11 or newer on the host. 3.12 is what this runs on.
+* An NVIDIA driver, if you want to serve or train. `BUILD.sh` installs the
+  container toolkit but not the driver — that is distribution-specific and
+  usually wants a reboot. Everything else, including the whole UI and model
+  downloads, works on a machine with no GPU at all.
 * The vLLM container image, `nvcr.io/nvidia/vllm:26.07-py3` by default. It is
   about 22 GB; pull it before you start if you have not already.
 * `nvidia-smi` for GPU telemetry. Without it the dashboard still works and the
@@ -98,12 +104,46 @@ tell you how much memory the *other* models are holding.
 
 ## Install
 
+On a machine that has nothing yet:
+
 ```bash
 git clone <this repo> ~/llm_dashboard
 cd ~/llm_dashboard
-cp .env.example .env        # optional; every value has a default
-scripts/setup.sh
+./BUILD.sh
 ```
+
+`BUILD.sh` is the entry point. It asks for your password once, then installs
+what the application cannot install for itself — python and its venv module,
+docker, and the NVIDIA container toolkit if this machine has an NVIDIA GPU —
+puts you in the `docker` group so docker needs no sudo, and hands over to
+`scripts/setup.sh` and `scripts/install-service.sh`.
+
+It is safe to re-run: a second run reports that there is nothing to do.
+
+```
+  -y, --yes         never prompt (required when there is no terminal)
+      --with-images build the worker images now; they sit on a ~22 GB base
+                    image, so this stays opt-in even under --yes
+      --no-service  do not install the systemd user service
+      --no-gpu      skip the NVIDIA container toolkit
+      --no-sudoers  do not write the passwordless-docker sudoers rule
+      --dev         also install pytest and ruff
+```
+
+Two things it does that are worth knowing about. It adds you to the `docker`
+group, and it writes `/etc/sudoers.d/99-llmd-docker` so `sudo docker` does not
+prompt. **Both are equivalent to passwordless root** — anyone who can start a
+container can bind-mount `/` — so the sudoers rule grants nothing the group
+membership did not already. `--no-sudoers` skips the file; removing it later is
+`sudo rm /etc/sudoers.d/99-llmd-docker`.
+
+It never reinstalls a docker that already works. On some machines — the DGX line
+included — docker comes from a vendor repository that apt pins above Docker's
+own, where "just reinstall it to be sure" is a confusing no-op at best.
+
+If you would rather install the system parts yourself, skip `BUILD.sh` and run
+`scripts/setup.sh` directly; it needs only python 3.11+ and, for the container
+features, a working docker.
 
 `scripts/setup.sh` creates `.venv`, installs the dependencies with
 `--only-binary=:all:` so nothing compiles, creates the state, output and dataset
