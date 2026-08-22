@@ -234,7 +234,7 @@ function renderModelPicker() {
     type: 'text',
     list: 'heretic-model-ids',
     value: known ? '' : current,
-    placeholder: 'Qwen/Qwen3-4B-Instruct-2507 or /home/user/models/outputs/…',
+    placeholder: 'Qwen/Qwen3-4B-Instruct-2507 or a path under the outputs directory',
     onInput: (event) => {
       view.config.model = event.target.value.trim();
       modelHint(hint);

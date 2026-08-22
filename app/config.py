@@ -47,13 +47,13 @@ class Settings:
         default_factory=lambda: _env_path("LLMD_STATE_DIR", "~/.local/share/llm-dashboard")
     )
     hf_cache: Path = field(
-        default_factory=lambda: _env_path("LLMD_HF_CACHE", "/home/user/models/hf-cache")
+        default_factory=lambda: _env_path("LLMD_HF_CACHE", "~/models/hf-cache")
     )
     output_dir: Path = field(
-        default_factory=lambda: _env_path("LLMD_OUTPUT_DIR", "/home/user/models/outputs")
+        default_factory=lambda: _env_path("LLMD_OUTPUT_DIR", "~/models/outputs")
     )
     dataset_dir: Path = field(
-        default_factory=lambda: _env_path("LLMD_DATASET_DIR", "/home/user/models/datasets")
+        default_factory=lambda: _env_path("LLMD_DATASET_DIR", "~/models/datasets")
     )
 
     # --- container images -------------------------------------------------

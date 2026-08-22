@@ -174,9 +174,9 @@ so a `.env` value will not reach a process you launch by hand with
 | `LLMD_HOST` | `0.0.0.0` | Interface the web server binds. There is no authentication. |
 | `LLMD_PORT` | `8700` | Web server port. |
 | `LLMD_STATE_DIR` | `~/.local/share/llm-dashboard` | Database, job logs, uploads. |
-| `LLMD_HF_CACHE` | `/home/user/models/hf-cache` | Shared HuggingFace cache, mounted into every container at `/hf`. |
-| `LLMD_OUTPUT_DIR` | `/home/user/models/outputs` | Job artefacts: fine-tunes, Heretic exports. Mounted into server containers at `/outputs`. |
-| `LLMD_DATASET_DIR` | `/home/user/models/datasets` | Uploaded training data. |
+| `LLMD_HF_CACHE` | `~/models/hf-cache` | Shared HuggingFace cache, mounted into every container at `/hf`. |
+| `LLMD_OUTPUT_DIR` | `~/models/outputs` | Job artefacts: fine-tunes, Heretic exports. Mounted into server containers at `/outputs`. |
+| `LLMD_DATASET_DIR` | `~/models/datasets` | Uploaded training data. |
 | `LLMD_VLLM_IMAGE` | `nvcr.io/nvidia/vllm:26.07-py3` | Image used for serving, downloads, and as the base for the two worker images. |
 | `LLMD_HERETIC_IMAGE` | `llmd/heretic:latest` | Tag the Heretic tab builds and runs. |
 | `LLMD_FINETUNE_IMAGE` | `llmd/finetune:latest` | Tag the fine-tuning tab builds and runs. |
@@ -198,7 +198,7 @@ detached `docker run` that the dashboard shows you in full before it happens:
 ```
 docker run --name llmd-vllm-3 -d --runtime nvidia --gpus all \
   --network host --ipc host --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v /home/user/models/hf-cache:/hf -v /home/user/models/outputs:/outputs \
+  -v ~/models/hf-cache:/hf -v ~/models/outputs:/outputs \
   -e HF_HOME=/hf -e NCCL_SOCKET_IFNAME=enp1s0f0np0 ... \
   nvcr.io/nvidia/vllm:26.07-py3 \
   vllm serve unsloth/Qwen3.8-27B-NVFP4 --host 0.0.0.0 --port 8010 \
@@ -213,7 +213,7 @@ mapping to get wrong, and the port you choose in the form is the port you curl.
 The dashboard suggests a free one from 8010 upward, avoiding its own port and
 the usual suspects.
 
-**The shared cache.** `/home/user/models/hf-cache` is mounted at `/hf` with
+**The shared cache.** `~/models/hf-cache` is mounted at `/hf` with
 `HF_HOME` pointing at it, so every container — servers, downloads, fine-tunes,
 Heretic — reads and writes the same blobs and a model is downloaded once. The
 cache tree is root-owned: the host user can read it, which is why cache listing
@@ -289,9 +289,9 @@ optional version pins (`UNSLOTH_VERSION`, `TRL_VERSION`, …); unpinned means
 | `~/.local/share/llm-dashboard/dashboard.db` | SQLite: server definitions, jobs, chat transcripts, presets, datasets, settings. |
 | `~/.local/share/llm-dashboard/logs/<job_id>.log` | Full output of every job, kept after it finishes. |
 | `~/.local/share/llm-dashboard/uploads/` | Uploaded files staged by the UI. |
-| `/home/user/models/hf-cache/` | Shared HuggingFace cache. Root-owned; written only from containers. |
-| `/home/user/models/outputs/<name>-<job_id>/` | One directory per job: config, checkpoints, and the exported model or adapter. |
-| `/home/user/models/datasets/` | Uploaded JSONL training sets. |
+| `~/models/hf-cache/` | Shared HuggingFace cache. Root-owned; written only from containers. |
+| `~/models/outputs/<name>-<job_id>/` | One directory per job: config, checkpoints, and the exported model or adapter. |
+| `~/models/datasets/` | Uploaded JSONL training sets. |
 | `app/data/vllm_args.json` | Generated vLLM flag schema. Checked in. |
 | `app/data/sampling_params.json` | Generated sampling-parameter schema, used as a fallback. Checked in. |
 
