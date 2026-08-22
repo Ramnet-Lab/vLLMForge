@@ -263,23 +263,29 @@ async def test_fp8_block_weights_are_flagged_for_this_gpu(box):
 
 
 @pytest.mark.anyio
-async def test_a_quantised_tied_embedding_is_flagged_unless_it_is_exempt(box):
-    """model.embed_vision* is a different tensor; matching 'embed' loosely would
-    silence a real warning, and matching nothing would raise a false one."""
+async def test_a_modelopt_checkpoint_with_tied_embeddings_always_warns(box):
+    """The ignore list is not an escape hatch. ModelOpt never quantises
+    embed_tokens; the object that raises is lm_head, and excluding it does not
+    help — an excluded ParallelLMHead gets UnquantizedLinearMethod, which lacks
+    tie_weights exactly as the quantised method does. Treating the ignore list
+    as an exemption would stay silent on a checkpoint that still fails."""
     place, mp = box
     base = dict(found=True, architectures=["LlamaForCausalLM"], quant_method="modelopt",
                 tie_word_embeddings=True, weight_bytes=30 * GIB, has_safetensors=True,
                 chat_template=True, supported=True)
 
-    place(mp.Profile(reference="org/tied", **base,
-                     quantization={"ignore": ["model.embed_vision*", "re:.*vision.*"]}))
-    flagged = (await recommend.build("org/tied")).to_dict()
-    assert any("tied input embedding" in f["text"] for f in flagged["findings"])
+    for ignore in (["model.embed_vision*"], ["lm_head", "model.embed_vision*"],
+                   ["re:.*embed_tokens.*"], []):
+        place(mp.Profile(reference="org/tied", **base, quantization={"ignore": ignore}))
+        rec = (await recommend.build("org/tied")).to_dict()
+        assert any("ties lm_head" in f["text"] for f in rec["findings"]), ignore
 
-    place(mp.Profile(reference="org/exempt", **base,
-                     quantization={"ignore": ["lm_head", "model.embed_vision*"]}))
-    clean = (await recommend.build("org/exempt")).to_dict()
-    assert not any("tied input embedding" in f["text"] for f in clean["findings"])
+    # A compressed-tensors build of the same model is fine: its excluded lm_head
+    # falls through to the unquantised embedding method, which does tie.
+    place(mp.Profile(reference="org/ct", **{**base, "quant_method": "compressed-tensors"},
+                     quantization={"ignore": ["lm_head"]}))
+    clean = (await recommend.build("org/ct")).to_dict()
+    assert not any("ties lm_head" in f["text"] for f in clean["findings"])
 
 
 @pytest.mark.anyio
@@ -324,6 +330,21 @@ async def test_a_qwen3_xml_template_is_recognised(box):
     rec = (await recommend.build("org/q")).to_dict()
     assert rec["args"]["tool_call_parser"] == "qwen3_xml"
     assert rec["args"]["reasoning_parser"] == "qwen3"
+
+
+@pytest.mark.anyio
+async def test_the_same_three_tokens_do_not_make_every_model_qwen3(box):
+    """step3p5's parser reads <tool_call>, <function= and <parameter= too, so the
+    three-token lock alone picks the wrong engine — silently. The model family
+    is what disambiguates."""
+    place, mp = box
+    place(mp.Profile(reference="org/s", found=True, architectures=["Step3p5ForCausalLM"],
+                     model_type="step3p5", weight_bytes=20 * GIB, has_safetensors=True,
+                     chat_template=True,
+                     template_markers=["<tool_call>", "<function=", "<parameter="],
+                     supported=True))
+    rec = (await recommend.build("org/s")).to_dict()
+    assert "tool_call_parser" not in rec["args"]
 
 
 @pytest.mark.anyio

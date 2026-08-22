@@ -1713,7 +1713,8 @@ function renderProfile(options = {}) {
       ? notice('warn',
         h('strong', null, 'This serves embeddings, not chat. '),
         h('span', null, `vLLM will run it as a pooling model: ${profile.runner_reason}. `
-          + '/v1/embeddings works, /v1/chat/completions will refuse.'))
+          + '/v1/embeddings works; /v1/chat/completions is never registered, so the route '
+          + 'does not exist and the Playground cannot talk to it.'))
       : null,
     (profile.notes || []).length
       ? h('p', { class: 'ov-note' }, profile.notes.join(' · '))

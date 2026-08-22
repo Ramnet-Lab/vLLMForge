@@ -315,18 +315,20 @@ def _quantisation(rec: Recommendation, profile: Profile) -> None:
             "on this GPU in vLLM 0.24 — the engine loads them and then aborts. A per-channel or "
             "per-tensor FP8 build of the same model avoids it, as does the unquantised one.")))
 
+    # No ignore-list clause here, and that is deliberate. ModelOpt never
+    # quantises embed_tokens — get_quant_method returns None for a
+    # VocabParallelEmbedding, which becomes UnquantizedEmbeddingMethod and does
+    # implement tie_weights. The object that raises is lm_head, and excluding it
+    # does not help: an excluded ParallelLMHead gets UnquantizedLinearMethod,
+    # which lacks tie_weights just as the quantised method does. Treating the
+    # ignore list as an escape hatch would silence a checkpoint that still fails.
     if profile.quant_method == "modelopt" and profile.tie_word_embeddings:
-        # The tied pair is embed_tokens and lm_head; an entry naming either
-        # exempts it. `model.embed_vision*` does not — that is a different
-        # tensor, and matching it loosely would silence a real warning.
-        exempted = any(
-            "embed_tokens" in str(entry) or "lm_head" in str(entry)
-            for entry in (quant.get("ignore") or []))
-        if not exempted:
-            rec.findings.append(Finding("warn", (
-                "This checkpoint quantises a tied input embedding, which this build cannot "
-                "untie — model construction raises NotImplementedError. The unquantised base "
-                "model, or a checkpoint whose ignore list exempts embed_tokens, loads.")))
+        rec.findings.append(Finding("warn", (
+            "This ModelOpt checkpoint ties lm_head to the input embedding, and no ModelOpt "
+            "quantisation method implements tie_weights — construction raises "
+            "NotImplementedError before any weights are read. A compressed-tensors build of the "
+            "same model works, because its excluded lm_head falls through to the unquantised "
+            "embedding method, which does implement it. So does the unquantised base model.")))
 
 
 def _loading(rec: Recommendation, profile: Profile) -> None:
@@ -364,7 +366,10 @@ def _parsers(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> Non
     tool = ""
     if "<|tool_call>" in markers:
         tool = "gemma4"
-    elif {"<tool_call>", "<function=", "<parameter="} <= markers:
+    elif ({"<tool_call>", "<function=", "<parameter="} <= markers
+            and profile.model_type.startswith("qwen3")):
+        # step3p5's parser reads the same three tokens, so the three-token lock
+        # alone does not identify qwen3 — the model family is what disambiguates.
         tool = "qwen3_xml"
 
     if tool and not args.get("tool_call_parser"):
@@ -403,7 +408,8 @@ def _serving(rec: Recommendation, profile: Profile) -> None:
     if profile.runner == "pooling":
         rec.findings.append(Finding("warn", (
             f"This will serve embeddings, not chat: {profile.runner_reason}. /v1/embeddings "
-            "works; /v1/chat/completions refuses.")))
+            "works; /v1/chat/completions is never registered, so the route does not exist and "
+            "the Playground cannot talk to it.")))
         return
 
     if not profile.chat_template:
