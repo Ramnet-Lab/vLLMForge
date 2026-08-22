@@ -1508,7 +1508,7 @@ async function loadProfile() {
   const model = String(editor.form.model || '').trim();
   // A pooled engine reads the model from its head, which is the first node.
   const node = editor.form.pooled ? (editor.form.pool[0] || LOCAL) : editor.form.node;
-  const key = `${node}\u0000${model}`;
+  const key = `${node}\u0000${model}\u0000${editor.form.pooled ? editor.form.pool.join(',') : ''}`;
   if (key === editor.profileFor) return;
 
   editor.profileFor = key;
@@ -1522,7 +1522,10 @@ async function loadProfile() {
   try {
     // The recommendation carries the profile it was built from, so one call
     // answers both "what is this" and "what should it be set to".
-    const rec = await post('/servers/recommend', { model, node, args: { ...editor.args } });
+    const rec = await post('/servers/recommend', {
+      model, node, args: { ...editor.args },
+      pool: editor.form.pooled ? editor.form.pool : [],
+    });
     if (state.mode !== 'edit' || !state.editor || state.editor.profileFor !== key) return;
     state.editor.profile = rec.profile;
     state.editor.rec = rec;

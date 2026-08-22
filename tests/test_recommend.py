@@ -382,3 +382,33 @@ async def test_a_parser_set_without_auto_tool_choice_is_called_out(box):
                      supported=True))
     rec = (await recommend.build("org/m", "", {"tool_call_parser": "hermes"})).to_dict()
     assert any("ignored unless" in f["text"] for f in rec["findings"])
+
+
+@pytest.mark.anyio
+async def test_pooling_a_model_that_fits_on_one_machine_is_questioned(box):
+    """Pooling costs a network hop per token, an engine that aborts if either
+    node drops, and the pipeline-parallel code paths — a class of failure a
+    single-machine launch never meets."""
+    place, mp = box
+    place(mp.Profile(reference="org/m", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=131072, num_hidden_layers=32,
+                     num_key_value_heads=8, head_dim=128, weight_bytes=48 * GIB,
+                     has_safetensors=True, chat_template=True, supported=True))
+
+    alone = (await recommend.build("org/m", "", {}, [])).to_dict()
+    assert not any("does not need" in f["text"] for f in alone["findings"])
+
+    spread = (await recommend.build("org/m", "", {}, ["local", "node2"])).to_dict()
+    assert any("does not need 2 machines" in f["text"] for f in spread["findings"])
+
+
+@pytest.mark.anyio
+async def test_pooling_a_model_that_does_not_fit_is_left_alone(box):
+    """When it genuinely does not fit, spreading it is the whole point."""
+    place, mp = box
+    place(mp.Profile(reference="org/huge", found=True, architectures=["LlamaForCausalLM"],
+                     max_position_embeddings=131072, num_hidden_layers=60,
+                     num_key_value_heads=16, head_dim=256, weight_bytes=90 * GIB,
+                     has_safetensors=True, chat_template=True, supported=True))
+    spread = (await recommend.build("org/huge", "", {}, ["local", "node2"])).to_dict()
+    assert not any("does not need" in f["text"] for f in spread["findings"])

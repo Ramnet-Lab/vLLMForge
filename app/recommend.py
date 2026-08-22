@@ -158,7 +158,8 @@ def safe_utilisation(total_bytes: int, available_bytes: int, budget_free_util: f
     return math.floor(allowed * 100) / 100
 
 
-async def build(model: str, node: str = "", args: dict[str, Any] | None = None) -> Recommendation:
+async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
+                pool: list[str] | None = None) -> Recommendation:
     """What to set for this model on this node, and what stands in the way."""
     from app import nodes
 
@@ -182,6 +183,8 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None) 
     _blockers(rec, profile, available)
     if not rec.ok:
         return rec
+
+    _placement(rec, profile, total, available, pool or [])
 
     # The memory advice is about this machine and holds whether or not the model
     # is here yet. Everything else is read from files, so with no files there is
@@ -236,6 +239,31 @@ def _blockers(rec: Recommendation, profile: Profile, available: int) -> None:
             f"{_gib(profile.weight_bytes)} of weights against {_gib(available)} free. No "
             "--gpu-memory-utilization serves it on this node right now — stop something, or "
             "pool it across machines.")))
+
+
+def _placement(rec: Recommendation, profile: Profile, total: int, available: int,
+               pool: list[str]) -> None:
+    """Whether spreading this across machines is buying anything.
+
+    Pooling is not free and it is not merely slower: it costs a network hop per
+    token per stage boundary, it fixes the world size so losing a node aborts
+    the engine, and it runs pipeline-parallel code paths a single-node launch
+    never touches — which is its own source of failures. A model that fits on
+    one box should stay on one box.
+    """
+    if len(pool) < 2 or not profile.weight_bytes:
+        return
+    overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
+    kv = profile.kv_bytes(min(profile.max_position_embeddings or TARGET_CONTEXT,
+                              TARGET_CONTEXT)) or 0
+    wanted = profile.weight_bytes + overhead + CONCURRENCY * kv
+    if wanted <= available:
+        rec.findings.append(Finding("warn", (
+            f"This does not need {len(pool)} machines. {_gib(profile.weight_bytes)} of weights "
+            f"and its cache want about {_gib(wanted)}, and {_gib(available)} is free on one — so "
+            "pooling buys nothing and costs a network hop per token, an engine that aborts if "
+            "either node drops, and the pipeline-parallel paths, which is a class of failure a "
+            "single-machine launch never meets.")))
 
 
 def _memory(rec: Recommendation, profile: Profile, total: int, available: int,
