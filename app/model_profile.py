@@ -45,6 +45,30 @@ MAX_TEMPLATE_BYTES = 1 * 1024 * 1024
 # it is the order vLLM and transformers look in.
 TEMPLATE_FILES = ("chat_template.jinja", "chat_template.json")
 
+# Markers that identify which parser a template expects. vLLM picks its tool
+# and reasoning parsers by name, and the name is not written down anywhere in
+# the repo — but the tokens the template emits are, and each parser keys on its
+# own. Only the presence of these is recorded; the template body never leaves
+# the disk read.
+TEMPLATE_MARKERS = (
+    "<|tool_call>",              # gemma4 tool calls
+    "<tool_call>",               # hermes / qwen3 family
+    "<function=",                # qwen3 xml
+    "<parameter=",               # qwen3 xml
+    "[TOOL_CALLS]",              # mistral
+    "<|python_tag|>",            # llama3 json
+    "<|tool_call|>",             # granite
+    "<tool_calls>",              # jamba
+    "<|tool_calls_section_begin|>",  # kimi k2
+    "<|channel>",                # gemma4 reasoning
+    "<think>",
+    "</think>",
+    "<seed:think>",
+    "<mm:think>",
+    "<|START_THINKING|>",
+    "if not enable_thinking",    # the template hides reasoning unless asked
+)
+
 # A repo with any of these is doing more than text.
 MULTIMODAL_FILES = ("preprocessor_config.json", "processor_config.json",
                     "image_processor_config.json", "video_preprocessor_config.json")
@@ -140,6 +164,8 @@ class Profile:
     chat_template: bool = False
     chat_template_source: str = ""
     """`tokenizer_config.json`, a file name, or empty when there is none."""
+    template_markers: list[str] = field(default_factory=list)
+    """Which of TEMPLATE_MARKERS the template contains. What a parser keys on."""
     eos_token: str = ""
     bos_token: str = ""
 
@@ -640,6 +666,15 @@ def _read_tokenizer(profile: Profile, snapshot: Snapshot) -> None:
                 profile.chat_template = True
                 profile.chat_template_source = name
                 break
+
+    if profile.chat_template:
+        body = ""
+        if profile.chat_template_source == "tokenizer_config.json":
+            body = str(raw.get("chat_template") or "")
+        else:
+            body = snapshot.texts.get(profile.chat_template_source, "")
+        if body:
+            profile.template_markers = [m for m in TEMPLATE_MARKERS if m in body]
 
     if not raw and not profile.is_adapter:
         profile.notes.append("no tokenizer_config.json — the tokenizer may not resolve")

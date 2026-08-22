@@ -36,6 +36,23 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 parser = make_arg_parser(FlexibleArgumentParser())
 
+# Two flags whose values are validated by a registry rather than by argparse:
+# a name the build does not register raises KeyError inside the API server,
+# after the container has started and before it serves anything. Folding the
+# registry in as `choices` turns the form's free-text box into a picker and
+# lets the dashboard's own validator catch a typo at save.
+registries = {}
+try:
+    from vllm.tool_parsers import ToolParserManager
+    registries["tool_call_parser"] = sorted(ToolParserManager.list_registered())
+except Exception:
+    pass
+try:
+    from vllm.reasoning import ReasoningParserManager
+    registries["reasoning_parser"] = sorted(ReasoningParserManager.list_registered())
+except Exception:
+    pass
+
 group_of = {}
 for group in parser._action_groups:
     for action in group._group_actions:
@@ -61,7 +78,8 @@ for action in parser._actions:
         "type": getattr(action.type, "__name__", None),
         "nargs": action.nargs,
         "default": jsonable(action.default),
-        "choices": [str(c) for c in action.choices] if action.choices else None,
+        "choices": ([str(c) for c in action.choices] if action.choices
+                    else registries.get(action.dest)),
         "action": kind,
         "group": group_of.get(id(action), "options"),
         "required": bool(action.required),

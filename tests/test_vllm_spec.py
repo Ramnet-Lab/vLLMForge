@@ -103,3 +103,32 @@ def test_size_values_survive_validation_and_rendering():
 def test_a_size_flag_still_rejects_nonsense():
     problems = vllm_spec.validate({"max_model_len": "as long as possible"})
     assert problems and "--max-model-len" in problems[0]
+
+
+def test_auto_tool_choice_without_a_parser_is_refused():
+    """vLLM's own argument validator raises before the model is read, so the
+    container is gone in seconds — which from the dashboard looks exactly like
+    a launch that failed for a memory reason."""
+    problems = vllm_spec.validate({"enable_auto_tool_choice": True})
+    assert problems and "needs --tool-call-parser" in problems[0]
+    assert vllm_spec.validate(
+        {"enable_auto_tool_choice": True, "tool_call_parser": "hermes"}) == []
+
+
+def test_parser_names_are_checked_against_this_build():
+    """The registries are extracted from the image, so a typo is caught at save
+    rather than by a KeyError inside the API server after it has started."""
+    assert vllm_spec.validate({"tool_call_parser": "hermes",
+                               "enable_auto_tool_choice": True}) == []
+    bad = vllm_spec.validate({"tool_call_parser": "hermez", "enable_auto_tool_choice": True})
+    assert bad and "hermez" in bad[0]
+    assert vllm_spec.validate({"reasoning_parser": "qwen3"}) == []
+    assert vllm_spec.validate({"reasoning_parser": "qwen4"})
+
+
+def test_a_parser_without_auto_tool_choice_warns_rather_than_blocks():
+    assert vllm_spec.validate({"tool_call_parser": "hermes"}) == []
+    warnings = vllm_spec.cross_flag_warnings({"tool_call_parser": "hermes"})
+    assert warnings and "ignored unless" in warnings[0]
+    assert vllm_spec.cross_flag_warnings(
+        {"tool_call_parser": "hermes", "enable_auto_tool_choice": True}) == []

@@ -340,7 +340,41 @@ def validate(params: dict[str, Any]) -> list[str]:
                 json.loads(value)
             except ValueError:
                 problems.append(f"{arg['flag']}: not valid JSON")
+    problems.extend(_cross_flag_problems(params))
     return problems
+
+
+def _cross_flag_problems(params: dict[str, Any]) -> list[str]:
+    """Combinations that are individually legal and together fatal.
+
+    Each of these is checked by vLLM itself, but only after the container has
+    started — and one of them exits before the model is even read, which looks
+    from the dashboard exactly like a launch that failed for a memory reason.
+    """
+    problems: list[str] = []
+    parser = str(params.get("tool_call_parser") or "").strip()
+    auto_tools = bool(params.get("enable_auto_tool_choice"))
+
+    # vllm/entrypoints/openai/cli_args.py: the argument validator raises before
+    # anything is loaded, so the container is gone in seconds with a TypeError.
+    if auto_tools and not parser:
+        problems.append(
+            "--enable-auto-tool-choice needs --tool-call-parser; without it the container "
+            "exits during argument validation, before the model is read")
+
+    return problems
+
+
+def cross_flag_warnings(params: dict[str, Any]) -> list[str]:
+    """Combinations that are legal, start fine, and do not do what was meant."""
+    warnings: list[str] = []
+    parser = str(params.get("tool_call_parser") or "").strip()
+    if parser and not params.get("enable_auto_tool_choice"):
+        warnings.append(
+            f"--tool-call-parser {parser} is ignored unless --enable-auto-tool-choice is also "
+            "on. vLLM does not validate the name in this state either, so a typo goes unnoticed "
+            "and tool calls come back as ordinary text.")
+    return warnings
 
 
 def gpu_memory_utilization(params: dict[str, Any]) -> float | None:

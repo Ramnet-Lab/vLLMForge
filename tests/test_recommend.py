@@ -292,3 +292,72 @@ async def test_cpu_offload_is_called_out_on_unified_memory(box):
     assert any("frees nothing here" in f["text"] for f in rec["findings"])
     clean = (await recommend.build("org/m", "", {})).to_dict()
     assert not any("frees nothing here" in f["text"] for f in clean["findings"])
+
+
+@pytest.mark.anyio
+async def test_a_gemma_template_names_its_own_parsers(box):
+    """vLLM picks parsers by name, and the name is written down nowhere in the
+    repo — but the tokens the template emits are, and each parser keys on its
+    own. Every gemma4 template in this cache carries these three markers."""
+    place, mp = box
+    place(mp.Profile(reference="org/g", found=True, architectures=["Gemma4ForConditionalGeneration"],
+                     model_type="gemma4", weight_bytes=30 * GIB, has_safetensors=True,
+                     chat_template=True, chat_template_source="chat_template.jinja",
+                     template_markers=["<|tool_call>", "<|channel>", "if not enable_thinking"],
+                     supported=True))
+    rec = (await recommend.build("org/g")).to_dict()
+    assert rec["args"]["tool_call_parser"] == "gemma4"
+    assert rec["args"]["reasoning_parser"] == "gemma4"
+    # A parser without this is silently ignored, and vLLM does not say so.
+    assert rec["args"]["enable_auto_tool_choice"] is True
+    assert any("enable_thinking" in f["text"] for f in rec["findings"])
+
+
+@pytest.mark.anyio
+async def test_a_qwen3_xml_template_is_recognised(box):
+    place, mp = box
+    place(mp.Profile(reference="org/q", found=True, architectures=["Qwen3_5ForConditionalGeneration"],
+                     model_type="qwen3_5", weight_bytes=20 * GIB, has_safetensors=True,
+                     chat_template=True, template_markers=["<tool_call>", "<function=",
+                                                           "<parameter=", "<think>", "</think>"],
+                     supported=True))
+    rec = (await recommend.build("org/q")).to_dict()
+    assert rec["args"]["tool_call_parser"] == "qwen3_xml"
+    assert rec["args"]["reasoning_parser"] == "qwen3"
+
+
+@pytest.mark.anyio
+async def test_an_ambiguous_thinking_template_is_named_not_guessed(box):
+    """<think>/</think> is claimed by five registered parsers that differ in what
+    they do with the tokens. A wrong auto-set parser is worse than none."""
+    place, mp = box
+    place(mp.Profile(reference="org/t", found=True, architectures=["LlamaForCausalLM"],
+                     model_type="llama", weight_bytes=8 * GIB, has_safetensors=True,
+                     chat_template=True, template_markers=["<think>", "</think>"],
+                     supported=True))
+    rec = (await recommend.build("org/t")).to_dict()
+    assert "reasoning_parser" not in rec["args"]
+    assert any("five registered parsers" in f["text"] for f in rec["findings"])
+
+
+@pytest.mark.anyio
+async def test_a_pooling_model_is_offered_no_parsers(box):
+    """It has no chat endpoint to parse anything for."""
+    place, mp = box
+    place(mp.Profile(reference="org/e", found=True, architectures=["Qwen3ForCausalLM"],
+                     runner="pooling", runner_reason="modules.json declares a Pooling module",
+                     weight_bytes=8 * GIB, has_safetensors=True, chat_template=True,
+                     template_markers=["<|tool_call>", "<|channel>"], supported=True))
+    rec = (await recommend.build("org/e")).to_dict()
+    assert "tool_call_parser" not in rec["args"]
+    assert "reasoning_parser" not in rec["args"]
+
+
+@pytest.mark.anyio
+async def test_a_parser_set_without_auto_tool_choice_is_called_out(box):
+    place, mp = box
+    place(mp.Profile(reference="org/m", found=True, architectures=["LlamaForCausalLM"],
+                     weight_bytes=8 * GIB, has_safetensors=True, chat_template=True,
+                     supported=True))
+    rec = (await recommend.build("org/m", "", {"tool_call_parser": "hermes"})).to_dict()
+    assert any("ignored unless" in f["text"] for f in rec["findings"])

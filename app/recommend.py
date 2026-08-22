@@ -192,6 +192,8 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None) 
         _loading(rec, profile)
         _quantisation(rec, profile)
         _serving(rec, profile)
+        if profile.runner != "pooling":
+            _parsers(rec, profile, args or {})
     _existing(rec, args or {})
 
     rec.left_alone = [{"dest": dest, "why": why} for dest, why in LEFT_ALONE]
@@ -346,6 +348,57 @@ def _loading(rec: Recommendation, profile: Profile) -> None:
             "name it guesses often resolves to an embedding server.")))
 
 
+def _parsers(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None:
+    """Which tool and reasoning parser this template expects.
+
+    vLLM picks these by name, and the name is written down nowhere in the repo —
+    but the tokens the template emits are, and each parser keys on its own. Only
+    the unambiguous cases are offered as flags; a bare <think>/</think> is claimed
+    by five parsers that differ in what they do with the tokens, so it is named
+    rather than set.
+    """
+    markers = set(profile.template_markers or [])
+    if not markers:
+        return
+
+    tool = ""
+    if "<|tool_call>" in markers:
+        tool = "gemma4"
+    elif {"<tool_call>", "<function=", "<parameter="} <= markers:
+        tool = "qwen3_xml"
+
+    if tool and not args.get("tool_call_parser"):
+        rec.suggestions.append(Suggestion(
+            "tool_call_parser", tool,
+            f"the template emits the tokens the {tool} parser reads; without it a tool call "
+            "comes back as ordinary text in the reply"))
+        rec.suggestions.append(Suggestion(
+            "enable_auto_tool_choice", True,
+            "the parser is ignored unless this is on, and vLLM does not say so"))
+
+    reasoning = ""
+    if "<|channel>" in markers and profile.model_type == "gemma4":
+        reasoning = "gemma4"
+    elif {"<think>", "</think>"} <= markers and profile.model_type.startswith("qwen3"):
+        reasoning = "qwen3"
+
+    if reasoning and not args.get("reasoning_parser"):
+        rec.suggestions.append(Suggestion(
+            "reasoning_parser", reasoning,
+            "separates the model's thinking from its answer; without it the reasoning arrives "
+            "as part of the reply"))
+    elif {"<think>", "</think>"} <= markers and not args.get("reasoning_parser"):
+        rec.findings.append(Finding("warn", (
+            "The template emits <think>/</think>, which five registered parsers claim and "
+            "handle differently. Pick one under Reasoning rather than guessing here.")))
+
+    if "if not enable_thinking" in markers:
+        rec.findings.append(Finding("warn", (
+            "This template hides the model's reasoning unless the caller passes "
+            'enable_thinking. Set --default-chat-template-kwargs to \'{"enable_thinking": '
+            'true}\' to turn it on for every request.')))
+
+
 def _serving(rec: Recommendation, profile: Profile) -> None:
     if profile.runner == "pooling":
         rec.findings.append(Finding("warn", (
@@ -370,6 +423,9 @@ def _existing(rec: Recommendation, args: dict[str, Any]) -> None:
             "--cpu-offload-gb frees nothing here: GPU memory is host memory on this machine, so "
             "the offloaded weights sit in the same pool, pinned and unreclaimable, and every "
             "forward pass reads them back over the same bus.")))
+
+    for warning in vllm_spec.cross_flag_warnings(args):
+        rec.findings.append(Finding("warn", warning))
 
 
 def _finish(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None:
