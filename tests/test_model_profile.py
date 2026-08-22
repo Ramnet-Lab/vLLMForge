@@ -334,3 +334,60 @@ def test_an_ordinary_causal_model_is_a_generator(cache):
     cache("org/plain", {"config.json": LLAMA})
     profile = model_profile.read("org/plain")
     assert profile.runner == "generate" and profile.runner_reason == ""
+
+
+def test_an_architecture_this_build_cannot_load_is_named(cache, monkeypatch):
+    """The registry is generated from the image, so the answer is that image's.
+    Finding out four minutes into a load, from a traceback, is the alternative."""
+    monkeypatch.setattr(model_profile, "supported_architectures",
+                        lambda: frozenset({"LlamaForCausalLM", "Qwen3ForCausalLM"}))
+
+    cache("org/known", {"config.json": LLAMA})
+    assert model_profile.read("org/known").supported is True
+
+    cache("org/exotic", {"config.json": {**LLAMA, "architectures": ["MadeUpForCausalLM"]}})
+    exotic = model_profile.read("org/exotic")
+    assert exotic.supported is False
+    assert any("does not register MadeUpForCausalLM" in note for note in exotic.notes)
+
+
+def test_an_ungenerated_registry_claims_nothing(cache, monkeypatch):
+    """No generated list is an unknown answer, and an unknown answer must not
+    read as a refusal."""
+    monkeypatch.setattr(model_profile, "supported_architectures", frozenset)
+    cache("org/model", {"config.json": LLAMA})
+    profile = model_profile.read("org/model")
+    assert profile.supported is None
+    assert not any("does not register" in note for note in profile.notes)
+
+
+def test_the_shard_index_is_authoritative_for_weight_bytes(cache, tmp_path):
+    """A repo can ship tensors the loader skips — speculative-decoding heads,
+    for one — which count on disk and never reach memory."""
+    snapshot = cache("org/model", {
+        "config.json": LLAMA,
+        "model.safetensors.index.json": {
+            "metadata": {"total_size": 7000, "total_parameters": 1234},
+            "weight_map": {"a": "model.safetensors"},
+        },
+    })
+    blob = tmp_path / "w.bin"
+    blob.write_bytes(b"x" * 9000)
+    (snapshot / "model.safetensors").symlink_to(blob)
+    (snapshot / "model_extra.safetensors").symlink_to(blob)
+
+    profile = model_profile.read("org/model")
+    assert profile.disk_bytes == 18000
+    assert profile.weight_bytes == 7000
+    assert profile.parameters == 1234
+
+
+def test_without_an_index_the_files_are_the_answer(cache, tmp_path):
+    snapshot = cache("org/model", {"config.json": LLAMA})
+    blob = tmp_path / "w.bin"
+    blob.write_bytes(b"x" * 4096)
+    (snapshot / "model.safetensors").symlink_to(blob)
+
+    profile = model_profile.read("org/model")
+    assert profile.weight_bytes == 4096 == profile.disk_bytes
+    assert profile.parameters is None

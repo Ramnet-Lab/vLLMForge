@@ -1494,8 +1494,10 @@ function profileFacts(profile) {
     facts.push(['Context', `${CTX_FMT(profile.max_position_embeddings)} tokens`,
       kv ? `${bytes(kv)} of KV cache at full length` : 'full length']);
   }
-  facts.push(['Weights', profile.weight_bytes ? bytes(profile.weight_bytes) : '—',
-    profile.quant_method ? `${profile.quant_method} quantised` : (profile.dtype || '')]);
+  const scale = profile.parameters
+    ? `${(profile.parameters / 1e9).toFixed(1)}B params`
+    : (profile.quant_method ? `${profile.quant_method} quantised` : (profile.dtype || ''));
+  facts.push(['Weights', profile.weight_bytes ? bytes(profile.weight_bytes) : '—', scale]);
   facts.push(['Chat template',
     profile.chat_template ? 'present' : 'none',
     profile.chat_template ? profile.chat_template_source : '/v1/chat/completions will refuse']);
@@ -1504,6 +1506,7 @@ function profileFacts(profile) {
 
 function profileFlags(profile) {
   const flags = [];
+  if (profile.supported === false) flags.push(badge('failed', 'architecture not in this image'));
   if (profile.runner === 'pooling') flags.push(badge('starting', 'embeddings, not chat'));
   if (profile.is_multimodal) flags.push(badge('info', 'multimodal'));
   if (profile.requires_remote_code) flags.push(badge('starting', 'needs trust-remote-code'));
@@ -1546,7 +1549,8 @@ function renderProfile(options = {}) {
 
   const adapter = profile.is_adapter;
   const pooling = profile.runner === 'pooling';
-  mount(host, h('div', { class: `serve-profile${adapter ? ' bad' : ''}` },
+  const unsupported = profile.supported === false;
+  mount(host, h('div', { class: `serve-profile${adapter || unsupported ? ' bad' : ''}` },
     h('div', { class: 'sp-head' },
       h('strong', null, 'What this model is'),
       h('span', { class: 'row wrap' }, profileFlags(profile)),

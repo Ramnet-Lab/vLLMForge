@@ -28,6 +28,7 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,10 @@ class Profile:
     is_adapter: bool = False
     base_model: str = ""
 
+    supported: bool | None = None
+    """Whether this build of vLLM registers the architecture. None when there is
+    no architecture to check, or no generated registry to check it against."""
+
     runner: str = "generate"
     """How vLLM will run this: `generate` or `pooling`. Not a free choice — it
     is resolved from the repo, and a model that resolves to `pooling` serves
@@ -144,6 +149,11 @@ class Profile:
     # --- the files themselves ---------------------------------------------
     files: list[str] = field(default_factory=list)
     weight_bytes: int = 0
+    """What the engine will actually resident. The shard index is authoritative
+    where it exists: a repo can ship tensors vLLM skips — speculative-decoding
+    heads, for instance — which count on disk and never reach memory."""
+    disk_bytes: int = 0
+    parameters: int | None = None
     shard_count: int = 0
     has_safetensors: bool = False
     has_gguf: bool = False
@@ -238,7 +248,8 @@ class Profile:
 # The small files worth carrying across an ssh connection. Everything else in a
 # repo is weights, and none of it changes what the flags should be.
 READABLE = ("config.json", "tokenizer_config.json", "generation_config.json",
-            "adapter_config.json", "modules.json", *TEMPLATE_FILES)
+            "adapter_config.json", "modules.json", "model.safetensors.index.json",
+            *TEMPLATE_FILES)
 
 
 @dataclass
@@ -410,6 +421,7 @@ def _profile(profile: Profile, snapshot: Snapshot) -> Profile:
     profile.path = snapshot.path
     _read_files(profile, snapshot)
     _read_config(profile, snapshot)
+    _read_support(profile)
     _read_runner(profile, snapshot)
     _read_tokenizer(profile, snapshot)
     profile.generation = snapshot.json("generation_config.json")
@@ -420,9 +432,21 @@ def _read_files(profile: Profile, snapshot: Snapshot) -> None:
     for name, size in snapshot.files.items():
         profile.files.append(f"{name}/" if size < 0 else name)
         if size > 0 and name.endswith(WEIGHT_SUFFIXES):
-            profile.weight_bytes += size
+            profile.disk_bytes += size
             if name.endswith(".safetensors"):
                 profile.shard_count += 1
+    profile.weight_bytes = profile.disk_bytes
+
+    # The shard index knows exactly what the checkpoint weighs and, sometimes,
+    # how many parameters it holds — better than adding up files, which counts
+    # anything the loader will skip.
+    index = snapshot.json("model.safetensors.index.json").get("metadata") or {}
+    total = index.get("total_size")
+    if isinstance(total, int) and total > 0:
+        profile.weight_bytes = total
+    count = index.get("total_parameters")
+    if isinstance(count, int) and count > 0:
+        profile.parameters = count
 
     names = set(snapshot.files)
     profile.has_safetensors = any(n.endswith(".safetensors") for n in names)
@@ -532,6 +556,33 @@ def _rope_kind(rope: dict[str, Any] | None) -> str:
     if not kinds:
         return "scaled"
     return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
+@lru_cache(maxsize=1)
+def supported_architectures() -> frozenset[str]:
+    """What this build of vLLM can load, generated from the image itself.
+
+    Empty when the file has not been generated, in which case nothing is
+    claimed either way — an unknown answer must not read as a refusal.
+    """
+    path = settings.data_dir / "vllm_archs.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        log.debug("no generated architecture list at %s", path)
+        return frozenset()
+    return frozenset(data.get("architectures") or ())
+
+
+def _read_support(profile: Profile) -> None:
+    known = supported_architectures()
+    if not known or not profile.architectures:
+        return
+    profile.supported = any(name in known for name in profile.architectures)
+    if not profile.supported:
+        profile.notes.append(
+            f"this vLLM build does not register {profile.architectures[0]} — it has "
+            f"{len(known)} architectures and this is not one of them")
 
 
 def _read_runner(profile: Profile, snapshot: Snapshot) -> None:
