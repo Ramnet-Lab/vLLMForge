@@ -1662,6 +1662,7 @@ function profileFacts(profile) {
 function profileFlags(profile) {
   const flags = [];
   if (profile.supported === false) flags.push(badge('failed', 'architecture not in this image'));
+  if (profile.custom_sampler) flags.push(badge('starting', 'one machine only'));
   if (profile.runner === 'pooling') flags.push(badge('starting', 'embeddings, not chat'));
   if (profile.is_multimodal) flags.push(badge('info', 'multimodal'));
   if (profile.requires_remote_code) flags.push(badge('starting', 'needs trust-remote-code'));

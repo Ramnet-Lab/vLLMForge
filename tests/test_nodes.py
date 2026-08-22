@@ -400,3 +400,51 @@ async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
     bare = await cluster.plan(["node1", "node2"], "")
     assert bare["ok"] is True and seen == []
     assert all(n["verdict"] is None for n in bare["nodes"])
+
+
+@pytest.mark.anyio
+async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, peer):
+    """The alternative is discovering it from an assertion in the far rank's
+    warmup, four minutes in, with every shard already read."""
+    from app import cluster, model_profile, safety
+
+    wired = [nodes.Node(name="node1", address="10.0.0.1"),
+             nodes.Node(name="node2", address="10.0.0.2", docker_host="ssh://node2")]
+    monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
+    monkeypatch.setattr(nodes, "by_name", lambda name: next(
+        (n for n in wired if n.name == name), wired[0]))
+
+    async def fake_wiring(node, prefix):
+        return cluster.NodeWiring(node=node, interface="enp1s0", address=f"{prefix}.1")
+
+    async def has_image(*a, **k):
+        return True
+
+    async def budget(node=None, exclude=None):
+        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL, free_bytes=TOTAL,
+                             reserve_bytes=int(TOTAL * 0.12))
+
+    async def no_missing(model, names):
+        return []
+
+    monkeypatch.setattr(cluster, "wiring", fake_wiring)
+    monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
+    monkeypatch.setattr(cluster.safety, "current_budget", budget)
+    monkeypatch.setattr(cluster, "missing_model", no_missing)
+
+    def profile(model):
+        return model_profile.Profile(
+            reference=model, found=True, custom_sampler=model == "org/diffusion",
+            architectures=["DiffusionGemmaForBlockDiffusion"] if model == "org/diffusion"
+            else ["LlamaForCausalLM"])
+
+    monkeypatch.setattr(model_profile, "read", profile)
+
+    # No args, so the memory guard is not consulted and the only thing that can
+    # refuse is the model itself.
+    refused = await cluster.plan(["node1", "node2"], "org/diffusion")
+    assert refused["ok"] is False
+    assert "supplies its own sampler" in refused["reason"]
+
+    fine = await cluster.plan(["node1", "node2"], "org/ordinary")
+    assert fine["ok"] is True

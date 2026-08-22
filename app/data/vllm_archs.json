@@ -360,6 +360,9 @@
   "XLMRobertaModel",
   "Zamba2ForCausalLM"
  ],
+ "custom_sampler": [
+  "DiffusionGemmaForBlockDiffusion"
+ ],
  "image": "nvcr.io/nvidia/vllm:26.07-py3",
  "vllm_version": "0.24.0+092c4842.dev"
 }

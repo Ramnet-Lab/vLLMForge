@@ -391,3 +391,22 @@ def test_without_an_index_the_files_are_the_answer(cache, tmp_path):
     profile = model_profile.read("org/model")
     assert profile.weight_bytes == 4096 == profile.disk_bytes
     assert profile.parameters is None
+
+
+def test_a_custom_sampler_architecture_is_flagged(cache, monkeypatch):
+    """vLLM's pipeline-parallel broadcast assumes the standard sampler's output.
+    A model that supplies its own is not bound by that, and DiffusionGemma's
+    returns int32 where the receiving rank allocates int64 — an assertion in the
+    far rank's warmup, after every shard has been read."""
+    monkeypatch.setattr(model_profile, "custom_sampler_architectures",
+                        lambda: frozenset({"DiffusionGemmaForBlockDiffusion"}))
+    monkeypatch.setattr(model_profile, "supported_architectures",
+                        lambda: frozenset({"DiffusionGemmaForBlockDiffusion",
+                                           "LlamaForCausalLM"}))
+
+    cache("google/diffusion", {"config.json": {
+        **LLAMA, "architectures": ["DiffusionGemmaForBlockDiffusion"]}})
+    assert model_profile.read("google/diffusion").custom_sampler is True
+
+    cache("org/plain", {"config.json": LLAMA})
+    assert model_profile.read("org/plain").custom_sampler is False

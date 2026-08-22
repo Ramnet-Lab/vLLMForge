@@ -152,6 +152,12 @@ class Profile:
     """Whether this build of vLLM registers the architecture. None when there is
     no architecture to check, or no generated registry to check it against."""
 
+    custom_sampler: bool = False
+    """This architecture supplies its own sampler instead of using vLLM's. It
+    still serves normally on one machine; it is pipeline parallelism that such a
+    model can break, because the PP broadcast assumes the standard sampler's
+    output shape and dtype."""
+
     runner: str = "generate"
     """How vLLM will run this: `generate` or `pooling`. Not a free choice — it
     is resolved from the repo, and a model that resolves to `pooling` serves
@@ -585,22 +591,35 @@ def _rope_kind(rope: dict[str, Any] | None) -> str:
 
 
 @lru_cache(maxsize=1)
+def _registry() -> dict[str, Any]:
+    path = settings.data_dir / "vllm_archs.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        log.debug("no generated architecture list at %s", path)
+        return {}
+
+
+@lru_cache(maxsize=1)
+def custom_sampler_architectures() -> frozenset[str]:
+    """Architectures that supply their own sampler, generated from the image."""
+    return frozenset(_registry().get("custom_sampler") or ())
+
+
+@lru_cache(maxsize=1)
 def supported_architectures() -> frozenset[str]:
     """What this build of vLLM can load, generated from the image itself.
 
     Empty when the file has not been generated, in which case nothing is
     claimed either way — an unknown answer must not read as a refusal.
     """
-    path = settings.data_dir / "vllm_archs.json"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        log.debug("no generated architecture list at %s", path)
-        return frozenset()
-    return frozenset(data.get("architectures") or ())
+    return frozenset(_registry().get("architectures") or ())
 
 
 def _read_support(profile: Profile) -> None:
+    custom = custom_sampler_architectures()
+    profile.custom_sampler = any(name in custom for name in profile.architectures)
+
     known = supported_architectures()
     if not known or not profile.architectures:
         return

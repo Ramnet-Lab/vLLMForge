@@ -460,3 +460,26 @@ async def test_the_floor_lifts_a_recommendation_that_would_be_too_small(box):
         mp.Profile(reference="x", weight_bytes=int(48 * GIB)), int(TOTAL))
     assert util >= floor
     assert util * TOTAL > 48 * GIB, "the budget has to cover the weights"
+
+
+@pytest.mark.anyio
+async def test_a_custom_sampler_model_cannot_be_pooled(box):
+    """Measured, not guessed: this exact configuration loaded 48 GiB of weights,
+    sized 1.1M tokens of KV cache and captured its graphs before the far rank
+    died on `assert sampled_token_ids.dtype == torch.int64`. It is refused now,
+    before anything starts."""
+    place, mp = box
+    profile = mp.Profile(reference="google/diffusion", found=True,
+                         architectures=["DiffusionGemmaForBlockDiffusion"],
+                         model_type="diffusion_gemma", weight_bytes=48 * GIB,
+                         has_safetensors=True, chat_template=True, supported=True,
+                         custom_sampler=True)
+    place(profile)
+
+    alone = (await recommend.build("google/diffusion", "", {}, [])).to_dict()
+    assert alone["ok"] is True, "it serves perfectly well on one machine"
+
+    spread = (await recommend.build("google/diffusion", "", {}, ["local", "node2"])).to_dict()
+    assert spread["ok"] is False and spread["level"] == "block"
+    assert spread["args"] == {}
+    assert "cannot be split across machines" in spread["headline"]

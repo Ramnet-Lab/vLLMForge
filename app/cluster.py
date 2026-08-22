@@ -145,6 +145,9 @@ async def plan(node_names: list[str], model: str = "",
     reasons = []
     if missing_image:
         reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
+    incompatible = _pipeline_incompatible(model)
+    if incompatible:
+        reasons.append(incompatible)
     for name, verdict in refused:
         reasons.append(f"{name}: {verdict.message}")
 
@@ -179,6 +182,27 @@ async def plan(node_names: list[str], model: str = "",
         "single_node_bytes": int(budgets[0].max_util * budgets[0].total_bytes),
         "missing_image": missing_image,
     }
+
+
+def _pipeline_incompatible(model: str) -> str:
+    """Why this model cannot be split by layer, when it cannot.
+
+    Checked before anything is started, because the alternative is discovering
+    it from an assertion in the far rank's warmup — after every shard has been
+    read, the KV cache sized and the graphs captured.
+    """
+    if not model:
+        return ""
+    from app import model_profile
+
+    profile = model_profile.read(model)
+    if not profile.custom_sampler:
+        return ""
+    arch = (profile.architectures or [model])[0]
+    return (
+        f"{arch} supplies its own sampler, and vLLM's pipeline-parallel broadcast requires the "
+        "standard one's output shape and dtype. It serves on a single machine; it cannot be "
+        "split across them")
 
 
 def _ray_env(w: NodeWiring) -> dict[str, str]:

@@ -199,6 +199,8 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
         return rec
 
     _placement(rec, profile, total, available, pool or [])
+    if not rec.ok:
+        return rec
 
     # The memory advice is about this machine and holds whether or not the model
     # is here yet. Everything else is read from files, so with no files there is
@@ -265,7 +267,30 @@ def _placement(rec: Recommendation, profile: Profile, total: int, available: int
     never touches — which is its own source of failures. A model that fits on
     one box should stay on one box.
     """
-    if len(pool) < 2 or not profile.weight_bytes:
+    if len(pool) < 2:
+        return
+
+    # Measured here, not guessed. vLLM's pipeline-parallel path has the last
+    # rank broadcast its sampled tokens back into a buffer the earlier ranks
+    # allocate as int64, one token per request per step, and asserts the sender
+    # matches. A model with its own sampler is under no such discipline:
+    # DiffusionGemma's returns int32, canvas_length wide, and the assert fires
+    # during warmup — after the whole checkpoint has been read. The class still
+    # declares SupportsPP, so vLLM's own check passes and nothing warns.
+    if profile.custom_sampler:
+        rec.ok = False
+        rec.level = "block"
+        rec.headline = "This model cannot be split across machines."
+        arch = (profile.architectures or ["It"])[0]
+        rec.findings.append(Finding("block", (
+            f"{arch} brings its own sampler, and vLLM's pipeline-parallel broadcast requires the "
+            "standard one's shape and dtype. The engine loads every shard, sizes the KV cache, "
+            "captures its graphs, and then the far rank dies on an assertion during warmup. No "
+            "flag changes it. Serve it on one machine — it works there — or run a replica per "
+            "machine instead of splitting one.")))
+        return
+
+    if not profile.weight_bytes:
         return
     overhead = OVERHEAD_BYTES + (MULTIMODAL_OVERHEAD_BYTES if profile.is_multimodal else 0)
     kv = profile.kv_bytes(min(profile.max_position_embeddings or TARGET_CONTEXT,
