@@ -129,3 +129,58 @@ def test_xet_bookkeeping_is_excluded_from_the_copy():
     source = Path("app/sync.py").read_text()
     assert "--exclude=trees/" in source
     assert "--exclude=.locks/" in source
+
+
+# --- pooled engines ------------------------------------------------------
+
+def test_the_engine_runs_inside_the_ray_head():
+    """A Ray driver needs the raylet session directory, which lives inside
+    whichever container ran `ray start`. Two containers on one host do not share
+    /tmp/ray, so a separate engine container fails with 'No node info found
+    matching attributes' — which is exactly what happened before this shape."""
+    from app import cluster
+
+    head = cluster.NodeWiring(node=nodes.local_node(), interface="eth0", address="10.0.0.1")
+    command = cluster.head_command(head, ["vllm", "serve", "m", "--port", "8000"])
+    assert command[0] == "-lc"
+    script = command[1]
+    assert script.startswith("ray start --head --node-ip-address=10.0.0.1")
+    # exec, so the engine becomes PID 1's child and the container dies with it.
+    assert " && exec vllm serve m --port 8000" in script
+
+
+def test_a_pool_needs_more_than_one_node():
+    import asyncio
+
+    from app import cluster
+
+    result = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        cluster.plan(["local"])
+    )
+    assert not result["ok"] and "two nodes" in result["reason"]
+
+
+def test_pooled_is_only_true_for_more_than_one_node():
+    from app import servers
+
+    assert not servers.is_pooled({"pool_nodes": []})
+    assert not servers.is_pooled({"pool_nodes": ["local"]})
+    assert servers.is_pooled({"pool_nodes": ["local", "node2"]})
+
+
+def test_a_pooled_servers_containers_live_on_its_head():
+    from app import db, servers
+
+    previous = db.get_setting("nodes", [])
+    try:
+        nodes.add("peer-x", address="10.0.0.9")
+        # An ordinary server runs on its own node...
+        assert servers.host_of({"node": "peer-x", "pool_nodes": []}) == "ssh://peer-x"
+        # ...but a pooled one runs where its Ray head is: the first pool entry.
+        # The other nodes hold shards, not the HTTP frontend.
+        assert servers.host_of({"node": "peer-x", "pool_nodes": ["local", "peer-x"]}) is None
+        assert servers.host_of(
+            {"node": "local", "pool_nodes": ["peer-x", "local"]}
+        ) == "ssh://peer-x"
+    finally:
+        db.set_setting("nodes", previous)

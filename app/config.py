@@ -66,6 +66,11 @@ class Settings:
     finetune_image: str = field(
         default_factory=lambda: _env("LLMD_FINETUNE_IMAGE", "llmd/finetune:latest")
     )
+    # vLLM plus ray, for an engine pooled across machines. The NGC image has no
+    # ray, so multi-node pipeline parallelism needs this one.
+    ray_image: str = field(
+        default_factory=lambda: _env("LLMD_RAY_IMAGE", "llmd/vllm-ray:latest")
+    )
     container_prefix: str = field(default_factory=lambda: _env("LLMD_CONTAINER_PREFIX", "llmd-"))
 
     # --- credentials ------------------------------------------------------

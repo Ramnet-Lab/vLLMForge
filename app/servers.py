@@ -20,10 +20,10 @@ from typing import Any
 
 import httpx
 
-from app import db, docker_ctl, events, hf, nodes, safety, vllm_spec
+from app import cluster, db, docker_ctl, events, hf, nodes, safety, vllm_spec
 from app.config import settings
 
-JSON_FIELDS = ("args", "env")
+JSON_FIELDS = ("args", "env", "pool_nodes")
 
 # Measuring the budget and creating the container have to happen together.
 # Two starts that each measure before the other has launched will both be
@@ -69,7 +69,8 @@ def create_server(payload: dict) -> dict:
     now = db.now()
     cursor = db.execute(
         "INSERT INTO servers (name, model, served_name, port, image, args, env, notes, autostart,"
-        " node, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " node, pool_nodes, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             payload["name"],
             payload["model"],
@@ -81,6 +82,7 @@ def create_server(payload: dict) -> dict:
             payload.get("notes", ""),
             1 if payload.get("autostart") else 0,
             payload.get("node") or nodes.LOCAL,
+            db.dumps(payload.get("pool_nodes") or []),
             now,
             now,
         ),
@@ -95,7 +97,7 @@ def update_server(server_id: int, payload: dict) -> dict | None:
     merged = {**existing, **{k: v for k, v in payload.items() if v is not None}}
     db.execute(
         "UPDATE servers SET name = ?, model = ?, served_name = ?, port = ?, image = ?, args = ?,"
-        " env = ?, notes = ?, autostart = ?, node = ?, updated_at = ? WHERE id = ?",
+        " env = ?, notes = ?, autostart = ?, node = ?, pool_nodes = ?, updated_at = ? WHERE id = ?",
         (
             merged["name"],
             merged["model"],
@@ -107,6 +109,7 @@ def update_server(server_id: int, payload: dict) -> dict | None:
             merged.get("notes", ""),
             1 if merged.get("autostart") else 0,
             merged.get("node") or nodes.LOCAL,
+            db.dumps(merged.get("pool_nodes") or []),
             db.now(),
             server_id,
         ),
@@ -122,11 +125,26 @@ def container_name(server: dict) -> str:
     return settings.container_name("vllm", server["id"])
 
 
+def pool_of(server: dict) -> list[str]:
+    """The nodes a pooled server spans. Empty means an ordinary single-box server."""
+    pool = server.get("pool_nodes") or []
+    return [str(n) for n in pool] if isinstance(pool, list) else []
+
+
+def is_pooled(server: dict) -> bool:
+    return len(pool_of(server)) > 1
+
+
 def node_of(server: dict) -> nodes.Node:
     return nodes.by_name(server.get("node"))
 
 
 def host_of(server: dict) -> str | None:
+    """Where this server's vLLM container runs. For a pooled engine that is the
+    Ray head — the other nodes hold shards, not the HTTP frontend."""
+    pool = pool_of(server)
+    if pool:
+        return nodes.by_name(pool[0]).docker_host
     return node_of(server).docker_host
 
 
@@ -204,10 +222,97 @@ def container_path(host_path: str | Path) -> str:
 
 # --- lifecycle ----------------------------------------------------------
 
+async def start_pooled(server: dict, *, force: bool = False) -> dict:
+    """One engine across several machines: bring up Ray, then vLLM on the head.
+
+    The engine has a fixed world size — if a node drops, vLLM aborts and has to
+    be relaunched — so the cluster is formed and confirmed complete before the
+    engine is told how many stages to split into.
+    """
+    pool = pool_of(server)
+    plan = await cluster.plan(pool)
+    if not plan["ok"] and not force:
+        return {"started": False, "error": plan.get("reason", "cannot pool across these nodes"),
+                "plan": plan}
+
+    missing = await cluster.missing_model(server["model"], pool)
+    if missing and not force:
+        return {
+            "started": False,
+            "plan": plan,
+            "error": (
+                f"{server['model']} is not in the cache on: {', '.join(missing)}. "
+                "Every node loads its own shard from its own disk, so sync it there first."
+            ),
+            "missing_model_on": missing,
+        }
+
+    prefix = cluster._subnet_prefix()
+    wirings = [await cluster.wiring(nodes.by_name(name), prefix) for name in pool]
+    head = wirings[0]
+    name = container_name(server)
+
+    args = dict(server.get("args") or {})
+    args["distributed_executor_backend"] = "ray"
+    args["pipeline_parallel_size"] = len(pool)
+    args.setdefault("tensor_parallel_size", 1)
+
+    env = build_env(server)
+    env["NCCL_SOCKET_IFNAME"] = head.interface
+    env["GLOO_SOCKET_IFNAME"] = head.interface
+    env["NCCL_IB_DISABLE"] = "1"
+
+    serve_argv = vllm_spec.build_argv(server["model"], args, port=int(server["port"]))
+
+    async with LAUNCH_LOCK:
+        await docker_ctl.remove(name, force=True, host=head.node.docker_host)
+        await cluster.stop_workers(wirings)
+        try:
+            # The engine container starts the Ray head and then becomes the
+            # engine, because a Ray driver needs the raylet session directory
+            # that lives inside whichever container ran `ray start`.
+            await docker_ctl.run_detached(
+                name=name,
+                image=settings.ray_image,
+                entrypoint="bash",
+                command=cluster.head_command(head, serve_argv),
+                env=env,
+                mounts=_mounts(),
+                gpu=True,
+                network="host",
+                host=head.node.docker_host,
+            )
+            # Workers can only join once the head is listening; the engine then
+            # completes its placement group as they arrive.
+            await asyncio.sleep(8)
+            await cluster.start_workers(wirings)
+            ray_status = await cluster.await_cluster(head, len(pool), name)
+        except Exception as exc:
+            await cluster.stop_workers(wirings)
+            await docker_ctl.remove(name, force=True, host=head.node.docker_host)
+            return {"started": False, "error": str(exc)[-800:], "plan": plan}
+
+    db.execute("UPDATE servers SET last_started_at = ? WHERE id = ?", (db.now(), server["id"]))
+    await events.broker.publish(events.SERVERS, {"type": "started", "id": server["id"]})
+    return {
+        "started": True,
+        "pooled": True,
+        "container": name,
+        "head": head.node.name,
+        "pipeline_parallel_size": len(pool),
+        "pooled_bytes": plan["pooled_bytes"],
+        "ray": ray_status[-800:],
+        "plan": plan,
+    }
+
+
 async def start(server_id: int, *, force: bool = False) -> dict:
     server = get_server(server_id)
     if server is None:
         raise KeyError(server_id)
+
+    if is_pooled(server):
+        return await start_pooled(server, force=force)
 
     name = container_name(server)
     args = server.get("args") or {}
@@ -248,6 +353,12 @@ async def stop(server_id: int) -> None:
     if server is None:
         raise KeyError(server_id)
     await docker_ctl.stop(container_name(server), host=host_of(server))
+    if is_pooled(server):
+        # The Ray containers are this engine's world; leaving them up would hold
+        # memory on every node for an engine that is gone.
+        prefix = cluster._subnet_prefix()
+        wirings = [await cluster.wiring(nodes.by_name(n), prefix) for n in pool_of(server)]
+        await cluster.stop_workers(wirings)
     await events.broker.publish(events.SERVERS, {"type": "stopped", "id": server_id})
 
 

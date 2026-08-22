@@ -122,6 +122,8 @@ def connect() -> sqlite3.Connection:
 # exists, so anything added after the first release needs an explicit step.
 MIGRATIONS = [
     ("servers", "node", "ALTER TABLE servers ADD COLUMN node TEXT NOT NULL DEFAULT 'local'"),
+    ("servers", "pool_nodes",
+     "ALTER TABLE servers ADD COLUMN pool_nodes TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 

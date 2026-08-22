@@ -26,6 +26,7 @@ class ServerIn(BaseModel):
     notes: str = ""
     autostart: bool = False
     node: str = "local"
+    pool_nodes: list[str] = Field(default_factory=list)
 
     @field_validator("args")
     @classmethod
@@ -47,6 +48,7 @@ class ServerPatch(BaseModel):
     notes: str | None = None
     autostart: bool | None = None
     node: str | None = None
+    pool_nodes: list[str] | None = None
 
 
 @router.get("/schema")
@@ -63,6 +65,21 @@ async def list_servers() -> dict:
 @router.get("/endpoints")
 async def endpoints() -> dict:
     return {"endpoints": await svc.endpoints()}
+
+
+@router.post("/pool/plan")
+async def pool_plan(payload: dict) -> dict:
+    """What pooling across these nodes would give, and what stands in the way."""
+    from app import cluster
+
+    return await cluster.plan(payload.get("nodes") or [])
+
+
+@router.get("/pool/status")
+async def pool_status(nodes: str = "") -> dict:
+    from app import cluster
+
+    return await cluster.status([n for n in nodes.split(",") if n])
 
 
 @router.get("/paths")
