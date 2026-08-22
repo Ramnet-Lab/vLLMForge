@@ -21,8 +21,12 @@ Both are read the same way once the directory is resolved.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +49,11 @@ MULTIMODAL_FILES = ("preprocessor_config.json", "processor_config.json",
                     "image_processor_config.json", "video_preprocessor_config.json")
 
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".gguf")
+
+# What a cache directory may be called. The name is interpolated into a remote
+# shell command, so it is matched rather than escaped: nothing but this shape
+# reaches the peer.
+_CACHE_NAME = re.compile(r"models--[A-Za-z0-9._-]+(--[A-Za-z0-9._-]+)*")
 
 # Older architectures spell the same shape differently — GPT-2 and its
 # descendants use n_layer where Llama-style configs use num_hidden_layers. The
@@ -148,6 +157,38 @@ class Profile:
         return 2 * self.num_hidden_layers * heads * dim * kv_dtype_bytes
 
 
+# The small files worth carrying across an ssh connection. Everything else in a
+# repo is weights, and none of it changes what the flags should be.
+READABLE = ("config.json", "tokenizer_config.json", "generation_config.json",
+            "adapter_config.json", *TEMPLATE_FILES)
+
+
+@dataclass
+class Snapshot:
+    """A model directory reduced to what profiling needs: what is in it, how big
+    each file is, and the text of the few small files that describe it.
+
+    Having this in between means the parsing below never touches a filesystem,
+    so a peer's cache — which can only be read a command at a time over ssh —
+    profiles through exactly the same code as this machine's."""
+
+    path: str = ""
+    files: dict[str, int] = field(default_factory=dict)
+    """name -> size in bytes. A directory is recorded as -1."""
+    texts: dict[str, str] = field(default_factory=dict)
+
+    def json(self, name: str) -> dict[str, Any]:
+        body = self.texts.get(name)
+        if not body:
+            return {}
+        try:
+            value = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            log.debug("malformed %s in %s", name, self.path)
+            return {}
+        return value if isinstance(value, dict) else {}
+
+
 # --- resolving a reference to a directory ---------------------------------
 
 
@@ -227,19 +268,6 @@ def _snapshot_of(repo: Path) -> Path | None:
 # --- reading --------------------------------------------------------------
 
 
-def _read_json(directory: Path, name: str) -> dict[str, Any]:
-    path = directory / name
-    try:
-        if not path.is_file() or path.stat().st_size > MAX_CONFIG_BYTES:
-            return {}
-        return json.loads(path.read_text())
-    except (OSError, ValueError, json.JSONDecodeError):
-        # A malformed config is worth knowing about but never worth raising
-        # from a read: the caller wants the rest of the profile regardless.
-        log.debug("could not read %s", path, exc_info=True)
-        return {}
-
-
 def _int(value: Any) -> int | None:
     try:
         number = int(value)
@@ -264,53 +292,72 @@ def read(reference: str) -> Profile:
     profile.source = source
     if directory is None:
         return profile
+    return _profile(profile, _scan(directory))
 
+
+def _scan(directory: Path) -> Snapshot:
+    """Reduce a directory on this machine to a Snapshot.
+
+    A cached snapshot is symlinks into blobs/, so sizes come from `stat`, which
+    follows — `lstat` would report the length of the link text instead of the
+    60 GiB it points at.
+    """
+    snapshot = Snapshot(path=str(directory))
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return snapshot
+
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            snapshot.files[entry.name] = -1
+            continue
+        try:
+            snapshot.files[entry.name] = entry.stat().st_size
+        except OSError:
+            snapshot.files[entry.name] = 0
+        if entry.name in READABLE and 0 < snapshot.files[entry.name] <= MAX_CONFIG_BYTES:
+            try:
+                snapshot.texts[entry.name] = entry.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+    return snapshot
+
+
+def _profile(profile: Profile, snapshot: Snapshot) -> Profile:
+    """Turn a Snapshot into a Profile. No filesystem, no network."""
     profile.found = True
-    profile.path = str(directory)
-    _read_files(profile, directory)
-    _read_config(profile, directory)
-    _read_tokenizer(profile, directory)
-    profile.generation = _read_json(directory, "generation_config.json")
+    profile.path = snapshot.path
+    _read_files(profile, snapshot)
+    _read_config(profile, snapshot)
+    _read_tokenizer(profile, snapshot)
+    profile.generation = snapshot.json("generation_config.json")
     return profile
 
 
-def _read_files(profile: Profile, directory: Path) -> None:
-    """The repo's own file list, and what the weights weigh.
-
-    A snapshot is symlinks into blobs/, so the size has to come from the target
-    — `stat` follows, `lstat` would report the length of the link text.
-    """
-    try:
-        entries = sorted(p for p in directory.iterdir() if not p.name.startswith("."))
-    except OSError:
-        return
-
-    for entry in entries:
-        if entry.is_dir():
-            profile.files.append(f"{entry.name}/")
-            continue
-        profile.files.append(entry.name)
-        if entry.name.endswith(WEIGHT_SUFFIXES):
-            try:
-                profile.weight_bytes += entry.stat().st_size
-            except OSError:
-                continue
-            if entry.name.endswith(".safetensors"):
+def _read_files(profile: Profile, snapshot: Snapshot) -> None:
+    for name, size in snapshot.files.items():
+        profile.files.append(f"{name}/" if size < 0 else name)
+        if size > 0 and name.endswith(WEIGHT_SUFFIXES):
+            profile.weight_bytes += size
+            if name.endswith(".safetensors"):
                 profile.shard_count += 1
 
-    names = set(profile.files)
+    names = set(snapshot.files)
     profile.has_safetensors = any(n.endswith(".safetensors") for n in names)
     profile.has_gguf = any(n.endswith(".gguf") for n in names)
     profile.is_multimodal = any(n in names for n in MULTIMODAL_FILES)
     profile.is_adapter = "adapter_config.json" in names and "config.json" not in names
 
     if profile.is_adapter:
-        adapter = _read_json(directory, "adapter_config.json")
+        adapter = snapshot.json("adapter_config.json")
         profile.base_model = str(adapter.get("base_model_name_or_path") or "")
 
 
-def _read_config(profile: Profile, directory: Path) -> None:
-    raw = _read_json(directory, "config.json")
+def _read_config(profile: Profile, snapshot: Snapshot) -> None:
+    raw = snapshot.json("config.json")
     if not raw:
         if not profile.is_adapter:
             profile.notes.append("no readable config.json beside the weights")
@@ -367,8 +414,8 @@ def _read_config(profile: Profile, directory: Path) -> None:
     profile.requires_remote_code = bool(raw.get("auto_map") or text.get("auto_map"))
 
 
-def _read_tokenizer(profile: Profile, directory: Path) -> None:
-    raw = _read_json(directory, "tokenizer_config.json")
+def _read_tokenizer(profile: Profile, snapshot: Snapshot) -> None:
+    raw = snapshot.json("tokenizer_config.json")
     if raw:
         profile.tokenizer_class = str(raw.get("tokenizer_class") or "")
         profile.model_max_length = _int(raw.get("model_max_length"))
@@ -382,14 +429,100 @@ def _read_tokenizer(profile: Profile, directory: Path) -> None:
     # writes it that way and vLLM reads it.
     if not profile.chat_template:
         for name in TEMPLATE_FILES:
-            path = directory / name
-            try:
-                if path.is_file() and 0 < path.stat().st_size <= MAX_TEMPLATE_BYTES:
-                    profile.chat_template = True
-                    profile.chat_template_source = name
-                    break
-            except OSError:
-                continue
+            size = snapshot.files.get(name, 0)
+            if 0 < size <= MAX_TEMPLATE_BYTES:
+                profile.chat_template = True
+                profile.chat_template_source = name
+                break
 
     if not raw and not profile.is_adapter:
         profile.notes.append("no tokenizer_config.json — the tokenizer may not resolve")
+
+
+# --- a peer's cache --------------------------------------------------------
+
+# One round trip: resolve the snapshot, list it with sizes followed through the
+# symlinks, then emit the few small files base64'd so a newline in a jinja
+# template cannot be mistaken for the end of a record.
+_REMOTE_SCRIPT = r"""
+hub={hub}
+d="$hub/{directory}"
+[ -d "$d" ] || exit 3
+snap=""
+sha=$(cat "$d/refs/main" 2>/dev/null)
+[ -n "$sha" ] && [ -d "$d/snapshots/$sha" ] && snap="$d/snapshots/$sha"
+[ -n "$snap" ] || snap=$(ls -1dt "$d"/snapshots/*/ 2>/dev/null | head -1)
+[ -n "$snap" ] || exit 3
+snap=${{snap%/}}
+echo "P|$snap"
+find -L "$snap" -maxdepth 1 -mindepth 1 -printf 'F|%y|%s|%f\n' 2>/dev/null
+for f in {readable}; do
+  [ -f "$snap/$f" ] && echo "T|$f|$(base64 -w0 < "$snap/$f")"
+done
+exit 0
+"""
+
+
+async def read_remote(reference: str, node: str) -> Profile:
+    """Profile a model held in a peer's cache.
+
+    The peer's files are only reachable a command at a time, so the whole scan
+    is one script and the result goes through the same parsers as a local read.
+    A path reference is refused rather than guessed at: a path means "as the
+    container sees it", and the peer's containers are not this machine's.
+    """
+    from app import nodes
+
+    profile = Profile(reference=str(reference or ""))
+    target = nodes.by_name(node)
+    if target.is_local:
+        return read(reference)
+
+    text = str(reference or "").strip().rstrip("/")
+    if not text or "/" not in text or text.startswith("/"):
+        profile.notes.append(f"only a Hub id can be profiled on {target.name}")
+        return profile
+
+    directory = f"models--{text.replace('/', '--')}"
+    if not _CACHE_NAME.fullmatch(directory):
+        profile.notes.append("that is not a model id")
+        return profile
+
+    script = _REMOTE_SCRIPT.format(
+        hub=shlex.quote(f"{settings.hf_cache}/hub"),
+        directory=directory,
+        readable=" ".join(shlex.quote(name) for name in READABLE),
+    )
+    code, out = await nodes._ssh(target.name or target.address, script)
+    if code == 3:
+        profile.notes.append(f"not in {target.name}'s cache")
+        return profile
+    if code != 0:
+        profile.notes.append(f"{target.name} did not answer: {out.strip()[:200]}")
+        return profile
+
+    profile.source = "peer"
+    return _profile(profile, _parse_remote(out))
+
+
+def _parse_remote(out: str) -> Snapshot:
+    snapshot = Snapshot()
+    for line in out.splitlines():
+        tag, _, rest = line.partition("|")
+        if tag == "P":
+            snapshot.path = rest.strip()
+        elif tag == "F":
+            kind, _, tail = rest.partition("|")
+            size, _, name = tail.partition("|")
+            if not name or name.startswith("."):
+                continue
+            snapshot.files[name] = -1 if kind == "d" else (int(size) if size.isdigit() else 0)
+        elif tag == "T":
+            name, _, body = rest.partition("|")
+            if name not in READABLE:
+                continue
+            try:
+                snapshot.texts[name] = base64.b64decode(body).decode("utf-8", "replace")
+            except (ValueError, binascii.Error):
+                continue
+    return snapshot

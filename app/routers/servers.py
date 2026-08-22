@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
+from app import nodes as nodes_svc
 from app import servers as svc
 from app import vllm_spec
 from app.config import settings
@@ -108,6 +109,25 @@ async def paths() -> dict:
 @router.get("/suggest")
 async def suggest() -> dict:
     return {"port": await asyncio.to_thread(svc.suggest_port), "image": settings.vllm_image}
+
+
+@router.get("/profile")
+async def profile(model: str = Query(""), node: str = Query("")) -> dict:
+    """What the files beside a model's weights say it is.
+
+    Read from the node that would run it, because a model cached here and a
+    model cached on a peer are different questions and only one of them is
+    about to be loaded.
+    """
+    from app import model_profile
+
+    if not model.strip():
+        return {"found": False, "reference": "", "source": "missing"}
+    if node and node != nodes_svc.LOCAL:
+        result = await model_profile.read_remote(model, node)
+    else:
+        result = await asyncio.to_thread(model_profile.read, model)
+    return result.to_dict()
 
 
 @router.post("", status_code=201)
