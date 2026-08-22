@@ -1510,10 +1510,9 @@ function profileFlags(profile) {
   if (profile.is_adapter) flags.push(badge('failed', 'LoRA adapter, not a model'));
   if (profile.has_gguf && !profile.has_safetensors) flags.push(badge('failed', 'GGUF only'));
   if (profile.num_experts) flags.push(badge('plain', `${profile.num_experts} experts`));
-  if (profile.rope_scaling) {
-    flags.push(badge('plain', `rope ${profile.rope_scaling.rope_type
-      || profile.rope_scaling.type || 'scaled'}`));
-  }
+  // rope_kind is worked out on the server, where the two spellings and the
+  // nested-by-layer-type shape are already untangled.
+  if (profile.rope_kind) flags.push(badge('plain', `rope ${profile.rope_kind}`));
   if (profile.source === 'peer') flags.push(badge('plain', 'read over ssh'));
   return flags;
 }
