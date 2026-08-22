@@ -58,6 +58,17 @@ MULTIMODAL_OVERHEAD_BYTES = 2 * 1024 ** 3
 # conversation is not one anybody wanted.
 CONCURRENCY = 2
 
+# What --max-num-seqs becomes on a model with recurrent layers. Those layers
+# hold a fixed state per sequence rather than a growing KV cache, so the
+# admission cap stops being an admission cap and becomes a memory demand paid up
+# front: vLLM allocates one state block per sequence the cap allows, before it
+# captures a single graph. Its own default is 256, which on a 27B hybrid is tens
+# of gigabytes of state for callers that will never arrive.
+#
+# Sized to be affordable at any utilisation that can hold the weights at all,
+# and deliberately in the same range as the rest of this box's operating limits
+# — concurrency spikes, not loading, are what take this machine down.
+RECURRENT_SEQS = 16
 
 # Flags a recommendation deliberately leaves alone, with the reason. Shown to
 # the operator, because "why didn't it set the quantisation" is the obvious
@@ -272,6 +283,7 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
     # pulled would be a guess dressed as a fact.
     _memory(rec, profile, total, available, budget.free_util, shards)
     if profile.found:
+        _recurrent(rec, profile, args or {})
         _loading(rec, profile)
         _quantisation(rec, profile)
         _serving(rec, profile)
@@ -494,6 +506,44 @@ def _quantisation(rec: Recommendation, profile: Profile) -> None:
             "NotImplementedError before any weights are read. A compressed-tensors build of the "
             "same model works, because its excluded lm_head falls through to the unquantised "
             "embedding method, which does implement it. So does the unquantised base model.")))
+
+
+def _recurrent(rec: Recommendation, profile: Profile, args: dict[str, Any]) -> None:
+    """Why a hybrid model needs --max-num-seqs set rather than left to vLLM.
+
+    On an ordinary model --max-num-seqs is an admission cap: exceed it and
+    requests queue. On a model with recurrent layers it is also a memory
+    demand, and one paid before the engine serves anything. Each concurrent
+    sequence pins one state block in every recurrent layer, so vLLM sizes that
+    pool from the cap and then refuses to start if the utilisation cannot hold
+    it:
+
+        ValueError: max_num_seqs (256) exceeds available Mamba cache blocks
+        (125). Each decode sequence requires one Mamba cache block, so CUDA
+        graph capture cannot proceed.
+
+    Measured on Qwen3.8-27B — 48 of its 64 layers are linear_attention — at the
+    0.34 this page recommended for it. The failure is not the utilisation being
+    wrong: raising it far enough to hold 256 states would spend tens of
+    gigabytes on concurrency nobody asked for. It is the cap being left at a
+    default that quietly costs memory on this class of model.
+
+    Capping the sequences is also what keeps the rest of the arithmetic here
+    honest, since the utilisation is sized for CONCURRENCY callers and then
+    vLLM admits 256.
+    """
+    recurrent = sum(count for kind, count in (profile.layer_types or {}).items()
+                    if kind in model_profile.RECURRENT_KINDS)
+    if not recurrent or args.get("max_num_seqs"):
+        return
+
+    total_layers = sum((profile.layer_types or {}).values())
+    rec.suggestions.append(Suggestion(
+        "max_num_seqs", RECURRENT_SEQS,
+        f"{recurrent} of this model's {total_layers} layers are recurrent, so every sequence "
+        f"the cap allows pins a state block whether or not anyone is using it. vLLM's default "
+        f"of 256 has to fit before it will capture a graph, and it will not — the engine stops "
+        f"with \"exceeds available Mamba cache blocks\" rather than starting"))
 
 
 def _loading(rec: Recommendation, profile: Profile) -> None:

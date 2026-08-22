@@ -579,3 +579,54 @@ async def test_weights_that_do_not_fit_one_machine_may_fit_two(box):
     spread = (await recommend.build("org/huge", "", {}, ["local", "node2"])).to_dict()
     assert spread["ok"] is True, "50 GiB a machine fits where 100 does not"
 
+
+@pytest.mark.anyio
+async def test_a_recurrent_model_gets_its_sequence_cap_set(box):
+    """On a hybrid model --max-num-seqs stops being an admission cap and becomes
+    a memory demand: one state block per sequence, allocated before the engine
+    serves anything. vLLM's default of 256 has to fit or it refuses to capture a
+    graph — which is how Qwen3.8-27B (48 of 64 layers linear_attention) died at
+    the 0.34 this page recommended for it, with "max_num_seqs (256) exceeds
+    available Mamba cache blocks (125)"."""
+    place, mp = box
+    place(mp.Profile(reference="org/hybrid", found=True, architectures=["Qwen3_5ForCausalLM"],
+                     model_type="qwen3_5", weight_bytes=28 * GIB,
+                     layer_types={"linear_attention": 48, "full_attention": 16},
+                     num_hidden_layers=64, num_key_value_heads=4, head_dim=256,
+                     max_position_embeddings=262144,
+                     has_safetensors=True, chat_template=True, supported=True))
+
+    rec = (await recommend.build("org/hybrid")).to_dict()
+    assert rec["args"]["max_num_seqs"] == recommend.RECURRENT_SEQS
+    assert rec["args"]["max_num_seqs"] < 256, "vLLM's default is the thing that fails"
+    why = next(s["why"] for s in rec["suggestions"] if s["dest"] == "max_num_seqs")
+    assert "48 of this model's 64 layers" in why
+
+
+@pytest.mark.anyio
+async def test_an_attention_only_model_keeps_vllms_own_sequence_cap(box):
+    """Setting a flag to a number vLLM would have chosen better is the thing
+    this module exists not to do. Without recurrent layers the cap costs no
+    memory up front and there is nothing to say about it."""
+    place, mp = box
+    place(mp.Profile(reference="org/plain", found=True, architectures=["LlamaForCausalLM"],
+                     weight_bytes=16 * GIB, num_hidden_layers=32, num_key_value_heads=8,
+                     head_dim=128, max_position_embeddings=131072,
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/plain")).to_dict()
+    assert "max_num_seqs" not in rec["args"]
+
+
+@pytest.mark.anyio
+async def test_a_cap_the_operator_chose_is_left_alone(box):
+    """They may want more concurrency than this page would pick, and they can
+    see the consequence in the memory guard. Overwriting it would be the page
+    arguing with them."""
+    place, mp = box
+    place(mp.Profile(reference="org/hybrid", found=True, architectures=["Qwen3_5ForCausalLM"],
+                     model_type="qwen3_5", weight_bytes=28 * GIB,
+                     layer_types={"linear_attention": 48, "full_attention": 16},
+                     num_hidden_layers=64, num_key_value_heads=4, head_dim=256,
+                     has_safetensors=True, chat_template=True, supported=True))
+    rec = (await recommend.build("org/hybrid", args={"max_num_seqs": 64})).to_dict()
+    assert "max_num_seqs" not in rec["args"]

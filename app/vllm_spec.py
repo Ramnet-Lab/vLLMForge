@@ -49,7 +49,9 @@ FEATURED: list[dict[str, Any]] = [
         "title": "Scheduling & concurrency",
         "blurb": (
             "max-num-seqs is an admission cap, not a request limit: extra requests "
-            "queue. It is the real safety valve against activation spikes."
+            "queue. It is the real safety valve against activation spikes. On a model "
+            "with recurrent layers it is a memory demand as well — one state block per "
+            "sequence the cap allows, allocated before the engine serves anything."
         ),
         "flags": [
             "max_num_seqs", "max_num_batched_tokens", "enable_chunked_prefill",
