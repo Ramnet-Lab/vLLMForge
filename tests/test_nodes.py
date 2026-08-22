@@ -91,3 +91,41 @@ async def test_a_peers_budget_never_counts_this_machines_gpu(monkeypatch):
 
     local = await safety.current_budget(node=nodes.local_node())
     assert local.measured_gpu_bytes == 60 * GIB
+
+
+# --- model sync ----------------------------------------------------------
+
+def test_rsync_progress_is_parsed():
+    from app import sync
+
+    line = "  1,234,567,890  42%  512.34MB/s    0:01:23 (xfr#12, to-chk=30/94)"
+    update = sync.parse_sync(line, {})
+    assert update["transferred_bytes"] == 1_234_567_890
+    assert update["percent"] == 42.0
+    assert update["speed_bps"] == 512.34 * 10 ** 6
+    assert update["files_total"] == 94 and update["files_done"] == 64
+
+
+def test_a_line_without_progress_is_left_as_log():
+    from app import sync
+
+    assert sync.parse_sync("sending incremental file list", {}) is None
+    assert sync.parse_sync("total size is 12,512,651  speedup is 1.00", {})["percent"] == 100.0
+
+
+def test_the_cache_directory_name_matches_huggingface_layout():
+    from app import sync
+
+    assert sync.repo_dir_name("org/model") == "models--org--model"
+    assert sync.repo_dir_name("org/set", "dataset") == "datasets--org--set"
+
+
+def test_xet_bookkeeping_is_excluded_from_the_copy():
+    """trees/ and .locks/ are written 0600 by the root container that downloaded
+    the model, so a non-root rsync cannot read them — and neither is needed to
+    load a model. Including them is the difference between exit 0 and exit 23."""
+    from pathlib import Path
+
+    source = Path("app/sync.py").read_text()
+    assert "--exclude=trees/" in source
+    assert "--exclude=.locks/" in source

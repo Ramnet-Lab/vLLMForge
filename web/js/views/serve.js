@@ -4,7 +4,11 @@
    The parameter form is built from GET /api/servers/schema, which the backend
    generates from the image itself, so the form cannot drift from the binary
    that will run. The only hard-coded vLLM flags in this file are in PRESETS,
-   and each of those carries the provenance of its numbers in the UI. */
+   and each of those carries the provenance of its numbers in the UI.
+
+   A server also names the machine it runs on. Memory is the one thing that does
+   not travel between them, so every figure in this view belongs to exactly one
+   node and says which. */
 
 import { ApiError, del, get, getText, patch, post } from '../api.js';
 import {
@@ -43,6 +47,9 @@ const STYLES = `
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
 .serve-unmanaged td:first-child { border-left: 3px solid var(--info); }
 .serve-tenants { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.serve-peer > td:first-child { border-left: 3px solid var(--accent); }
+.serve-group > td { background: var(--bg-sunken); }
+.serve-group .s-name { font-family: var(--mono); }
 .serve-pick { display: flex; flex-direction: column; gap: 6px; }
 .serve-pick-row { display: flex; align-items: center; gap: 6px; }
 .serve-pick-row select { flex: 1 1 auto; min-width: 0; }
@@ -93,13 +100,15 @@ const PRESETS = [
 
 const DETAIL_TABS = [['command', 'Command'], ['logs', 'Logs'], ['metrics', 'Metrics']];
 const LIVE = ['running', 'loading', 'starting', 'unhealthy'];
+const LOCAL = 'local';
 
 const state = {
   ctx: null,
   main: null,
   schema: null,
   flagIndex: null,
-  status: { servers: [], foreign: [], budget: null },
+  status: { servers: [], foreign: [], nodes: [], budgets: {}, budget: null },
+  cluster: [],
   mode: 'list',
   selected: null,
   detailTab: 'command',
@@ -125,14 +134,17 @@ export async function render(container, ctx) {
       h('div', null,
         h('h1', null, 'Serve'),
         h('p', null,
-          'vLLM engines on this host. Utilisation is a fraction of the memory the CPU and GPU '
-          + 'share, so every engine that is up spends the same pool.')),
+          'vLLM engines on the machines in this cluster. Utilisation is a fraction of the memory '
+          + 'the CPU and GPU share on one node, so every engine on a node spends the same pool — '
+          + 'and none of it is shared with the node next to it.')),
       h('div', { class: 'page-actions' },
-        h('button', { onClick: () => refreshStatus() }, 'Refresh'),
+        h('button', { onClick: () => { refreshStatus(); loadCluster(); } }, 'Refresh'),
         h('button', { class: 'btn-primary', onClick: () => openEditor(null) }, 'New server'))),
     state.main);
 
-  const [schema] = await Promise.all([get('/servers/schema'), refreshStatus({ render: false })]);
+  const [schema] = await Promise.all([
+    get('/servers/schema'), refreshStatus({ render: false }), loadCluster(),
+  ]);
   if (state.stopped) return;
   state.schema = schema;
   state.flagIndex = new Map();
@@ -165,6 +177,7 @@ export function dispose() {
   state.selected = null;
   state.detailKey = '';
   state.nodes = {};
+  state.cluster = [];
 }
 
 function routeDetail(ctx) {
@@ -176,6 +189,29 @@ function routeDetail(ctx) {
     return raw;
   }
 }
+
+/* --- the cluster --------------------------------------------------------- */
+
+/* GET /api/servers carries the registry, which is enough to place a server.
+   GET /api/nodes additionally sshes into every peer to see whether it is up,
+   which takes a second or so — worth it when the picker is about to offer a
+   node, too expensive for the five-second list poll. */
+async function loadCluster() {
+  try {
+    const payload = await get('/nodes');
+    state.cluster = payload.nodes || [];
+  } catch (error) {
+    // The registry from /api/servers still names every node, so the picker
+    // works; it just cannot say which of them are answering.
+    toast(error.message, { level: 'warn', title: 'Could not read node status' });
+  }
+}
+
+const nodeChoices = () => (state.cluster.length ? state.cluster : (state.status.nodes || []));
+
+/** An unregistered name resolves to this machine on the backend (nodes.by_name),
+ *  so only a name that matches a registered peer is remote. */
+const isPeer = (name) => nodeChoices().some((node) => node.name === name && node.local === false);
 
 /* --- status -------------------------------------------------------------- */
 
@@ -202,7 +238,7 @@ function ensureListShell() {
   nodes.servers = h('div');
   nodes.foreign = h('div');
   nodes.foreignPanel = panel('Containers this dashboard did not start', {
-    sub: 'read-only',
+    sub: 'this machine · read-only',
     flush: true,
     body: nodes.foreign,
   });
@@ -222,6 +258,7 @@ function renderList() {
   renderServerTable();
   renderForeignTable();
   renderDetail();
+  renderDetailSafety();
 }
 
 function budgetPanel() {
@@ -231,7 +268,7 @@ function budgetPanel() {
   const reserveWidth = Math.max(0,
     Math.min(1 - budget.occupied_util, budget.reserve_bytes / budget.total_bytes));
   return panel('Host memory budget', {
-    sub: `${budget.tenants.length} engine(s) resident`,
+    sub: `this machine · ${budget.tenants.length} engine(s) resident`,
     body: h('div', null,
       h('div', { class: 'grid cols-4' },
         stat('Committed', pct(budget.committed_util, 0),
@@ -264,6 +301,9 @@ function renderServerTable() {
       h('button', { class: 'btn-primary', onClick: () => openEditor(null) }, 'New server')));
     return;
   }
+  // A single-machine install gets the table it always had: a header naming the
+  // only node there is would be a row of noise.
+  const clustered = (state.status.nodes || []).length > 1;
   mount(state.nodes.servers, h('div', { class: 'table-wrap' },
     h('table', null,
       h('thead', null, h('tr', null,
@@ -273,7 +313,44 @@ function renderServerTable() {
         h('th', null, 'Status'),
         h('th', null, 'Serving'),
         h('th', null, ''))),
-      h('tbody', null, rows.map(serverRow)))));
+      groupByNode(rows).map(([name, group]) => h('tbody', null,
+        clustered ? nodeGroupRow(name, group) : null,
+        group.map(serverRow))))));
+}
+
+/** Servers grouped by node, in registry order. */
+function groupByNode(rows) {
+  const order = (state.status.nodes || []).map((node) => node.name);
+  const groups = new Map();
+  for (const server of rows) {
+    const name = server.node || LOCAL;
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(server);
+  }
+  // A server can still name a node that has since been deregistered. The
+  // backend runs it here rather than losing it, so it goes last but stays.
+  const rank = (name) => (order.indexOf(name) === -1 ? order.length : order.indexOf(name));
+  return [...groups].sort((a, b) => rank(a[0]) - rank(b[0]));
+}
+
+function nodeGroupRow(name, group) {
+  const node = (state.status.nodes || []).find((entry) => entry.name === name);
+  const live = state.cluster.find((entry) => entry.name === name);
+  const budget = (state.status.budgets || {})[name];
+  const peer = Boolean(node) && node.local === false;
+
+  return h('tr', { class: 'serve-group' },
+    h('td', { colspan: '6' }, h('div', { class: 'row wrap' },
+      h('span', { class: 's-name' }, name),
+      badge(peer ? 'info' : 'absent', peer ? 'peer' : 'this machine'),
+      node ? null : badge('failed', 'not registered'),
+      live && live.reachable === false ? badge('failed', 'unreachable') : null,
+      h('span', { class: 'faint small' }, `${group.length} server(s)`),
+      budget
+        ? h('span', { class: 'faint small' },
+          `${pct(budget.free_util, 0)} of a ${pct(budget.max_util, 0)} ceiling free · `
+          + `${bytes(budget.available_bytes)} available of ${bytes(budget.total_bytes)}`)
+        : null)));
 }
 
 function utilCell(util) {
@@ -302,13 +379,15 @@ function serverRow(server) {
     onClick: (event) => { event.stopPropagation(); fn(); },
   }, label);
   const live = LIVE.includes(server.status);
+  const peer = server.node_local === false;
 
   return h('tr', {
-    class: `serve-row${server.id === state.selected ? ' sel' : ''}`,
+    class: `serve-row${peer ? ' serve-peer' : ''}${server.id === state.selected ? ' sel' : ''}`,
     onClick: () => selectServer(server.id),
   },
   h('td', null,
-    h('div', { class: 's-name' }, server.name),
+    h('div', { class: 's-name' }, server.name,
+      peer ? h('span', { class: 'tag', style: { marginLeft: '6px' } }, server.node) : null),
     h('div', { class: 's-model truncate', title: server.model }, server.model)),
   h('td', { class: 'num' }, String(server.port)),
   h('td', { class: 'num' }, utilCell(server.util)),
@@ -393,6 +472,16 @@ function selectServer(id, tab) {
 async function refreshVerdict() {
   const server = selectedServer();
   if (!server) return;
+  // /api/system/budget/check reads this machine's meminfo and this machine's
+  // nvidia-smi. Running it for a server on a peer answers a question nobody
+  // asked: it would refuse launches the peer has ample room for, and bless ones
+  // it does not. The peer's own budget stands in its place.
+  if (server.node_local === false) {
+    state.verdict = null;
+    renderDetail();
+    renderDetailSafety();
+    return;
+  }
   const util = server.util;
   const query = util === null || util === undefined ? '' : `?util=${util}`;
   try {
@@ -400,6 +489,7 @@ async function refreshVerdict() {
     if (state.selected !== server.id) return;
     state.verdict = verdict;
     renderDetail();
+    renderDetailSafety();
   } catch (error) {
     console.error('budget check failed', error);
   }
@@ -419,11 +509,16 @@ function renderDetail() {
 
   const live = LIVE.includes(server.status);
   const blocked = state.verdict?.level === 'block';
+  const peer = server.node_local === false;
   state.nodes.detailBody = state.nodes.detailBody || h('div');
+  // Held across rebuilds so the peer figures can be refreshed on the list poll
+  // without re-parenting the log box below them.
+  state.nodes.detailSafety = state.nodes.detailSafety || h('div');
 
   mount(state.nodes.detail, panel(server.name, {
     sub: `${server.model} · ${server.url}`,
     actions: [
+      badge(peer ? 'info' : 'absent', server.node || LOCAL),
       badge(server.status),
       live
         ? h('button', { class: 'btn-sm', onClick: () => stopServer(server.id) }, 'Stop')
@@ -450,10 +545,54 @@ function renderDetail() {
           loadDetailBody();
         },
       }, label))),
-      state.verdict ? verdictNotice(state.verdict) : null,
+      state.nodes.detailSafety,
       state.nodes.detailBody),
   }));
+  renderDetailSafety();
   return undefined;
+}
+
+function renderDetailSafety() {
+  const host = state.nodes.detailSafety;
+  const server = selectedServer();
+  if (!host || !host.isConnected || !server) return;
+  mount(host, server.node_local === false
+    ? remoteLaunchNotice(server.node, server.util)
+    : (state.verdict ? verdictNotice(state.verdict) : null));
+}
+
+/* What there is to say about a launch aimed at another machine. The verdict the
+   rest of this view shows is computed here, against this host; for a peer the
+   honest substitute is that peer's own headroom plus where the decision is
+   actually taken. Showing the local verdict instead would read as an answer
+   about the wrong machine. */
+function remoteLaunchNotice(name, util) {
+  const budget = (state.status.budgets || {})[name];
+  const asked = util === null || util === undefined
+    ? 'No --gpu-memory-utilization is set, so vLLM applies its own default there.'
+    : `You are asking for ${util} of that node.`;
+
+  if (!budget) {
+    return notice('info',
+      h('strong', null, `Checked on ${name}, not here. `),
+      `GET /api/servers reported no budget for ${name}, so there is nothing to show from it. `
+      + `${asked} The memory guard runs on ${name} when the server starts.`);
+  }
+
+  const resident = budget.tenants.length
+    ? budget.tenants.map((tenant) => `${tenant.name} ${tenant.util}`).join(', ')
+    : 'nothing resident';
+
+  return notice('info',
+    h('strong', null, `Checked on ${name}, not here. `),
+    `${name} reports ${pct(budget.free_util, 0)} of its ${pct(budget.max_util, 0)} ceiling free: `
+    + `${bytes(budget.available_bytes)} available of ${bytes(budget.total_bytes)}, `
+    + `${pct(budget.committed_util, 0)} already committed (${resident}). ${asked}`,
+    h('div', { class: 'faint', style: { marginTop: '4px' } },
+      'This is that node\'s headroom, not a verdict — the memory guard runs on '
+      + `${name} at start time and it is the one that can refuse. Per-process GPU allocation is `
+      + 'only readable on the machine running this dashboard, so a peer is measured by the '
+      + 'utilisation fractions its containers declare.'));
 }
 
 function verdictNotice(verdict) {
@@ -1034,8 +1173,10 @@ async function openEditor(server, prefill = {}) {
     searchable: [],
     paths: EMPTY_PATHS,
     pathViews: [],
+    budgetFor: null,
     form: {
       name: server?.name || '',
+      node: server?.node || LOCAL,
       model: server?.model || prefill.model || '',
       port: server?.port || '',
       image: server?.image || '',
@@ -1046,7 +1187,7 @@ async function openEditor(server, prefill = {}) {
     },
   };
 
-  await Promise.all([loadPaths(), server ? null : suggest()]);
+  await Promise.all([loadPaths(), loadCluster(), server ? null : suggest()]);
   if (state.mode !== 'edit' || state.stopped) return;
   renderEditor();
   scheduleSafety();
@@ -1102,6 +1243,11 @@ function renderEditor() {
   const basics = h('div', { class: 'param-grid' },
     field('Name', input('name', { placeholder: 'qwen3-chat' }), {
       help: 'Names the container and identifies the server everywhere in this dashboard.',
+    }),
+    field('Node', nodePicker(), {
+      help: 'Which machine runs the container. Memory, ports and the model cache are that '
+        + "machine's alone, so a model the list below offers is only cached here — a peer "
+        + 'downloads it the first time that server starts.',
     }),
     field('Model', modelPicker, {
       flag: 'positional',
@@ -1173,6 +1319,39 @@ function renderEditor() {
   renderFootActions();
 }
 
+/** A select over the registry. Unreachable peers stay selectable: a node that
+ *  is down now is still where this server belongs. */
+function nodePicker() {
+  const editor = state.editor;
+  const choices = nodeChoices();
+  const label = (node) => {
+    const parts = [node.local ? 'this machine' : (node.address || 'peer')];
+    if (node.reachable === false) parts.push('unreachable');
+    // The local node's registry note is "this machine", which parts[0] just said.
+    if (node.note && node.note !== parts[0]) parts.push(node.note);
+    return `${node.name} — ${parts.join(' · ')}`;
+  };
+
+  const select = h('select', {
+    onChange: (event) => {
+      editor.form.node = event.target.value;
+      scheduleSafety();
+    },
+  },
+  choices.map((node) => h('option', {
+    value: node.name,
+    selected: node.name === editor.form.node,
+  }, label(node))),
+  // A server saved against a node that has since been deregistered keeps its
+  // name here rather than silently becoming one of the others.
+  choices.some((node) => node.name === editor.form.node)
+    ? null
+    : h('option', { value: editor.form.node, selected: true },
+      `${editor.form.node} — not registered, runs here`));
+
+  return select;
+}
+
 function applyPreset(preset) {
   const missing = [];
   for (const [dest, value] of Object.entries(preset.args)) {
@@ -1195,6 +1374,23 @@ const scheduleSafety = debounce(() => checkSafety(), 300);
 
 async function checkSafety() {
   if (state.mode !== 'edit' || !state.editor) return;
+  const node = state.editor.form.node;
+  if (isPeer(node)) {
+    // Budgets ride along with GET /api/servers, so re-read them once per node
+    // the operator picks — not on every keystroke that moves the util slider,
+    // which is what actually drives this call.
+    if (state.editor.budgetFor !== node) {
+      state.editor.budgetFor = node;
+      await refreshStatus({ render: false });
+      if (state.mode !== 'edit' || !state.editor) return;
+    }
+    state.editor.verdict = null;
+    mount(state.nodes.safety,
+      remoteLaunchNotice(node, state.editor.args.gpu_memory_utilization));
+    renderFootActions();
+    return;
+  }
+  state.editor.budgetFor = null;
   const util = state.editor.args.gpu_memory_utilization;
   const query = util === undefined || util === null || util === '' ? '' : `?util=${util}`;
   let verdict;
@@ -1262,6 +1458,7 @@ async function save({ start = false, force = false } = {}) {
 
   const payload = {
     name: form.name.trim(),
+    node: form.node || LOCAL,
     model: form.model.trim(),
     port,
     served_name: form.served_name.trim(),

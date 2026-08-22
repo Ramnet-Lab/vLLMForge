@@ -3,7 +3,10 @@
    It answers three questions in priority order: how much memory is left before
    the box locks up, what is holding that memory, and what is running. The
    memory panel comes first and is the largest element on purpose — on a
-   unified-memory host every other failure is recoverable and that one is not. */
+   unified-memory host every other failure is recoverable and that one is not.
+
+   With a second machine in the registry that first question has one answer per
+   node, so the panel is one card per node rather than one machine's figures. */
 
 import { get, stream } from '../api.js';
 import {
@@ -28,9 +31,27 @@ const utilText = (value) => (Number.isFinite(value) ? value.toFixed(2) : '—');
 const reading = (value, suffix) =>
   (Number.isFinite(value) ? `${Math.round(value)}${suffix}` : '—');
 
-/* --- host memory -------------------------------------------------------- */
+/* --- cluster memory ----------------------------------------------------- */
 
-function memorySection(budget) {
+function memoryBars(segments, total) {
+  const scale = total || 1;
+  return h('div', { class: 'stack' },
+    h('div', { class: 'ov-track' },
+      segments.filter((seg) => seg.value > 0).map((seg) => h('span', {
+        class: `ov-seg ov-c-${seg.key}`,
+        style: { width: `${(seg.value / scale) * 100}%` },
+        title: `${seg.label}: ${bytes(seg.value)}`,
+      }))),
+    h('div', { class: 'legend ov-legend' },
+      segments.map((seg) => h('span', { title: seg.note },
+        h('i', { class: `ov-c-${seg.key}` }),
+        `${seg.label} · ${bytes(seg.value)}`))));
+}
+
+/* Only the machine this dashboard runs on can be broken down this far:
+   nvidia-smi reports per-process memory for its own box, and the committed
+   fractions come from containers we can inspect without ssh. */
+function localMemory(budget) {
   const total = budget.total_bytes || 1;
   const engines = Math.max(0, budget.committed_bytes || 0);
   // occupied_bytes is max(committed, measured), so the excess is allocation by
@@ -66,18 +87,6 @@ function memorySection(budget) {
     },
   ];
 
-  const track = h('div', { class: 'ov-track' },
-    segments.filter((seg) => seg.value > 0).map((seg) => h('span', {
-      class: `ov-seg ov-c-${seg.key}`,
-      style: { width: `${(seg.value / total) * 100}%` },
-      title: `${seg.label}: ${bytes(seg.value)}`,
-    })));
-
-  const legend = h('div', { class: 'legend ov-legend' },
-    segments.map((seg) => h('span', { title: seg.note },
-      h('i', { class: `ov-c-${seg.key}` }),
-      `${seg.label} · ${bytes(seg.value)}`)));
-
   const tight = budget.free_util <= 0.02;
   const warm = !tight && budget.occupied_util > budget.warn_util;
 
@@ -87,20 +96,13 @@ function memorySection(budget) {
       stat('Committed', utilText(budget.committed_util), bytes(budget.committed_bytes)),
       stat('Free to allocate', utilText(budget.free_util), `of a ${utilText(budget.max_util)} ceiling`),
       stat('MemAvailable', bytes(budget.available_bytes), `${bytes(budget.free_bytes)} actually free`)),
-    track,
-    legend,
-    notice('info',
-      h('strong', null, 'GPU memory is host memory on this machine. '),
-      h('span', null,
-        `--gpu-memory-utilization 0.50 reserves half of all ${bytes(total)}, so the fractions of `
-        + 'every running engine add up, and overcommitting does not run slowly — it freezes the '
-        + 'box while CUDA graphs are captured.')),
+    memoryBars(segments, total),
     tight || warm
       ? notice(tight ? 'danger' : 'warn',
-          h('strong', null, tight ? 'No room for another engine. ' : 'Getting tight. '),
+          h('strong', null, tight ? 'No room for another engine here. ' : 'Getting tight. '),
           h('span', null, tight
             ? `Everything above ${utilText(budget.max_util)} total utilisation is refused; stop a `
-              + 'server before starting or fine-tuning anything.'
+              + 'server before starting or fine-tuning anything, or place the next one on a peer.'
             : `Total utilisation has passed the ${utilText(budget.warn_util)} warning line. Keep `
               + '--max-num-seqs low; concurrency spikes are what actually kill this box.'))
       : null,
@@ -121,6 +123,113 @@ function memorySection(budget) {
               h('td', { class: 'num' }, `${utilText(tenant.util)}${tenant.implicit ? ' *' : ''}`),
               h('td', { class: 'num' }, bytes(tenant.bytes_committed)))))))
       : h('p', { class: 'ov-note' }, 'No vLLM engine is holding a reservation right now.'));
+}
+
+/* A peer is read over ssh: /proc/meminfo and docker ps, nothing else. Used is
+   whatever the kernel does not count as available, which is a coarser split
+   than the local card and is labelled as such. */
+function peerMemory(node) {
+  const total = node.total_bytes || 0;
+  const available = Math.max(0, node.available_bytes || 0);
+  const used = Math.max(0, total - available);
+  const running = node.containers || [];
+
+  const segments = [
+    {
+      key: 'other',
+      label: 'In use',
+      value: used,
+      note: 'everything MemAvailable does not count as reclaimable, engines included',
+    },
+    {
+      key: 'free',
+      label: 'Available',
+      value: available,
+      note: 'what a new engine on this node could take before the guard steps in',
+    },
+  ];
+
+  return h('div', { class: 'stack' },
+    h('div', { class: 'ov-tiles' },
+      stat('Host memory', bytes(total), 'shared by the CPU and the GPU'),
+      stat('In use', bytes(used), `${Math.round((used / (total || 1)) * 100)}% of the node`),
+      stat('MemAvailable', bytes(available), `${bytes(node.free_bytes)} actually free`),
+      stat('Containers', String(running.length), 'running under its docker daemon')),
+    memoryBars(segments, total),
+    running.length
+      ? h('p', { class: 'ov-note' }, running.map((container) => container.name).join(', '))
+      : h('p', { class: 'ov-note' }, 'Nothing is running on this node.'),
+    h('p', { class: 'ov-note' },
+      'No per-process GPU figure: nvidia-smi reports on the machine it runs on, and this peer is '
+      + 'reached over ssh. What it has committed through vLLM flags is on the Serve tab, next to '
+      + 'the servers placed there.'));
+}
+
+function nodeHeader(node) {
+  const running = node.containers || [];
+  // The local node's registry note is "this machine", which its badge already says.
+  const meta = [node.address, node.docker ? `docker ${node.docker}` : null,
+    node.local ? null : node.note].filter(Boolean).join(' · ');
+
+  return h('div', { class: 'row wrap ov-node-head' },
+    h('strong', null, node.name),
+    badge(node.local ? 'info' : 'plain', node.local ? 'this machine' : 'peer'),
+    badge(node.reachable ? 'running' : 'failed', node.reachable ? 'reachable' : 'unreachable'),
+    node.reachable
+      ? badge(node.has_nvidia_runtime ? 'succeeded' : 'failed',
+          node.has_nvidia_runtime ? 'nvidia runtime' : 'no nvidia runtime')
+      : null,
+    node.reachable
+      ? h('span', {
+          class: 'badge plain',
+          title: running.map((container) => container.name).join('\n'),
+        }, `${running.length} container(s)`)
+      : null,
+    h('span', { class: 'spacer' }),
+    meta ? h('span', { class: 'ov-note' }, meta) : null);
+}
+
+function nodeCard(node, budget) {
+  const down = !node.reachable;
+  return h('div', { class: `ov-node${down ? ' down' : ''}` },
+    nodeHeader(node),
+    down
+      ? notice('danger',
+          h('strong', null, 'Unreachable. '),
+          h('span', null, node.error
+            || 'Its docker daemon did not answer. Nothing can be placed here until it does.'))
+      : null,
+    // /proc/meminfo is read locally and stays readable when the docker socket is
+    // not, so this card keeps its figures. A peer's numbers come over the same
+    // ssh that just failed, and 0 GiB would be a lie rather than a measurement.
+    node.local ? localMemory(budget) : (down ? null : peerMemory(node)));
+}
+
+function clusterSection(payload) {
+  const registry = payload.nodes || [];
+  if (!registry.length) {
+    // /api/nodes sshes to every peer, so it is the call here most likely to hang
+    // or fail, and it always names this machine when it does answer. Losing it
+    // must not take the local figures down with it.
+    return h('div', { class: 'stack' },
+      notice('warn',
+        h('strong', null, 'No node list. '),
+        h('span', null, 'GET /api/nodes named no machines, which it cannot do while it is '
+          + 'working. Only this one is shown until it answers again.')),
+      localMemory(payload.budget));
+  }
+  const local = registry.find((node) => node.local) || {};
+
+  return h('div', { class: 'stack' },
+    registry.map((node) => nodeCard(node, payload.budget)),
+    notice('info',
+      h('strong', null, 'GPU memory is host memory on these machines. '),
+      h('span', null,
+        '--gpu-memory-utilization 0.50 reserves half of all '
+        + `${bytes(local.total_bytes || payload.budget.total_bytes)} on the node it runs on, so the `
+        + 'fractions of every engine on that node add up, and overcommitting does not run slowly — '
+        + 'it freezes that box while CUDA graphs are captured. The fractions do not travel: a '
+        + 'peer\'s ceiling is its own.')));
 }
 
 /* --- live telemetry ----------------------------------------------------- */
@@ -172,16 +281,24 @@ function telemetrySection(snapshot) {
 function serversSection(payload) {
   const managed = payload.servers || [];
   const foreign = payload.foreign || [];
+  // One machine needs no column telling you which machine it is.
+  const clustered = (payload.nodes || []).length > 1;
   if (!managed.length && !foreign.length) {
     return empty('Nothing is serving', 'No managed or hand-launched vLLM container is running.',
       h('button', { class: 'btn-primary', onClick: () => ctxRef.navigate('serve') },
         'Define a server'));
   }
 
+  // Foreign containers are discovered with a plain docker ps on this machine,
+  // so anything without a node of its own is here.
   const row = (entry, { id = null, hand = false } = {}) => h('tr', null,
     h('td', null,
       h('div', { class: 'nowrap' }, entry.name),
       hand ? h('div', { class: 'ov-note' }, 'started outside the dashboard') : null),
+    clustered
+      ? h('td', null, badge(entry.node_local === false ? 'info' : 'plain',
+          entry.node || payload.local || 'local'))
+      : null,
     h('td', null, badge(entry.status, entry.status)),
     h('td', null, h('span', { class: 'truncate ov-model' }, entry.model || '—')),
     h('td', { class: 'num' }, entry.port || '—'),
@@ -196,6 +313,7 @@ function serversSection(payload) {
     h('table', null,
       h('thead', null, h('tr', null,
         h('th', null, 'Server'),
+        clustered ? h('th', null, 'Node') : null,
         h('th', null, 'Status'),
         h('th', null, 'Model'),
         h('th', { class: 'num' }, 'Port'),
@@ -334,16 +452,29 @@ function fill(node, settled, build) {
 }
 
 async function refresh({ withImages = false } = {}) {
-  const [budget, servers, jobs, guard, imageResult] = await Promise.allSettled([
+  const [budget, registry, servers, jobs, guard, imageResult] = await Promise.allSettled([
     get('/system/budget'),
+    get('/nodes'),
     get('/servers'),
     get('/jobs?limit=8'),
     get('/system/memguard'),
     withImages ? get('/system/images') : Promise.resolve(images),
   ]);
 
+  // The panel wants both calls: /api/nodes for who is in the cluster, and
+  // /api/system/budget for the per-tenant detail only this machine can measure.
+  // Without the budget there is nothing to draw; without the registry the panel
+  // falls back to this machine alone rather than to an error.
+  const cluster = budget.status === 'rejected' ? budget : {
+    status: 'fulfilled',
+    value: {
+      ...(registry.status === 'fulfilled' ? registry.value : {}),
+      budget: budget.value,
+    },
+  };
+
   const ok = [
-    fill(region.memory, budget, memorySection),
+    fill(region.memory, cluster, clusterSection),
     fill(region.servers, servers, serversSection),
     fill(region.jobs, jobs, jobsSection),
   ].every(Boolean);
@@ -395,7 +526,10 @@ export async function render(container, ctx) {
       h('div', { class: 'page-actions' },
         h('button', { class: 'btn-sm', onClick: () => refresh({ withImages: true }) }, 'Refresh'))),
     region.memguard,
-    panel('Host memory', { sub: 'GET /api/system/budget', body: region.memory }),
+    panel('Cluster memory', {
+      sub: 'GET /api/nodes · /api/system/budget',
+      body: region.memory,
+    }),
     h('div', { class: 'grid cols-2' },
       panel('Live telemetry', { sub: 'nvidia-smi · /proc', body: region.telemetry }),
       panel('Environment', { sub: 'images and paths', body: region.environment })),
@@ -459,4 +593,10 @@ const CSS = `
   display: inline-block; max-width: 34ch; vertical-align: bottom;
   font-family: var(--mono); font-size: 12px;
 }
+.ov-node {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.ov-node.down { border-color: var(--danger); }
+.ov-node-head strong { font-size: 13px; }
 `;
