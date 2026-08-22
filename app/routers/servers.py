@@ -180,6 +180,20 @@ async def preview(server_id: int) -> dict:
     }
 
 
+@router.post("/{server_id}/launch", status_code=202)
+async def launch(server_id: int, force: bool = False) -> dict:
+    """Start a server, doing whatever has to happen first.
+
+    Returns a job rather than a result: a pooled launch may have to copy the
+    model to another machine, which takes minutes, and that is progress to
+    watch rather than an error to report.
+    """
+    try:
+        return {"job_id": await svc.submit_launch(server_id, force=force)}
+    except KeyError:
+        raise HTTPException(404, "no such server") from None
+
+
 @router.post("/{server_id}/start")
 async def start(server_id: int, force: bool = False) -> dict:
     try:

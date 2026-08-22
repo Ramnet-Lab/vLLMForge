@@ -8,9 +8,15 @@
 
    A server also names the machine it runs on. Memory is the one thing that does
    not travel between them, so every figure in this view belongs to exactly one
-   node and says which. */
+   node and says which.
 
-import { ApiError, del, get, getText, patch, post } from '../api.js';
+   The one exception is a pooled server: one engine split by layer across
+   several machines, whose memory really is the sum of theirs. Nothing local can
+   answer for it — the per-node budget check least of all — so everything a
+   pooled definition shows comes from POST /api/servers/pool/plan, which asks
+   every node in turn. */
+
+import { ApiError, del, get, getText, patch, post, stream } from '../api.js';
 import {
   badge, bytes, confirmDialog, copyButton, count, debounce, empty, ensureStyles, field, h,
   logBox, modal, mount, notice, panel, pct, spinner, stat, toast,
@@ -53,6 +59,22 @@ const STYLES = `
 .serve-pick { display: flex; flex-direction: column; gap: 6px; }
 .serve-pick-row { display: flex; align-items: center; gap: 6px; }
 .serve-pick-row select { flex: 1 1 auto; min-width: 0; }
+.serve-seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; align-self: flex-start; }
+.serve-seg button { border: 0; border-radius: 0; background: none; color: var(--text-dim);
+  padding: 6px 12px; font-size: 12.5px; }
+.serve-seg button[aria-pressed="true"] { background: var(--accent-dim); color: var(--text); }
+.serve-pool { display: grid; gap: 10px; }
+.serve-pool-list { display: flex; flex-direction: column; gap: 6px; }
+.serve-pool-item { display: flex; align-items: center; gap: 9px; padding: 7px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-sunken); }
+.serve-pool-item .p-name { font-weight: 600; }
+.serve-pool-item .p-wire { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.serve-pool-add { display: flex; align-items: center; gap: 6px; }
+.serve-pool-add select { flex: 0 1 340px; min-width: 0; }
+.serve-pool-plan { display: grid; gap: 8px; }
+.serve-sync { display: grid; gap: 6px; padding: 9px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-sunken); }
 `;
 
 /* Two of these three are configurations that have actually run co-resident on
@@ -117,6 +139,10 @@ const state = {
   editor: null,
   nodes: {},
   log: { lines: [], box: null },
+  // What the selected pooled server's machines are doing, and what they could
+  // hold. Both are cluster-wide questions, so neither can come off /api/servers.
+  pool: { forServer: null, status: null, plan: null },
+  sync: null,
   timers: [],
   stopped: false,
 };
@@ -167,17 +193,22 @@ export async function render(container, ctx) {
 
   state.timers.push(setInterval(() => { if (state.mode === 'list') refreshStatus(); }, 5000));
   state.timers.push(setInterval(tickDetail, 3000));
+  // Pool status inspects a container on every peer over ssh, which is far too
+  // slow to ride along with the three-second detail poll.
+  state.timers.push(setInterval(refreshPoolStatus, 10000));
 }
 
 export function dispose() {
   state.stopped = true;
   for (const timer of state.timers) clearInterval(timer);
   state.timers = [];
+  closeSync();
   state.editor = null;
   state.selected = null;
   state.detailKey = '';
   state.nodes = {};
   state.cluster = [];
+  state.pool = { forServer: null, status: null, plan: null };
 }
 
 function routeDetail(ctx) {
@@ -212,6 +243,23 @@ const nodeChoices = () => (state.cluster.length ? state.cluster : (state.status.
 /** An unregistered name resolves to this machine on the backend (nodes.by_name),
  *  so only a name that matches a registered peer is remote. */
 const isPeer = (name) => nodeChoices().some((node) => node.name === name && node.local === false);
+
+/** The machines a server spans, head first. One name is not a pool: the backend
+ *  only splits the engine when there are two or more. */
+function poolOf(server) {
+  const pool = server?.pool_nodes;
+  return Array.isArray(pool) && pool.length > 1 ? pool.map(String) : [];
+}
+
+/* Head first, always, and joined rather than listed: the head is the node whose
+   address clients hit, so the order is information and not presentation. */
+const poolLabel = (pool) => pool.join(' + ');
+
+const stagesPhrase = (pool) => `${pool.slice(1).join(', ')} `
+  + `hold${pool.length === 2 ? 's' : ''} the later pipeline stages`;
+
+const poolTitle = (pool) => `pooled engine · ${pool[0]} is the Ray head and serves the HTTP `
+  + `frontend · ${stagesPhrase(pool)}`;
 
 /* --- status -------------------------------------------------------------- */
 
@@ -313,27 +361,34 @@ function renderServerTable() {
         h('th', null, 'Status'),
         h('th', null, 'Serving'),
         h('th', null, ''))),
-      groupByNode(rows).map(([name, group]) => h('tbody', null,
-        clustered ? nodeGroupRow(name, group) : null,
-        group.map(serverRow))))));
+      groupByNode(rows).map((group) => h('tbody', null,
+        clustered ? nodeGroupRow(group) : null,
+        group.servers.map(serverRow))))));
 }
 
-/** Servers grouped by node, in registry order. */
+/** Servers grouped by where they run. A pooled server is not filed under its
+ *  head: it does not belong to that machine any more than to the others, so its
+ *  whole span is a group of its own. */
 function groupByNode(rows) {
   const order = (state.status.nodes || []).map((node) => node.name);
   const groups = new Map();
   for (const server of rows) {
-    const name = server.node || LOCAL;
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push(server);
+    const pool = poolOf(server);
+    const head = pool.length ? pool[0] : (server.node || LOCAL);
+    const key = pool.length ? `pool:${pool.join(',')}` : `node:${head}`;
+    if (!groups.has(key)) groups.set(key, { head, pool, servers: [] });
+    groups.get(key).servers.push(server);
   }
   // A server can still name a node that has since been deregistered. The
   // backend runs it here rather than losing it, so it goes last but stays.
-  const rank = (name) => (order.indexOf(name) === -1 ? order.length : order.indexOf(name));
-  return [...groups].sort((a, b) => rank(a[0]) - rank(b[0]));
+  const rank = (group) => (order.indexOf(group.head) === -1 ? order.length
+    : order.indexOf(group.head));
+  return [...groups.values()].sort((a, b) => rank(a) - rank(b));
 }
 
-function nodeGroupRow(name, group) {
+function nodeGroupRow(group) {
+  if (group.pool.length) return poolGroupRow(group);
+  const name = group.head;
   const node = (state.status.nodes || []).find((entry) => entry.name === name);
   const live = state.cluster.find((entry) => entry.name === name);
   const budget = (state.status.budgets || {})[name];
@@ -345,11 +400,34 @@ function nodeGroupRow(name, group) {
       badge(peer ? 'info' : 'absent', peer ? 'peer' : 'this machine'),
       node ? null : badge('failed', 'not registered'),
       live && live.reachable === false ? badge('failed', 'unreachable') : null,
-      h('span', { class: 'faint small' }, `${group.length} server(s)`),
+      h('span', { class: 'faint small' }, `${group.servers.length} server(s)`),
       budget
         ? h('span', { class: 'faint small' },
           `${pct(budget.free_util, 0)} of a ${pct(budget.max_util, 0)} ceiling free · `
           + `${bytes(budget.available_bytes)} available of ${bytes(budget.total_bytes)}`)
+        : null)));
+}
+
+function poolGroupRow(group) {
+  const budgets = state.status.budgets || {};
+  // The same sum cluster.plan() reports as pooled_bytes, from figures already in
+  // hand — worth showing here rather than sshing to every node for the table.
+  const known = group.pool.filter((name) => budgets[name]);
+  const ceiling = known.reduce(
+    (total, name) => total + budgets[name].max_util * budgets[name].total_bytes, 0);
+  const down = group.pool.filter(
+    (name) => state.cluster.some((entry) => entry.name === name && entry.reachable === false));
+
+  return h('tr', { class: 'serve-group' },
+    h('td', { colspan: '6' }, h('div', { class: 'row wrap' },
+      h('span', { class: 's-name', title: poolTitle(group.pool) }, poolLabel(group.pool)),
+      badge('info', 'pooled'),
+      down.length ? badge('failed', `${down.join(', ')} unreachable`) : null,
+      h('span', { class: 'faint small' }, `${group.servers.length} server(s)`),
+      h('span', { class: 'faint small' },
+        `${group.head} is the head and answers on its address`),
+      known.length === group.pool.length
+        ? h('span', { class: 'faint small' }, `${bytes(ceiling)} pooled ceiling`)
         : null)));
 }
 
@@ -379,15 +457,20 @@ function serverRow(server) {
     onClick: (event) => { event.stopPropagation(); fn(); },
   }, label);
   const live = LIVE.includes(server.status);
+  const pool = poolOf(server);
   const peer = server.node_local === false;
 
   return h('tr', {
-    class: `serve-row${peer ? ' serve-peer' : ''}${server.id === state.selected ? ' sel' : ''}`,
+    class: `serve-row${peer || pool.length ? ' serve-peer' : ''}`
+      + `${server.id === state.selected ? ' sel' : ''}`,
     onClick: () => selectServer(server.id),
   },
   h('td', null,
     h('div', { class: 's-name' }, server.name,
-      peer ? h('span', { class: 'tag', style: { marginLeft: '6px' } }, server.node) : null),
+      pool.length
+        ? h('span', { class: 'tag', style: { marginLeft: '6px' }, title: poolTitle(pool) },
+          poolLabel(pool))
+        : (peer ? h('span', { class: 'tag', style: { marginLeft: '6px' } }, server.node) : null)),
     h('div', { class: 's-model truncate', title: server.model }, server.model)),
   h('td', { class: 'num' }, String(server.port)),
   h('td', { class: 'num' }, utilCell(server.util)),
@@ -462,16 +545,26 @@ function selectServer(id, tab) {
   state.selected = id;
   state.detailTab = tab || state.detailTab || 'command';
   state.verdict = null;
+  state.pool = { forServer: null, status: null, plan: null };
   state.log = { lines: [], box: null };
   renderServerTable();
   renderDetail();
   loadDetailBody();
   refreshVerdict();
+  loadPoolDetail();
 }
 
 async function refreshVerdict() {
   const server = selectedServer();
   if (!server) return;
+  // A pooled engine is sized against every node it spans; this machine's budget
+  // is not the question. loadPoolDetail() answers the one that is.
+  if (poolOf(server).length) {
+    state.verdict = null;
+    renderDetail();
+    renderDetailSafety();
+    return;
+  }
   // /api/system/budget/check reads this machine's meminfo and this machine's
   // nvidia-smi. Running it for a server on a peer answers a question nobody
   // asked: it would refuse launches the peer has ample room for, and bless ones
@@ -509,6 +602,7 @@ function renderDetail() {
 
   const live = LIVE.includes(server.status);
   const blocked = state.verdict?.level === 'block';
+  const pool = poolOf(server);
   const peer = server.node_local === false;
   state.nodes.detailBody = state.nodes.detailBody || h('div');
   // Held across rebuilds so the peer figures can be refreshed on the list poll
@@ -516,9 +610,13 @@ function renderDetail() {
   state.nodes.detailSafety = state.nodes.detailSafety || h('div');
 
   mount(state.nodes.detail, panel(server.name, {
-    sub: `${server.model} · ${server.url}`,
+    sub: pool.length
+      ? `${server.model} · ${server.url} on ${pool[0]}, the head`
+      : `${server.model} · ${server.url}`,
     actions: [
-      badge(peer ? 'info' : 'absent', server.node || LOCAL),
+      pool.length
+        ? badge('info', `pooled · ${poolLabel(pool)}`)
+        : badge(peer ? 'info' : 'absent', server.node || LOCAL),
       badge(server.status),
       live
         ? h('button', { class: 'btn-sm', onClick: () => stopServer(server.id) }, 'Stop')
@@ -556,9 +654,107 @@ function renderDetailSafety() {
   const host = state.nodes.detailSafety;
   const server = selectedServer();
   if (!host || !host.isConnected || !server) return;
+  const pool = poolOf(server);
+  if (pool.length) {
+    mount(host, pooledDetailNotice(server, pool));
+    return;
+  }
   mount(host, server.node_local === false
     ? remoteLaunchNotice(server.node, server.util)
     : (state.verdict ? verdictNotice(state.verdict) : null));
+}
+
+/* What is true of a pooled engine and of nothing else here: it spans machines,
+   its ceiling is their sum, and it dies whole. The per-node verdict the rest of
+   the view shows would be an answer to a question nobody asked. */
+function pooledDetailNotice(server, pool) {
+  const status = state.pool.forServer === server.id ? state.pool.status : null;
+  const plan = state.pool.forServer === server.id ? state.pool.plan : null;
+  const workers = status?.workers || [];
+  const joined = Number.isFinite(status?.nodes) ? status.nodes : null;
+  const expected = status?.expected || pool.length;
+  const live = LIVE.includes(server.status);
+  // A pool that is short of nodes matters while the engine is meant to be up;
+  // for a stopped definition it is simply the resting state.
+  const short = live && status && status.running === false;
+
+  return notice(short ? 'warn' : 'info',
+    h('strong', null, `Pooled across ${poolLabel(pool)}. `),
+    `${pool[0]} runs the Ray head and the HTTP frontend, so ${server.url} is the only address `
+    + `clients use. ${stagesPhrase(pool)} — no client talks to them directly.`,
+    h('div', { style: { marginTop: '4px' } },
+      status
+        ? (live
+          ? `Ray: ${status.running ? 'up' : 'short of nodes'}`
+            + `${joined === null ? '' : ` · ${joined} of ${expected} node(s) joined`}`
+            + (workers.length
+              ? ` · ${workers.map((w) => `${w.node} ${w.status}`).join(', ')}`
+              : '')
+          : `Not running: no Ray cluster for this engine yet. Starting it brings the head up on ${
+            pool[0]} and a worker on ${pool.slice(1).join(', ')}.`)
+        : 'Reading pool status…'),
+    plan?.ok === false && plan.reason
+      ? h('div', { class: 'faint', style: { marginTop: '4px' } },
+        `A relaunch would be refused: ${plan.reason}`)
+      : null,
+    plan?.ok
+      ? h('div', { class: 'faint', style: { marginTop: '4px' } },
+        `Ceiling ${bytes(plan.pooled_bytes)} across ${plan.pipeline_parallel_size} machines, `
+        + `against ${bytes(plan.single_node_bytes)} on ${pool[0]} alone · `
+        + `--pipeline-parallel-size ${plan.pipeline_parallel_size}`)
+      : null,
+    fixedWorldSizeLine());
+}
+
+/* The single thing a pooled engine does that surprises people. vLLM builds the
+   executor for exactly this world size; a node that goes away takes the whole
+   engine with it, and without this sentence that reads as the dashboard
+   breaking. */
+const fixedWorldSizeLine = () => h('div', { class: 'faint', style: { marginTop: '4px' } },
+  'Fixed world size: the engine is built for exactly these machines. If one of them leaves — a '
+  + 'reboot, a dropped link, a stopped worker container — vLLM aborts the engine and it has to '
+  + 'be started again. That is how vLLM\'s executor works, not a fault here.');
+
+async function loadPoolDetail() {
+  const server = selectedServer();
+  if (!server) return;
+  const pool = poolOf(server);
+  if (!pool.length) {
+    state.pool = { forServer: null, status: null, plan: null };
+    return;
+  }
+  state.pool = { forServer: server.id, status: null, plan: null };
+  renderDetailSafety();
+  const query = `nodes=${pool.map(encodeURIComponent).join(',')}&server_id=${server.id}`;
+  const [status, plan] = await Promise.all([
+    get(`/servers/pool/status?${query}`).catch((error) => ({ error: error.message })),
+    // The plan is what this pool could hold and whether it could start again;
+    // it walks every node, so it is read once per selection, not on the poll.
+    post('/servers/pool/plan', { nodes: pool, model: server.model })
+      .catch((error) => ({ ok: false, reason: error.message })),
+  ]);
+  if (state.pool.forServer !== server.id) return;
+  state.pool.status = status;
+  state.pool.plan = plan;
+  renderDetailSafety();
+}
+
+async function refreshPoolStatus() {
+  const server = selectedServer();
+  if (state.mode !== 'list' || !server || state.pool.forServer !== server.id) return;
+  const pool = poolOf(server);
+  if (!pool.length) return;
+  const query = `nodes=${pool.map(encodeURIComponent).join(',')}&server_id=${server.id}`;
+  let status;
+  try {
+    status = await get(`/servers/pool/status?${query}`);
+  } catch (error) {
+    console.error('pool status failed', error);
+    return;
+  }
+  if (state.pool.forServer !== server.id) return;
+  state.pool.status = status;
+  renderDetailSafety();
 }
 
 /* What there is to say about a launch aimed at another machine. The verdict the
@@ -1148,6 +1344,9 @@ function paramSection(section, { collapsed = false } = {}) {
 }
 
 function applyFilter(query) {
+  // The debounce outlives the form it filters: saving or cancelling within the
+  // keystroke window tears the editor down before this runs.
+  if (!state.editor) return;
   const needle = query.trim().toLowerCase();
   for (const el of state.editor.searchable) {
     el.hidden = Boolean(needle) && !el.dataset.search.includes(needle);
@@ -1163,10 +1362,16 @@ function applyFilter(query) {
 
 async function openEditor(server, prefill = {}) {
   state.mode = 'edit';
+  closeSync();
+  const pool = poolOf(server);
   state.editor = {
     id: server?.id ?? null,
     args: { ...(server?.args || {}) },
     verdict: null,
+    plan: null,
+    planning: false,
+    planKey: '',
+    syncChecks: new Map(),
     fields: new Map(),
     setters: new Map(),
     sections: [],
@@ -1177,6 +1382,8 @@ async function openEditor(server, prefill = {}) {
     form: {
       name: server?.name || '',
       node: server?.node || LOCAL,
+      pooled: pool.length > 0,
+      pool,
       model: server?.model || prefill.model || '',
       port: server?.port || '',
       image: server?.image || '',
@@ -1191,6 +1398,7 @@ async function openEditor(server, prefill = {}) {
   if (state.mode !== 'edit' || state.stopped) return;
   renderEditor();
   scheduleSafety();
+  if (state.editor.form.pooled) runPlan();
 }
 
 async function suggest() {
@@ -1205,6 +1413,7 @@ async function suggest() {
 }
 
 function closeEditor() {
+  closeSync();
   state.editor = null;
   state.detailKey = '';
   renderList();
@@ -1222,6 +1431,11 @@ function renderEditor() {
   state.nodes.safety = h('div', { class: 'row', style: { flex: '1 1 340px' } },
     h('span', { class: 'faint small' }, 'checking the memory budget…'));
   state.nodes.footActions = h('div', { class: 'row' });
+  // Held across re-plans: the plan report is rebuilt whenever the answer
+  // changes, but a running sync must keep its stream and its progress bar.
+  state.nodes.planBox = h('div', { class: 'serve-pool-plan' });
+  state.nodes.syncBox = h('div');
+  state.nodes.poolBox = h('div', { class: 'param-section' });
 
   const flagCount = [...state.schema.featured, ...state.schema.advanced]
     .reduce((total, section) => total + section.flags.length, 0);
@@ -1232,7 +1446,7 @@ function renderEditor() {
     value: editor.form.model,
     lead: 'choose a model…',
     placeholder: 'org/repo, or a path the container can see',
-    onChange: (next) => { editor.form.model = next; },
+    onChange: (next) => { editor.form.model = next; schedulePlan(); },
     extra: h('button', {
       class: 'btn-sm',
       title: 'Re-read the model cache and the outputs directory',
@@ -1240,15 +1454,22 @@ function renderEditor() {
     }, 'Refresh'),
   });
 
+  state.nodes.nodeField = field('Node', nodePicker(), {
+    help: 'Which machine runs the container. Memory, ports and the model cache are that '
+      + "machine's alone, so a model the list below offers is only cached here — a peer "
+      + 'downloads it the first time that server starts.',
+  });
+
   const basics = h('div', { class: 'param-grid' },
     field('Name', input('name', { placeholder: 'qwen3-chat' }), {
       help: 'Names the container and identifies the server everywhere in this dashboard.',
     }),
-    field('Node', nodePicker(), {
-      help: 'Which machine runs the container. Memory, ports and the model cache are that '
-        + "machine's alone, so a model the list below offers is only cached here — a peer "
-        + 'downloads it the first time that server starts.',
+    field('Placement', placementControl(), {
+      help: 'One engine on one machine, or one engine split by layer across several so their '
+        + 'memory adds up. Pooling costs a network hop per token per stage boundary and a fixed '
+        + 'world size; a model that fits on one box should stay on one box.',
     }),
+    state.nodes.nodeField,
     field('Model', modelPicker, {
       flag: 'positional',
       help: 'What is cached on this box, plus what the Fine-tune and Heretic tabs have written '
@@ -1296,6 +1517,7 @@ function renderEditor() {
       actions: h('button', { onClick: closeEditor }, 'Cancel'),
       body: h('div', { class: 'serve-form' },
         basics,
+        state.nodes.poolBox,
         h('div', { class: 'param-section' },
           h('h3', null, 'Presets'),
           h('p', { class: 'blurb' },
@@ -1316,6 +1538,8 @@ function renderEditor() {
     }),
     h('div', { class: 'serve-foot' }, state.nodes.safety, state.nodes.footActions));
 
+  renderPoolBox();
+  syncPlacement();
   renderFootActions();
 }
 
@@ -1352,6 +1576,409 @@ function nodePicker() {
   return select;
 }
 
+/* --- pooling ------------------------------------------------------------- */
+
+/* A pooled definition answers to nothing local: which machines, in which order,
+   and whether the cluster can actually take the launch all come from
+   POST /api/servers/pool/plan. The form re-asks it on every change to the node
+   set or the model, because both are things the plan is about. */
+
+function placementControl() {
+  const seg = h('div', { class: 'serve-seg' });
+  const single = nodeChoices().length < 2;
+  const button = (pooled, label) => h('button', {
+    type: 'button',
+    'aria-pressed': String(state.editor.form.pooled === pooled),
+    disabled: pooled && single,
+    title: pooled && single
+      ? 'Only one machine is registered. Add a peer on the Nodes tab first.' : '',
+    onClick: () => setPooled(pooled),
+  }, label);
+  state.nodes.segButtons = [button(false, 'One machine'), button(true, 'Pooled across machines')];
+  mount(seg, state.nodes.segButtons);
+  return seg;
+}
+
+function setPooled(pooled) {
+  const editor = state.editor;
+  if (editor.form.pooled === pooled) return;
+  editor.form.pooled = pooled;
+  if (pooled && editor.form.pool.length < 2) editor.form.pool = defaultPool();
+  if (!pooled) editor.plan = null;
+  syncPlacement();
+  renderPoolBox();
+  renderFootActions();
+  if (pooled) runPlan();
+  else scheduleSafety();
+}
+
+/** The pool the operator most likely wants: whatever the single-node picker was
+ *  already pointing at, plus the first other machine. */
+function defaultPool() {
+  const names = nodeChoices().map((node) => node.name);
+  const head = names.includes(state.editor.form.node) ? state.editor.form.node : (names[0] || LOCAL);
+  const next = names.find((name) => name !== head);
+  return next ? [head, next] : [head];
+}
+
+function syncPlacement() {
+  const pooled = state.editor.form.pooled;
+  for (const [index, button] of (state.nodes.segButtons || []).entries()) {
+    button.setAttribute('aria-pressed', String(pooled === (index === 1)));
+  }
+  // The single-node picker is not merely irrelevant when pooling: the backend
+  // ignores `node` entirely for a pooled server, so leaving it on screen would
+  // invite a choice that has no effect.
+  if (state.nodes.nodeField) state.nodes.nodeField.hidden = pooled;
+  if (state.nodes.poolBox) state.nodes.poolBox.hidden = !pooled;
+}
+
+function movePoolNode(index, delta) {
+  const pool = state.editor.form.pool;
+  const target = index + delta;
+  if (target < 0 || target >= pool.length) return;
+  [pool[index], pool[target]] = [pool[target], pool[index]];
+  renderPoolBox();
+  runPlan();
+}
+
+function removePoolNode(index) {
+  state.editor.form.pool.splice(index, 1);
+  renderPoolBox();
+  runPlan();
+}
+
+function addPoolNode(name) {
+  if (!name || state.editor.form.pool.includes(name)) return;
+  state.editor.form.pool.push(name);
+  renderPoolBox();
+  runPlan();
+}
+
+function renderPoolBox() {
+  const host = state.nodes.poolBox;
+  if (!host || !state.editor) return;
+  const pool = state.editor.form.pool;
+  const spare = nodeChoices().filter((node) => !pool.includes(node.name));
+  const picker = h('select', null,
+    h('option', { value: '' },
+      spare.length ? 'add a machine…' : 'every registered machine is already in this pool'),
+    spare.map((node) => h('option', { value: node.name },
+      `${node.name} — ${node.local ? 'this machine' : (node.address || 'peer')}`)));
+
+  mount(host,
+    h('h3', null, 'Pooled across machines'),
+    h('p', { class: 'blurb' },
+      'One engine, split by layer — pipeline parallel, not tensor parallel, because each Spark '
+      + 'has a single GPU. The order below is the pipeline order: the first machine runs the Ray '
+      + 'head and the HTTP frontend, so its address is the one clients use, and the rest hold '
+      + 'later stages and serve nothing directly.'),
+    h('div', { class: 'serve-pool' },
+      h('div', { class: 'serve-pool-list' }, pool.map(poolItem)),
+      h('div', { class: 'serve-pool-add' },
+        picker,
+        h('button', {
+          class: 'btn-sm',
+          disabled: !spare.length,
+          onClick: () => addPoolNode(picker.value),
+        }, 'Add')),
+      state.nodes.planBox,
+      state.nodes.syncBox));
+  renderPlan();
+}
+
+function poolItem(name, index) {
+  const pool = state.editor.form.pool;
+  const node = nodeChoices().find((entry) => entry.name === name);
+  const wire = (state.editor.plan?.nodes || []).find((entry) => entry.name === name);
+  const last = pool.length <= 2;
+
+  return h('div', { class: 'serve-pool-item' },
+    badge('info', index === 0 ? 'head' : `stage ${index + 1}`),
+    h('span', { class: 'p-name' }, name),
+    wire && wire.address
+      ? h('span', { class: 'p-wire', title: 'the interface on this node carrying the cluster '
+        + 'subnet — NCCL is pointed at this one by name, and the name differs per machine' },
+        `${wire.interface} ${wire.address}`)
+      : h('span', { class: 'faint small' },
+        node?.local ? 'this machine' : (node?.address || 'not registered')),
+    wire
+      ? h('span', { class: 'faint small' },
+        `${pct(wire.free_util, 0)} free to commit of ${bytes(wire.total_bytes)}`)
+      : null,
+    node && node.reachable === false ? badge('failed', 'unreachable') : null,
+    h('span', { class: 'spacer' }),
+    h('button', {
+      class: 'btn-sm', disabled: index === 0, title: 'earlier in the pipeline',
+      onClick: () => movePoolNode(index, -1),
+    }, '↑'),
+    h('button', {
+      class: 'btn-sm', disabled: index === pool.length - 1, title: 'later in the pipeline',
+      onClick: () => movePoolNode(index, 1),
+    }, '↓'),
+    h('button', {
+      class: 'btn-sm btn-ghost',
+      disabled: last,
+      title: last ? 'a pool needs at least two machines' : `drop ${name} from the pool`,
+      onClick: () => removePoolNode(index),
+    }, 'Remove'));
+}
+
+const schedulePlan = debounce(() => runPlan(), 400);
+
+async function runPlan() {
+  const editor = state.editor;
+  if (!editor || !editor.form.pooled) return;
+  const pool = [...editor.form.pool];
+  const model = editor.form.model.trim();
+  const key = `${pool.join(',')}|${model}`;
+  editor.planKey = key;
+
+  if (pool.length < 2) {
+    editor.planning = false;
+    editor.plan = { ok: false, reason: 'pooling needs at least two machines' };
+    renderPlan();
+    renderFootActions();
+    mountPoolSafety();
+    return;
+  }
+
+  editor.planning = true;
+  renderPlan();
+  mountPoolSafety();
+  let plan;
+  try {
+    plan = await post('/servers/pool/plan', { nodes: pool, model });
+  } catch (error) {
+    plan = { ok: false, reason: error.message };
+  }
+  // A slower answer to an older question would overwrite a newer one.
+  if (state.editor !== editor || editor.planKey !== key) return;
+  editor.planning = false;
+  editor.plan = plan;
+  editor.syncChecks = new Map();
+  renderPoolBox();
+  renderFootActions();
+  mountPoolSafety();
+}
+
+function renderPlan() {
+  const host = state.nodes.planBox;
+  const editor = state.editor;
+  if (!host || !editor) return;
+  const plan = editor.plan;
+
+  if (editor.planning) {
+    mount(host, h('div', { class: 'row' }, spinner(),
+      h('span', { class: 'faint small' },
+        'asking every machine for its interface, its image and its cache…')));
+    return;
+  }
+  if (!plan) {
+    mount(host);
+    return;
+  }
+
+  mount(host,
+    plan.ok
+      ? notice('ok',
+        h('strong', null, 'These machines can hold it. '),
+        `${bytes(plan.pooled_bytes)} across ${plan.pipeline_parallel_size} machines, against `
+        + `${bytes(plan.single_node_bytes)} on ${plan.head} alone — `
+        + `${(plan.pooled_bytes / Math.max(plan.single_node_bytes, 1)).toFixed(2)}× the room, at `
+        + `--pipeline-parallel-size ${plan.pipeline_parallel_size}.`)
+      : notice('danger',
+        h('strong', null, 'Cannot launch. '),
+        plan.reason || 'the cluster cannot take this pool'),
+    (plan.missing_model_on || []).map((name) => missingModelRow(name)),
+    (plan.missing_image || []).length ? missingImageNotice(plan.missing_image) : null);
+}
+
+/* A blocker the operator can clear from here: the bytes are already on this
+   machine and the cluster link is faster than the internet, so the fix is a
+   copy, not a second download. */
+function missingModelRow(name) {
+  const model = state.editor.form.model.trim();
+  // undefined: never asked. null: the check is in flight.
+  const check = state.editor.syncChecks.get(name);
+  const button = h('button', {
+    class: 'btn-sm btn-primary',
+    onClick: () => syncModelTo(name, button),
+  }, `Sync to ${name}`);
+
+  if (check === undefined) checkSync(name);
+
+  return notice('warn',
+    h('strong', null, `${model} is not cached on ${name}. `),
+    'Every node loads its own shard from its own disk, so a launch would have each machine '
+    + 'fetch the weights on its own, minutes in.',
+    h('div', { class: 'row wrap', style: { marginTop: '6px' } },
+      !check
+        ? h('span', { class: 'faint small' }, 'measuring what would have to be copied…')
+        : h('span', { class: 'faint small' },
+          check.ok
+            ? `${bytes(check.to_copy_bytes)} to copy over the cluster link`
+              + (check.already_there_bytes
+                ? ` · ${bytes(check.already_there_bytes)} already there` : '')
+            : check.reason || 'that copy cannot be started'),
+      check && check.ok === false ? null : button));
+}
+
+async function checkSync(name) {
+  const editor = state.editor;
+  const model = editor.form.model.trim();
+  if (!model) return;
+  editor.syncChecks.set(name, null);
+  let check;
+  try {
+    check = await get(`/nodes/${encodeURIComponent(name)}/sync/check`
+      + `?repo_id=${encodeURIComponent(model)}`);
+  } catch (error) {
+    check = { ok: false, reason: error.message };
+  }
+  if (state.editor !== editor || editor.form.model.trim() !== model) return;
+  editor.syncChecks.set(name, check);
+  renderPlan();
+}
+
+/* Nothing here can fix this one: there is no build endpoint for the ray image,
+   so the honest answer is the command that builds it. */
+function missingImageNotice(names) {
+  return notice('danger',
+    h('strong', null, `The Ray image is missing on ${names.join(', ')}. `),
+    'The NGC vLLM image has no ray in it at all, so a pooled launch needs the derived image '
+    + 'built from docker/vllm-ray.Dockerfile on every machine in the pool. There is no build '
+    + 'endpoint for it — build it on each of those machines and re-plan:',
+    h('div', { class: 'cmdbox', style: { marginTop: '6px' } },
+      'docker build -f docker/vllm-ray.Dockerfile -t llmd-vllm-ray .'));
+}
+
+function syncModelTo(name, button) {
+  const model = state.editor.form.model.trim();
+  button.disabled = true;
+  post(`/nodes/${encodeURIComponent(name)}/sync`, { repo_id: model })
+    .then(({ job_id: jobId }) => followSync(jobId, name, model))
+    .catch((error) => {
+      button.disabled = false;
+      toast(error.message, { level: 'danger', title: `Sync to ${name} failed` });
+    });
+}
+
+function followSync(jobId, name, model) {
+  closeSync();
+  const bar = h('span', { style: { width: '0%' } });
+  const nums = h('div', { class: 'faint small' }, 'starting…');
+  const line = h('div', { class: 'faint small mono truncate' });
+  const caveat = h('div');
+  const status = badge('running', 'copying');
+  const cancel = h('button', { class: 'btn-sm btn-danger' }, 'Cancel');
+  cancel.addEventListener('click', () => {
+    cancel.disabled = true;
+    post(`/jobs/${jobId}/cancel`).catch((error) => {
+      cancel.disabled = false;
+      toast(error.message, { level: 'danger' });
+    });
+  });
+
+  mount(state.nodes.syncBox, h('div', { class: 'serve-sync' },
+    h('div', { class: 'row wrap' },
+      h('strong', { class: 'small' }, `Copying ${model} → ${name}`),
+      status,
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'faint small mono' }, jobId),
+      cancel),
+    h('div', { class: 'progress' }, bar),
+    nums,
+    line,
+    caveat));
+
+  const apply = (progress) => {
+    const percent = Number(progress.percent);
+    if (Number.isFinite(percent)) bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    mount(nums,
+      h('span', null, Number.isFinite(percent) ? `${percent.toFixed(0)}%` : '—'),
+      h('span', null, ` · ${bytes(progress.transferred_bytes || 0)} copied`),
+      progress.speed_bps ? h('span', null, ` · ${bytes(progress.speed_bps)}/s`) : null,
+      progress.files_total
+        ? h('span', null, ` · ${progress.files_done ?? 0}/${progress.files_total} files`)
+        : null,
+      progress.elapsed ? h('span', null, ` · ${progress.elapsed}`) : null);
+  };
+
+  state.sync = {
+    jobId,
+    close: stream(`/jobs/${jobId}/stream`, {
+      progress: (payload) => apply(payload?.progress || {}),
+      status: (payload) => {
+        mount(status, payload?.status || 'running');
+        status.className = `badge ${payload?.status || 'running'}`;
+        if (payload?.progress && Object.keys(payload.progress).length) apply(payload.progress);
+      },
+      // rsync rewrites one line with \r; the manager forwards it as transient.
+      'progress-line': (payload) => { line.textContent = payload?.line ?? ''; },
+      end: (payload) => {
+        const finished = payload?.status || 'succeeded';
+        mount(status, finished);
+        status.className = `badge ${finished}`;
+        cancel.remove();
+        closeSync();
+        // The plan's cache check is a directory test on the peer, so a copy
+        // that stopped half way makes the blocker disappear without the model
+        // actually being loadable. Nothing but this can tell the operator.
+        if (finished !== 'succeeded') {
+          mount(caveat, notice('warn',
+            h('strong', null, `Copy ${finished} part way. `),
+            `${name} now holds an incomplete copy. The plan below only checks that the model's `
+            + 'directory exists there, so it will stop reporting this as a blocker — run the sync '
+            + `again to finish it, or delete ${model} from ${name} before launching.`));
+        }
+        toast(`${model} → ${name}: ${finished}`,
+          { level: finished === 'succeeded' ? 'ok' : 'warn' });
+        // The blocker this cleared is the plan's, so the plan is what has to
+        // agree that it is gone.
+        runPlan();
+      },
+    }),
+  };
+}
+
+function closeSync() {
+  state.sync?.close?.();
+  state.sync = null;
+}
+
+/* What stands beside the launch buttons for a pooled server. The per-node
+   verdict has nothing to say about an engine spread over several nodes, so the
+   plan's ceiling takes its place. */
+function poolSafetyNotice() {
+  const editor = state.editor;
+  const plan = editor.plan;
+  if (editor.planning || !plan) {
+    return notice('info',
+      h('strong', null, 'Pooled. '),
+      'Working out what these machines can hold…',
+      fixedWorldSizeLine());
+  }
+  if (!plan.ok) {
+    return notice('danger',
+      h('strong', null, 'Cannot launch. '),
+      plan.reason || 'the cluster cannot take this pool',
+      fixedWorldSizeLine());
+  }
+  return notice('ok',
+    h('strong', null, `Pooled ceiling ${bytes(plan.pooled_bytes)}. `),
+    `Across ${poolLabel(editor.form.pool)}, head first — ${plan.head} runs the HTTP frontend. `
+    + `One machine alone would top out at ${bytes(plan.single_node_bytes)}. The per-machine `
+    + 'memory guard does not apply: nothing on one node can judge this launch.',
+    fixedWorldSizeLine());
+}
+
+function mountPoolSafety() {
+  if (state.nodes.safety && state.editor?.form.pooled) {
+    mount(state.nodes.safety, poolSafetyNotice());
+  }
+}
+
 function applyPreset(preset) {
   const missing = [];
   for (const [dest, value] of Object.entries(preset.args)) {
@@ -1374,6 +2001,14 @@ const scheduleSafety = debounce(() => checkSafety(), 300);
 
 async function checkSafety() {
   if (state.mode !== 'edit' || !state.editor) return;
+  // /api/system/budget/check answers for this machine alone, which is the wrong
+  // question for an engine spread over several. The plan answers it instead.
+  if (state.editor.form.pooled) {
+    state.editor.verdict = null;
+    mountPoolSafety();
+    renderFootActions();
+    return;
+  }
   const node = state.editor.form.node;
   if (isPeer(node)) {
     // Budgets ride along with GET /api/servers, so re-read them once per node
@@ -1409,17 +2044,27 @@ async function checkSafety() {
 function renderFootActions() {
   const host = state.nodes.footActions;
   if (!host) return;
-  const blocked = state.editor?.verdict?.level === 'block';
+  const editor = state.editor;
+  const pooled = Boolean(editor?.form.pooled);
+  // Forcing past the memory guard is a judgement call an operator is allowed to
+  // make. A plan that says no is not: the ray image or the weights are missing,
+  // and starting anyway just fails slowly on another machine.
+  const planBlocked = pooled && (editor.planning || editor.plan?.ok !== true);
+  const blocked = pooled ? planBlocked : editor?.verdict?.level === 'block';
+  const why = pooled
+    ? (editor.planning ? 'still planning across the pool' : (editor.plan?.reason || ''))
+    : (editor?.verdict?.message || '');
+
   mount(host,
     h('button', { onClick: closeEditor }, 'Cancel'),
     h('button', { onClick: () => save({ start: false }) }, 'Save'),
     h('button', {
       class: 'btn-primary',
       disabled: blocked,
-      title: blocked ? state.editor.verdict.message : '',
+      title: blocked ? why : '',
       onClick: () => save({ start: true }),
     }, 'Save & start'),
-    blocked
+    blocked && !pooled
       ? h('button', { class: 'btn-danger', onClick: () => saveAndForce() }, 'Save & start anyway')
       : null);
 }
@@ -1455,10 +2100,17 @@ async function save({ start = false, force = false } = {}) {
     toast('Port must be a whole number between 1024 and 65535.', { level: 'danger' });
     return;
   }
+  if (form.pooled && form.pool.length < 2) {
+    toast('A pooled server needs at least two machines, in pipeline order.', { level: 'danger' });
+    return;
+  }
 
   const payload = {
     name: form.name.trim(),
     node: form.node || LOCAL,
+    // More than one name is what makes it pooled, and the first is the head.
+    // The backend ignores `node` for placement once this is set.
+    pool_nodes: form.pooled ? [...form.pool] : [],
     model: form.model.trim(),
     port,
     served_name: form.served_name.trim(),
@@ -1480,6 +2132,7 @@ async function save({ start = false, force = false } = {}) {
   }
 
   toast(`Saved "${saved.name}".`);
+  closeSync();
   state.editor = null;
   state.selected = saved.id;
   state.detailTab = start ? 'logs' : 'command';
@@ -1491,4 +2144,5 @@ async function save({ start = false, force = false } = {}) {
   loadDetailBody();
   if (start) await startServer(saved.id, { force });
   refreshVerdict();
+  loadPoolDetail();
 }

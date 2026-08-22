@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from app import cluster, db, docker_ctl, events, hf, nodes, safety, vllm_spec
+from app import cluster, db, docker_ctl, events, hf, jobs, nodes, safety, vllm_spec
 from app.config import settings
 
 JSON_FIELDS = ("args", "env", "pool_nodes")
@@ -235,17 +235,6 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         return {"started": False, "error": plan.get("reason", "cannot pool across these nodes"),
                 "plan": plan}
 
-    missing = await cluster.missing_model(server["model"], pool)
-    if missing and not force:
-        return {
-            "started": False,
-            "plan": plan,
-            "error": (
-                f"{server['model']} is not in the cache on: {', '.join(missing)}. "
-                "Every node loads its own shard from its own disk, so sync it there first."
-            ),
-            "missing_model_on": missing,
-        }
 
     prefix = cluster._subnet_prefix()
     wirings = [await cluster.wiring(nodes.by_name(name), prefix) for name in pool]
@@ -596,3 +585,104 @@ async def autostart() -> None:
             import logging
 
             logging.getLogger("llmd.servers").exception("autostart failed for %s", server["name"])
+
+
+# --- launching, including whatever has to happen first --------------------
+
+LAUNCH_KIND = "launch"
+
+
+@jobs.register_parser(LAUNCH_KIND)
+def _parse_launch(line: str, progress: dict) -> dict | None:
+    if line.startswith("[launch] "):
+        return {"phase": line[len("[launch] "):][:120]}
+    return None
+
+
+async def submit_launch(server_id: int, *, force: bool = False) -> str:
+    """Start a server, doing the work it needs first.
+
+    A model missing from a node used to be a refusal. It is really just a step:
+    every node loads its own shard from its own disk, so the model has to be
+    there — and the dashboard already knows how to put it there over the
+    cluster link. Making that part of the launch means the user asks for a
+    server and gets a server.
+    """
+    server = get_server(server_id)
+    if server is None:
+        raise KeyError(server_id)
+
+    job_id = jobs.manager.create(
+        jobs.JobSpec(
+            kind=LAUNCH_KIND,
+            title=f"Launch {server['name']}",
+            image="(orchestration)",
+            command=[],
+            env={},
+            mounts=[],
+            gpu=False,
+            meta={"server_id": server_id, "pool": pool_of(server), "model": server["model"]},
+        )
+    )
+    jobs.manager.adopt(job_id, _drive_launch(job_id, server_id, force))
+    return job_id
+
+
+async def _drive_launch(job_id: str, server_id: int, force: bool) -> None:
+    from app import sync
+
+    jobs.manager.begin(job_id)
+    server = get_server(server_id)
+    if server is None:
+        jobs.manager.finish(job_id, ok=False, error="the server was deleted")
+        return
+
+    pool = pool_of(server)
+    try:
+        if pool:
+            missing = await cluster.missing_model(server["model"], pool)
+            for node_name in missing:
+                jobs.manager.log(
+                    job_id,
+                    f"[launch] copying {server['model']} to {node_name} over the cluster link",
+                )
+                jobs.manager.report(job_id, {"phase": f"syncing to {node_name}"})
+                sync_id = await sync.submit(server["model"], node_name)
+                jobs.manager.log(job_id, f"[launch] sync job {sync_id}")
+                if not await _await_job(job_id, sync_id):
+                    jobs.manager.finish(
+                        job_id, ok=False,
+                        error=f"could not copy {server['model']} to {node_name}; see job {sync_id}",
+                    )
+                    return
+                jobs.manager.log(job_id, f"[launch] {node_name} has the model")
+
+        jobs.manager.log(job_id, "[launch] starting the engine")
+        jobs.manager.report(job_id, {"phase": "starting the engine"})
+        result = await start(server_id, force=force)
+    except Exception as exc:
+        jobs.manager.finish(job_id, ok=False, error=str(exc)[-600:])
+        return
+
+    if result.get("started"):
+        jobs.manager.log(job_id, "[launch] engine started")
+        jobs.manager.finish(job_id, ok=True, result=result,
+                            progress={"phase": "started", "percent": 100.0})
+    else:
+        detail = result.get("error") or (result.get("safety") or {}).get("message") or "refused"
+        jobs.manager.log(job_id, f"[launch] refused: {detail}")
+        jobs.manager.finish(job_id, ok=False, error=detail, result=result)
+
+
+async def _await_job(parent: str, child: str, poll: float = 2.0) -> bool:
+    """Follow a child job, mirroring its progress onto the launch."""
+    while True:
+        await asyncio.sleep(poll)
+        row = await asyncio.to_thread(jobs.manager.get, child)
+        if row is None:
+            return False
+        child_progress = row.get("progress") or {}
+        if child_progress:
+            jobs.manager.report(parent, {"phase": "syncing", "child": child, **child_progress})
+        if row["status"] in jobs.TERMINAL:
+            return row["status"] == jobs.SUCCEEDED

@@ -17,6 +17,8 @@ class DownloadIn(BaseModel):
     revision: str = "main"
     allow_patterns: list[str] | None = None
     ignore_patterns: list[str] | None = None
+    # Which machine's cache to fill. Empty means this one.
+    node: str = ""
 
 
 class TokenIn(BaseModel):
@@ -110,8 +112,10 @@ async def dataset_detail(repo_id: str, revision: str = "main") -> dict:
 
 
 @router.get("/local")
-async def local() -> dict:
-    return await hf.local_models()
+async def local(node: str = "") -> dict:
+    """A node's cache. Empty node means this machine, so existing callers are
+    unaffected."""
+    return await hf.node_cache(node) if node else await hf.local_models()
 
 
 @router.get("/token")
@@ -136,6 +140,7 @@ async def download(payload: DownloadIn) -> dict:
             revision=payload.revision,
             allow_patterns=payload.allow_patterns,
             ignore_patterns=payload.ignore_patterns,
+            node=payload.node,
         )
     except hf.HubError as exc:
         raise _http(exc) from None
@@ -143,9 +148,9 @@ async def download(payload: DownloadIn) -> dict:
 
 
 @router.delete("/local/{repo_id:path}")
-async def delete_local(repo_id: str) -> dict:
+async def delete_local(repo_id: str, node: str = "") -> dict:
     try:
-        return await hf.delete_local(repo_id)
+        return await hf.delete_local(repo_id, node=node)
     except hf.HubError as exc:
         raise _http(exc) from None
 

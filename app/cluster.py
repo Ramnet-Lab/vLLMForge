@@ -125,14 +125,21 @@ async def plan(node_names: list[str], model: str = "") -> dict[str, Any]:
 
     missing_model_on = await missing_model(model, node_names) if model else []
 
+    # A missing image is a blocker: nothing here can build it on a peer.
+    # A missing model is not — the launch copies it over the cluster link
+    # before starting the engine, so it is work to be done, not a refusal.
     reasons = []
     if missing_image:
         reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
+
+    will_sync = ""
     if missing_model_on:
-        reasons.append(f"{model} is not cached on: {', '.join(missing_model_on)}")
+        will_sync = (f"{model} will be copied to {', '.join(missing_model_on)} "
+                     "over the cluster link before the engine starts")
 
     return {
         "ok": not reasons,
+        "will_sync": will_sync,
         "reason": "; ".join(reasons),
         "missing_model_on": missing_model_on,
         "model": model,

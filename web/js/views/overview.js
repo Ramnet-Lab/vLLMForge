@@ -202,7 +202,45 @@ function nodeCard(node, budget) {
     // /proc/meminfo is read locally and stays readable when the docker socket is
     // not, so this card keeps its figures. A peer's numbers come over the same
     // ssh that just failed, and 0 GiB would be a lie rather than a measurement.
-    node.local ? localMemory(budget) : (down ? null : peerMemory(node)));
+    node.local ? localMemory(budget) : (down ? null : peerMemory(node)),
+    down ? null : nodeTelemetry(node));
+}
+
+/** The same readings the Live telemetry panel shows for this machine, for every
+ *  node. A peer is a machine before it is a cluster member: how hot it is and
+ *  what is holding its GPU matters whether or not anything is pooled onto it,
+ *  and most of the time nothing is. Fetched over ssh, so it needs no Ray. */
+function nodeTelemetry(node) {
+  const t = node.telemetry || {};
+  const gpu = t.gpu || {};
+  if (!Object.keys(gpu).length && !(t.load || []).length) return null;
+
+  const reading = (value, suffix, digits = 0) =>
+    (Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : '—');
+
+  const procs = t.gpu_processes || [];
+  const held = procs.reduce((sum, p) => sum + (p.used_bytes || 0), 0);
+
+  return h('div', { class: 'ov-node-tel' },
+    h('div', { class: 'grid cols-4' },
+      stat('GPU', reading(gpu.utilization_gpu, '%'),
+        gpu.name || (node.has_nvidia_runtime ? 'nvidia runtime' : 'no GPU reported')),
+      stat('Temp', reading(gpu.temperature_gpu, '°C'),
+        gpu.pstate ? `pstate ${gpu.pstate}` : ''),
+      stat('Power', reading(gpu.power_draw, ' W', 1),
+        Number.isFinite(gpu.clocks_sm) ? `${Math.round(gpu.clocks_sm)} MHz SM` : ''),
+      stat('Load', (t.load || []).length ? t.load[0].toFixed(2) : '—',
+        t.cpu_count ? `over ${t.cpu_count} cores` : '')),
+    procs.length
+      ? h('div', { class: 'faint small', style: { marginTop: '8px' } },
+          `${procs.length} process${procs.length === 1 ? '' : 'es'} holding ${bytes(held)} of GPU memory`
+          + ` (pid ${procs.map((p) => p.pid).join(', ')})`)
+      : h('div', { class: 'faint small', style: { marginTop: '8px' } },
+          'nothing is holding GPU memory here'),
+    t.disk && t.disk.free_bytes
+      ? h('div', { class: 'faint small' },
+          `${bytes(t.disk.free_bytes)} free on the model cache volume`)
+      : null);
 }
 
 /** The cluster as one pool. A pooled engine's memory is the sum of what each
@@ -599,6 +637,7 @@ export function dispose() {
 }
 
 const CSS = `
+.ov-node-tel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 .ov-pool { border: 1px solid var(--border-strong); border-radius: var(--radius);
   padding: 13px 14px; background: var(--bg-raised); }
 .ov-pool-head { display: flex; align-items: baseline; justify-content: space-between;

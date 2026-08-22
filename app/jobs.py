@@ -77,6 +77,9 @@ class JobSpec:
     entrypoint: str | None = None
     workdir: str | None = None
     network: str = "host"
+    # Which machine runs this job's container. None is this one; a peer's
+    # docker host makes every call below target it instead.
+    host: str | None = None
     meta: dict[str, Any] | None = None
 
 
@@ -156,6 +159,7 @@ class JobManager:
                         "command": list(spec.command),
                         "env": {k: v for k, v in spec.env.items() if "TOKEN" not in k.upper()},
                         "mounts": [m.as_flag() for m in spec.mounts],
+                        "host": spec.host,
                         "meta": spec.meta or {},
                     }
                 ),
@@ -178,7 +182,7 @@ class JobManager:
 
     async def _run(self, job_id: str, spec: JobSpec) -> None:
         container = settings.container_name(spec.kind, job_id)
-        await docker_ctl.remove(container, force=True)
+        await docker_ctl.remove(container, force=True, host=spec.host)
         argv = docker_ctl.build_run_argv(
             name=container,
             image=spec.image,
@@ -189,6 +193,7 @@ class JobManager:
             network=spec.network,
             entrypoint=spec.entrypoint,
             workdir=spec.workdir,
+            host=spec.host,
         )
         self._append(job_id, f"$ {docker_ctl.preview(argv)}")
         try:
@@ -202,6 +207,7 @@ class JobManager:
                 network=spec.network,
                 entrypoint=spec.entrypoint,
                 workdir=spec.workdir,
+                host=spec.host,
             )
         except docker_ctl.DockerError as exc:
             self._append(job_id, f"failed to start container: {exc}")
@@ -209,7 +215,7 @@ class JobManager:
             return
 
         self._update(job_id, status=RUNNING, started_at=db.now())
-        await self._follow(job_id, spec.kind, container)
+        await self._follow(job_id, spec.kind, container, host=spec.host)
 
     def _resume_cursor(self, job_id: str) -> str | None:
         """Where to resume a container's output after the dashboard restarted.
@@ -227,7 +233,8 @@ class JobManager:
         return moment.isoformat().replace("+00:00", "Z")
 
     async def _follow(
-        self, job_id: str, kind: str, container: str, *, since: str | None = None
+        self, job_id: str, kind: str, container: str, *,
+        since: str | None = None, host: str | None = None,
     ) -> None:
         """Tail a running container to completion and record its outcome."""
         parser = _parsers.get(kind)
@@ -240,7 +247,7 @@ class JobManager:
             # printed while the dashboard was down — the @@RESULT@@ line
             # included — was dropped, and then the container was removed.
             async for line, transient in docker_ctl.stream_logs(
-                container, tail="all", since=since
+                container, tail="all", since=since, host=host
             ):
                 if not line.strip():
                     continue
@@ -272,7 +279,7 @@ class JobManager:
         except Exception as exc:  # a broken log pipe must not lose the job
             self._append(job_id, f"[dashboard] log stream ended: {exc!r}")
 
-        state = await docker_ctl.state(container)
+        state = await docker_ctl.state(container, host)
         if progress:
             self._update(job_id, progress=progress)
 
@@ -405,14 +412,19 @@ class JobManager:
         for row in db.query("SELECT * FROM jobs WHERE status IN (?, ?)", (RUNNING, PENDING)):
             job_id, kind, container = row["id"], row["kind"], row["container_name"]
             state = await docker_ctl.state(container or "")
+            # A job may have been running on a peer; re-adopt it there.
+            host = ((db.loads(row.get("spec"), {}) or {}).get("host")) or None
+            state = await docker_ctl.state(container or "", host)
             since = self._resume_cursor(job_id)
             if state.running:
                 self._append(job_id, "[dashboard] reattached after restart")
-                task = asyncio.create_task(self._follow(job_id, kind, container, since=since))
+                task = asyncio.create_task(
+                    self._follow(job_id, kind, container, since=since, host=host)
+                )
                 self._tasks[job_id] = task
                 task.add_done_callback(lambda _t, jid=job_id: self._tasks.pop(jid, None))
             elif state.exists:
-                await self._follow(job_id, kind, container, since=since)
+                await self._follow(job_id, kind, container, since=since, host=host)
             else:
                 self._update(
                     job_id,

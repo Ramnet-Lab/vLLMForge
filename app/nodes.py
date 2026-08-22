@@ -60,6 +60,7 @@ class NodeStatus:
     docker: str = ""
     gpu: str = ""
     has_nvidia_runtime: bool = False
+    telemetry: dict = field(default_factory=dict)
     total_bytes: int = 0
     available_bytes: int = 0
     free_bytes: int = 0
@@ -73,6 +74,7 @@ class NodeStatus:
             "docker": self.docker,
             "gpu": self.gpu,
             "has_nvidia_runtime": self.has_nvidia_runtime,
+            "telemetry": self.telemetry,
             "total_bytes": self.total_bytes,
             "available_bytes": self.available_bytes,
             "free_bytes": self.free_bytes,
@@ -149,6 +151,72 @@ async def _ssh(address: str, command: str) -> tuple[int, str]:
     return proc.returncode or 0, (out or err).decode(errors="replace")
 
 
+# One ssh round trip for everything the local telemetry loop reads, with a
+# marker between sections so the same parsers can be used on the output. A peer
+# is a machine, not a Ray node — its temperature and power draw are worth
+# knowing whether or not anything is pooled onto it.
+TELEMETRY_SCRIPT = (
+    "echo '@@MEM@@'; cat /proc/meminfo; "
+    "echo '@@LOAD@@'; cat /proc/loadavg; nproc; "
+    "echo '@@GPU@@'; nvidia-smi {gpu} 2>/dev/null; "
+    "echo '@@APPS@@'; nvidia-smi {apps} 2>/dev/null; "
+    "echo '@@DISK@@'; df -PB1 {cache} 2>/dev/null | tail -1"
+)
+
+
+def _section(out: str, name: str) -> str:
+    marker = f"@@{name}@@"
+    if marker not in out:
+        return ""
+    rest = out.split(marker, 1)[1]
+    for other in ("@@MEM@@", "@@LOAD@@", "@@GPU@@", "@@APPS@@", "@@DISK@@"):
+        if other in rest:
+            rest = rest.split(other, 1)[0]
+    return rest.strip("\n")
+
+
+async def remote_telemetry(node: Node) -> dict:
+    """Everything the Overview shows for this machine, for a peer.
+
+    Deliberately independent of Ray: knowing a box is there, how hot it is and
+    what it is holding matters before anything is pooled onto it, and most of
+    the time nothing is.
+    """
+    from app import telemetry
+
+    command = TELEMETRY_SCRIPT.format(
+        gpu=" ".join(telemetry.GPU_QUERY),
+        apps=" ".join(telemetry.APPS_QUERY),
+        cache=settings.hf_cache,
+    )
+    code, out = await _ssh(node.name or node.address, command)
+    if code != 0:
+        return {"ok": False, "error": out.strip()[:300]}
+
+    load_raw = _section(out, "LOAD").split()
+    try:
+        load = [float(x) for x in load_raw[:3]]
+        cpus = int(load_raw[-1])
+    except (ValueError, IndexError):
+        load, cpus = [], 0
+
+    disk_raw = _section(out, "DISK").split()
+    disk = {}
+    if len(disk_raw) >= 4 and disk_raw[1].isdigit():
+        disk = {"path": str(settings.hf_cache), "total_bytes": int(disk_raw[1]),
+                "used_bytes": int(disk_raw[2]), "free_bytes": int(disk_raw[3])}
+
+    return {
+        "ok": True,
+        "memory": telemetry.parse_meminfo(_section(out, "MEM")),
+        "gpu": telemetry.parse_gpu_csv(_section(out, "GPU")),
+        "gpu_processes": telemetry.parse_compute_apps(_section(out, "APPS")),
+        "load": load,
+        "cpu_count": cpus,
+        "disk": disk,
+    }
+
+
 async def _remote_memory(node: Node) -> tuple[int, int, int]:
     code, out = await _ssh(node.name or node.address, "cat /proc/meminfo")
     if code != 0:
@@ -169,14 +237,24 @@ async def status(node: Node) -> NodeStatus:
     result = NodeStatus(node=node)
 
     if node.is_local:
-        from app.telemetry import read_meminfo
+        from app import telemetry as local_telemetry
 
-        memory = read_meminfo()
-        result.total_bytes = memory.total_bytes
-        result.available_bytes = memory.available_bytes
-        result.free_bytes = memory.free_bytes
+        snapshot = await local_telemetry.snapshot()
+        result.telemetry = snapshot
+        memory = snapshot["memory"]
+        result.total_bytes = memory["total_bytes"]
+        result.available_bytes = memory["available_bytes"]
+        result.free_bytes = memory["free_bytes"]
     else:
-        result.total_bytes, result.available_bytes, result.free_bytes = await _remote_memory(node)
+        remote = await remote_telemetry(node)
+        if remote.get("ok"):
+            result.telemetry = remote
+            memory = remote["memory"]
+            result.total_bytes = memory["total_bytes"]
+            result.available_bytes = memory["available_bytes"]
+            result.free_bytes = memory["free_bytes"]
+        else:
+            result.error = remote.get("error", "")
 
     try:
         result.docker = await docker_ctl.version(node.docker_host)
@@ -389,3 +467,48 @@ def combine(statuses: list[dict]) -> dict[str, Any]:
 async def summary() -> dict[str, Any]:
     statuses = await status_all()
     return {"nodes": statuses, "local": LOCAL, "combined": combine(statuses)}
+
+
+# --- getting our own code onto a peer -------------------------------------
+
+WORKER_DIR_REMOTE = ".llmd/workers"
+
+
+async def ensure_workers(node: Node) -> str:
+    """Put the worker scripts on a peer and return the path to bind-mount.
+
+    A bind mount is resolved by the daemon that runs the container, not by the
+    client asking for it. Mounting this repo's app/workers into a container on
+    node2 therefore mounts *node2's* copy of that path — which does not exist,
+    and the container dies with "can't open file '/worker/...'". The scripts are
+    small and change with the dashboard, so they are pushed every time rather
+    than cached and left to go stale.
+    """
+    if node.is_local:
+        from app.config import settings
+
+        return str(settings.hf_cache.parent) and str(
+            __import__("pathlib").Path(__file__).resolve().parent / "workers"
+        )
+
+    local_dir = Path(__file__).resolve().parent / "workers"
+    target = node.name or node.address
+    remote = f"{WORKER_DIR_REMOTE}"
+
+    code, out = await _ssh(target, f"mkdir -p ~/{remote} && echo $HOME")
+    if code != 0:
+        raise RuntimeError(f"could not prepare {target}: {out.strip()[:200]}")
+    home = out.strip().splitlines()[-1]
+
+    proc = await asyncio.create_subprocess_exec(
+        "rsync", "-a", "--delete",
+        "-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+        f"{local_dir}/", f"{target}:{home}/{remote}/",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"could not copy the workers to {target}: {stdout.decode(errors='replace')[-300:]}"
+        )
+    return f"{home}/{remote}"

@@ -137,10 +137,17 @@ def _coerce(field_name: str, raw: str):
     return raw
 
 
-async def read_gpu() -> dict:
-    out = await _nvidia_smi(
-        ["--query-gpu=" + ",".join(GPU_FIELDS), "--format=csv,noheader,nounits"]
-    )
+GPU_QUERY = ["--query-gpu=" + ",".join(GPU_FIELDS), "--format=csv,noheader,nounits"]
+APPS_QUERY = ["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]
+
+
+def parse_gpu_csv(out: str) -> dict:
+    """One row of `nvidia-smi --query-gpu`, wherever it came from.
+
+    Split out from the collector so a peer's output, fetched over ssh, goes
+    through exactly the same parsing — including dropping the [N/A] fields this
+    part reports for anything memory-related.
+    """
     line = next((ln for ln in out.splitlines() if ln.strip()), "")
     if not line:
         return {}
@@ -154,22 +161,55 @@ async def read_gpu() -> dict:
     return gpu
 
 
-async def read_gpu_processes() -> list[GpuProcess]:
-    """Per-process GPU memory. This DOES work on GB10 even though totals do not."""
-    out = await _nvidia_smi(
-        ["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]
-    )
-    procs: list[GpuProcess] = []
+def parse_compute_apps(out: str) -> list[dict]:
+    procs = []
     for line in out.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 2:
             continue
         try:
-            used_mib = int(float(parts[1]))
-            procs.append(GpuProcess(pid=int(parts[0]), used_bytes=used_mib * 1024 * 1024))
+            procs.append({
+                "pid": int(parts[0]),
+                "used_bytes": int(float(parts[1])) * 1024 * 1024,
+                "name": "",
+            })
         except ValueError:
             continue
     return procs
+
+
+def parse_meminfo(out: str) -> dict:
+    values: dict[str, int] = {}
+    for line in out.splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            try:
+                values[key] = int(parts[0]) * KIB
+            except ValueError:
+                continue
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", 0)
+    used = max(0, total - available)
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "free_bytes": values.get("MemFree", 0),
+        "swap_total_bytes": values.get("SwapTotal", 0),
+        "swap_free_bytes": values.get("SwapFree", 0),
+        "used_bytes": used,
+        "used_fraction": (used / total) if total else 0.0,
+    }
+
+
+async def read_gpu() -> dict:
+    return parse_gpu_csv(await _nvidia_smi(GPU_QUERY))
+
+
+async def read_gpu_processes() -> list[GpuProcess]:
+    """Per-process GPU memory. This DOES work on GB10 even though totals do not."""
+    out = await _nvidia_smi(APPS_QUERY)
+    return [GpuProcess(pid=p["pid"], used_bytes=p["used_bytes"]) for p in parse_compute_apps(out)]
 
 
 def read_disk(path=None) -> dict:

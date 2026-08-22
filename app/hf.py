@@ -610,7 +610,19 @@ def cache_dir_for(repo_id: str, repo_type: str = "model") -> Path:
     return directory
 
 
-async def delete_local(repo_id: str, repo_type: str = "model") -> dict:
+def _node_host(node: str) -> str | None:
+    """Where this cache operation runs. The worker container and the cache mount
+    are identical on every node, so the only difference is which daemon."""
+    from app import nodes
+
+    return nodes.by_name(node).docker_host if node else None
+
+
+async def delete_local(repo_id: str, repo_type: str = "model", node: str = "") -> dict:
+    host = _node_host(node)
+    if host:
+        # The peer's cache is its own; check and remove it there.
+        return await _delete_remote(repo_id, repo_type, node)
     directory = await asyncio.to_thread(cache_dir_for, repo_id, repo_type)
     freed = await asyncio.to_thread(_dir_size, directory)
     code, out, err = await docker_ctl.run_capture(
@@ -676,6 +688,7 @@ async def submit_download(
     allow_patterns: list[str] | None = None,
     ignore_patterns: list[str] | None = None,
     repo_type: str = "model",
+    node: str = "",
 ) -> str:
     check_repo_id(repo_id)
     _repo_type(repo_type)
@@ -703,6 +716,13 @@ async def submit_download(
     if token:
         env["HF_TOKEN"] = token
 
+    from app import nodes as node_registry
+
+    target = node_registry.by_name(node)
+    # The worker is bind-mounted, and a bind mount resolves on the daemon's own
+    # filesystem — so a peer needs its own copy of the script.
+    worker_dir = WORKER_DIR if target.is_local else await node_registry.ensure_workers(target)
+
     spec = jobs.JobSpec(
         kind="download",
         title=f"Download {repo_id}" + (" (dataset)" if repo_type == "dataset" else ""),
@@ -711,16 +731,103 @@ async def submit_download(
         env=env,
         mounts=[
             docker_ctl.Mount(settings.hf_cache, CONTAINER_CACHE),
-            docker_ctl.Mount(WORKER_DIR, "/worker", read_only=True),
+            docker_ctl.Mount(worker_dir, "/worker", read_only=True),
         ],
         gpu=False,
         entrypoint="python",
+        host=_node_host(node),
         meta={
             "repo_id": repo_id,
             "repo_type": repo_type,
+            "node": node or "local",
             "revision": revision,
             "allow_patterns": allow_patterns or [],
             "ignore_patterns": ignore_patterns or [],
         },
     )
     return await jobs.manager.submit(spec)
+
+
+async def _delete_remote(repo_id: str, repo_type: str, node_name: str) -> dict:
+    """Remove a cached repo from a peer.
+
+    The same guard as the local path — a validated directory name, never a
+    user string — because this still ends in `rm -rf` run as root, just on
+    another machine.
+    """
+    from app import nodes
+
+    check_repo_id(repo_id)
+    _segment, prefix = _repo_type(repo_type)
+    name = f"{prefix}{repo_id.replace('/', '--')}"
+    if not _CACHE_DIR.fullmatch(name):
+        raise HubError(f"'{repo_id}' does not name a cache directory.", 400)
+
+    node = nodes.by_name(node_name)
+    if node.is_local:
+        raise HubError("that is this machine; use the local delete", 400)
+
+    hub = f"{settings.hf_cache}/hub"
+    code, out = await nodes._ssh(
+        node.name or node.address,
+        f"test -d {hub}/{name} && du -sb {hub}/{name} | cut -f1 || echo missing",
+    )
+    if code != 0:
+        raise HubError(f"could not reach {node.name}: {out.strip()[:200]}", 502)
+    if "missing" in out:
+        raise HubError(f"'{repo_id}' is not in {node.name}'s cache.", 404)
+    freed = int(out.split()[0]) if out.split() and out.split()[0].isdigit() else 0
+
+    code, out, err = await docker_ctl.run_capture(
+        image=settings.vllm_image,
+        command=["-rf", f"{CONTAINER_CACHE}/hub/{name}"],
+        entrypoint="rm",
+        mounts=[docker_ctl.Mount(settings.hf_cache, CONTAINER_CACHE)],
+        gpu=False,
+        network="none",
+        timeout=600.0,
+        host=node.docker_host,
+    )
+    if code != 0:
+        raise HubError(f"delete on {node.name} failed: {(err or out).strip()[-400:]}", 502)
+    return {"deleted": repo_id, "freed_bytes": freed, "node": node.name}
+
+
+async def node_cache(node_name: str) -> dict:
+    """What a peer holds, with sizes, so the Models page can manage it."""
+    from app import nodes
+
+    node = nodes.by_name(node_name)
+    if node.is_local:
+        return await local_models()
+
+    hub = f"{settings.hf_cache}/hub"
+    code, out = await nodes._ssh(
+        node.name or node.address,
+        f"cd {hub} 2>/dev/null && du -sb models--* datasets--* 2>/dev/null || true",
+    )
+    if code != 0:
+        return {"ok": False, "node": node.name, "error": out.strip()[:300], "repos": []}
+
+    repos = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        size, directory = int(parts[0]), parts[1].strip()
+        kind, _, rest = directory.partition("--")
+        repos.append({
+            "repo_id": rest.replace("--", "/", 1),
+            "repo_type": "dataset" if kind == "datasets" else "model",
+            "size_on_disk": size,
+            "directory": directory,
+            "node": node.name,
+        })
+    repos.sort(key=lambda r: -r["size_on_disk"])
+    return {
+        "ok": True,
+        "node": node.name,
+        "cache_dir": hub,
+        "size_on_disk": sum(r["size_on_disk"] for r in repos),
+        "repos": repos,
+    }
