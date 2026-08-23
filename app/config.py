@@ -57,8 +57,14 @@ class Settings:
     )
 
     # --- container images -------------------------------------------------
+    # The NGC image plus the xgrammar its own vLLM imports; docker/vllm.Dockerfile
+    # says why. Set LLMD_VLLM_IMAGE back to nvcr.io/nvidia/vllm:26.07-py3 to run
+    # the base image, and accept that every request carrying tools 500s.
     vllm_image: str = field(
-        default_factory=lambda: _env("LLMD_VLLM_IMAGE", "nvcr.io/nvidia/vllm:26.07-py3")
+        default_factory=lambda: _env("LLMD_VLLM_IMAGE", "llmd/vllm:latest")
+    )
+    vllm_base_image: str = field(
+        default_factory=lambda: _env("LLMD_VLLM_BASE_IMAGE", "nvcr.io/nvidia/vllm:26.07-py3")
     )
     heretic_image: str = field(
         default_factory=lambda: _env("LLMD_HERETIC_IMAGE", "llmd/heretic:latest")

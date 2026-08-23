@@ -194,6 +194,18 @@ class Budget:
         return max(0, max(self.committed_bytes, self.measured_gpu_bytes - self.excluded_bytes))
 
     @property
+    def available_after_replacement(self) -> int:
+        """MemAvailable as it will be once the container being replaced has gone.
+
+        vLLM compares its request against free memory at the moment the engine
+        starts, and by then the old container has been removed — so judging a
+        restart against memory that container is still holding refuses launches
+        that would have been fine. Same reasoning as excluding it from the
+        budget; this is the live half of it, which was missed.
+        """
+        return min(self.total_bytes, self.available_bytes + self.excluded_bytes)
+
+    @property
     def occupied_util(self) -> float:
         return self.occupied_bytes / self.total_bytes if self.total_bytes else 0.0
 
@@ -419,7 +431,8 @@ async def check_launch(
             suggested_util=suggested,
         )
 
-    if requested_bytes > budget.available_bytes:
+    live_available = budget.available_after_replacement
+    if requested_bytes > live_available:
         # This is vLLM's own gate, not a policy of ours. On a unified-memory box
         # the engine reads psutil.virtual_memory().available — MemAvailable — and
         # refuses when ceil(total * util) exceeds it.
@@ -428,7 +441,7 @@ async def check_launch(
             level="block",
             message=(
                 f"{preface}Refusing to launch: {util:g} needs {_gib(requested_bytes)} but only "
-                f"{_gib(budget.available_bytes)} is available on the host right now — which is "
+                f"{_gib(live_available)} is available on the host right now — which is "
                 "the number vLLM itself compares against, so it would refuse to start. "
                 "Stop something first."
             ),
@@ -447,13 +460,13 @@ async def check_launch(
     #   vllm/utils/mem_utils.py: if current_platform.is_integrated_gpu(...):
     #       self.free_memory = psutil.virtual_memory().available
     #
-    if requested_bytes > budget.available_bytes * (1 - DRIFT_MARGIN):
+    if requested_bytes > live_available * (1 - DRIFT_MARGIN):
         return Verdict(
             ok=True,
             level="warn",
             message=(
                 f"{preface}{util:g} needs {_gib(requested_bytes)} of the "
-                f"{_gib(budget.available_bytes)} available — close enough that a little more "
+                f"{_gib(live_available)} available — close enough that a little more "
                 "activity before the engine starts would push it over vLLM's own check. "
                 f"{max(0.0, suggested or 0):.2f} leaves room for that."
             ),

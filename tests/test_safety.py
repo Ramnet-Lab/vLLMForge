@@ -367,3 +367,31 @@ def test_the_container_being_replaced_comes_off_the_measured_side_only():
     here.measured_gpu_bytes = 60 * GIB
     here.excluded_bytes = 24 * GIB
     assert here.occupied_bytes == 36 * GIB
+
+
+@pytest.mark.anyio
+async def test_a_restart_is_judged_against_the_memory_it_is_about_to_free(monkeypatch):
+    """vLLM compares its request against free memory at the moment the engine
+    starts, and by then the container being replaced is gone. Judging a restart
+    against memory that container is still holding refuses launches that would
+    have been fine — which is how restarting a 0.34 engine on a box with 36 GiB
+    free got "needs 41.4 GiB but only 36.4 GiB is available", when 41 GiB of the
+    shortfall was the engine being restarted."""
+    total = 121 * GIB
+
+    async def budget(node=None, exclude=None):
+        b = safety.Budget(total_bytes=int(total), available_bytes=int(36 * GIB),
+                          free_bytes=int(2 * GIB), reserve_bytes=int(32 * GIB),
+                          warn_reserve_bytes=int(38 * GIB))
+        if exclude:
+            b.excluded_bytes = int(41 * GIB)
+        return b
+
+    monkeypatch.setattr(safety, "current_budget", budget)
+
+    refused = await safety.check_launch(0.34, params={"gpu_memory_utilization": 0.34})
+    assert not refused.ok, "with nothing coming back, 36 GiB really cannot hold 41"
+
+    restart = await safety.check_launch(0.34, replacing="llmd-vllm-44",
+                                        params={"gpu_memory_utilization": 0.34})
+    assert restart.ok, "the engine being replaced releases what the new one needs"

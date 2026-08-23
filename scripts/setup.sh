@@ -165,7 +165,13 @@ else
     eval "$(cd "$REPO" && "$VENV/bin/python" -c \
         'from app.config import settings
 print(f"HERETIC_TAG={settings.heretic_image!r}")
-print(f"FINETUNE_TAG={settings.finetune_image!r}")')"
+print(f"FINETUNE_TAG={settings.finetune_image!r}")
+print(f"VLLM_TAG={settings.vllm_image!r}")
+print(f"VLLM_BASE={settings.vllm_base_image!r}")')"
+    # Not optional the way the other two are: without it every managed server
+    # 500s on any request carrying tools. Build it on every node in the cluster,
+    # because each rank of a pooled engine runs it on its own machine.
+    build_image "the vLLM image" "$VLLM_TAG" vllm.Dockerfile
     build_image Heretic "$HERETIC_TAG" heretic.Dockerfile
     build_image fine-tuning "$FINETUNE_TAG" finetune.Dockerfile
 fi
