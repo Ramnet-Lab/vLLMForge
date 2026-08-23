@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from app import accel, docker_ctl, events, safety
 from app.config import settings
@@ -61,6 +62,58 @@ async def _candidates() -> list[tuple[str, float]]:
     return [(name, util) for name, util, _bytes in ranked]
 
 
+@dataclass
+class Starvation:
+    """Which memory is running out, and how close to the floor it is.
+
+    The watchdog exists to get in front of a freeze, so it has to watch the pool
+    an engine actually spends. On a unified part that is host RAM. On a discrete
+    one it is the framebuffer, and host MemAvailable is the wrong instrument
+    entirely: it can read 90 GiB while every device is full, so the old trigger
+    either never fired or fired for a reason that had nothing to do with the
+    engines.
+    """
+
+    kind: str                 # "device" or "host"
+    available_bytes: int
+    threshold_bytes: int
+    pool_kind: str
+
+    @property
+    def starved(self) -> bool:
+        return bool(self.available_bytes) and self.available_bytes < self.threshold_bytes
+
+    def reason(self, name: str, util: float) -> str:
+        label = "device free" if self.kind == "device" else "MemAvailable"
+        return (
+            f"{label} {self.available_bytes // MIB} MiB below "
+            f"{self.threshold_bytes // MIB} MiB — killing {name} (util {util:g})"
+        )
+
+
+async def signal() -> Starvation:
+    """Read whichever memory this machine can actually exhaust.
+
+    Falls back to host on anything less than a measured framebuffer, matching
+    accel.py's rule: only positive proof of a separate pool is treated as one.
+    """
+    pool = await accel.pool_for(None)
+    if pool.kind == accel.DISCRETE and pool.can_size and pool.available_bytes:
+        return Starvation(
+            kind="device",
+            available_bytes=pool.available_bytes,
+            threshold_bytes=settings.memguard_device_threshold_mib * MIB,
+            pool_kind=pool.kind,
+        )
+    memory = read_meminfo()
+    return Starvation(
+        kind="host",
+        available_bytes=memory.available_bytes,
+        threshold_bytes=settings.memguard_threshold_mib * MIB,
+        pool_kind=pool.kind,
+    )
+
+
 async def _restart_policy(name: str) -> str:
     info = await docker_ctl.inspect(name)
     policy = ((info or {}).get("HostConfig") or {}).get("RestartPolicy") or {}
@@ -68,40 +121,40 @@ async def _restart_policy(name: str) -> str:
 
 
 async def watch() -> None:
-    threshold_bytes = settings.memguard_threshold_mib * MIB
     last_kill = 0.0
     while True:
         try:
-            memory = read_meminfo()
-            starved = memory.available_bytes and memory.available_bytes < threshold_bytes
-            if starved and time.monotonic() - last_kill > COOLDOWN_SECONDS:
+            starvation = await signal()
+            if starvation.starved and time.monotonic() - last_kill > COOLDOWN_SECONDS:
                 victims = await _candidates()
                 if victims:
                     name, util = victims[0]
-                    reason = (
-                        f"MemAvailable {memory.available_bytes // MIB} MiB below "
-                        f"{settings.memguard_threshold_mib} MiB — killing {name} (util {util:g})"
-                    )
+                    reason = starvation.reason(name, util)
                     log.warning(reason)
                     # A container set to `unless-stopped` would come back and
                     # re-reserve the memory just freed, so the policy has to go
                     # — but it is the operator's setting, not ours, so record
                     # what it was for whoever restarts the container.
-                    pool = await accel.pool_for(None)
-                    action = settings.memguard_host_action.strip().lower()
-                    if action not in ("kill", "warn"):
-                        # On a discrete GPU this trigger — host MemAvailable —
-                        # says nothing about what the engines are holding, and
-                        # the kernel OOM killer is a working backstop there
-                        # because the desktop is not in the framebuffer. Killing
-                        # a serving engine on that signal is a self-inflicted
-                        # outage.
-                        action = "warn" if pool.kind == accel.DISCRETE else "kill"
+                    if starvation.kind == "device":
+                        # The framebuffer is exactly what these engines spend, so
+                        # this reading is about them by construction and there is
+                        # no host-side OOM killer that will ever see it.
+                        action = "kill"
+                    else:
+                        action = settings.memguard_host_action.strip().lower()
+                        if action not in ("kill", "warn"):
+                            # On a discrete GPU this trigger — host MemAvailable —
+                            # says nothing about what the engines are holding, and
+                            # the kernel OOM killer is a working backstop there
+                            # because the desktop is not in the framebuffer. Killing
+                            # a serving engine on that signal is a self-inflicted
+                            # outage.
+                            action = "warn" if starvation.pool_kind == accel.DISCRETE else "kill"
                     if action == "warn":
                         entry = {
                             "ts": time.time(), "container": name, "util": util,
                             "action": "warn", "reason": reason + " (host memory, not "
-                            f"{pool.kind} device memory — nothing killed)",
+                            f"{starvation.pool_kind} device memory — nothing killed)",
                         }
                         _history.append(entry)
                         del _history[:-50]

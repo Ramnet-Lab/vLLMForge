@@ -63,9 +63,28 @@ class NodeStatus:
     gpu: str = ""
     has_nvidia_runtime: bool = False
     telemetry: dict = field(default_factory=dict)
+    # The memory an engine on this node actually spends: the framebuffer on a
+    # discrete machine, host RAM on a unified one. Reporting host RAM here on a
+    # discrete box made a card with 45 GiB of VRAM advertise 100 GiB of room,
+    # and every figure derived from it — the bars, the percentages, the "largest
+    # that fits" — was answering about the wrong pool.
     total_bytes: int = 0
     available_bytes: int = 0
     free_bytes: int = 0
+    pool_kind: str = ""
+    device_count: int = 0
+    # Every device added together. Distinct from total_bytes on purpose:
+    # total_bytes is one device, because that is what --gpu-memory-utilization
+    # multiplies, while this is how much memory the machine actually has. A card
+    # count of two makes them differ by 2x, and a panel that shows one where the
+    # reader expects the other is wrong by exactly that factor.
+    vram_total_bytes: int = 0
+    vram_used_bytes: int = 0
+    vram_free_bytes: int = 0
+    # Host RAM, kept separately because it is still a real constraint on a
+    # discrete box: --cpu-offload-gb and the loading process draw on it.
+    host_total_bytes: int = 0
+    host_available_bytes: int = 0
     containers: list = field(default_factory=list)
     error: str = ""
 
@@ -80,6 +99,13 @@ class NodeStatus:
             "total_bytes": self.total_bytes,
             "available_bytes": self.available_bytes,
             "free_bytes": self.free_bytes,
+            "pool_kind": self.pool_kind,
+            "device_count": self.device_count,
+            "vram_total_bytes": self.vram_total_bytes,
+            "vram_used_bytes": self.vram_used_bytes,
+            "vram_free_bytes": self.vram_free_bytes,
+            "host_total_bytes": self.host_total_bytes,
+            "host_available_bytes": self.host_available_bytes,
             "containers": self.containers,
             "error": self.error,
         }
@@ -266,26 +292,45 @@ async def _remote_memory(node: Node) -> tuple[int, int, int]:
     return pool.host.total_bytes, pool.host.available_bytes, pool.host.free_bytes
 
 
+def _apply_pool(result: NodeStatus, pool) -> None:
+    """Copy a measured pool onto the node card.
+
+    One function for local and remote on purpose: the two used to read their own
+    figures out of their own telemetry dict, which is how the local card came to
+    describe host RAM while the budget beside it described the framebuffer.
+    """
+    result.total_bytes = pool.total_bytes
+    result.available_bytes = pool.available_bytes
+    result.free_bytes = pool.free_bytes
+    result.pool_kind = pool.kind
+    result.device_count = len(pool.devices)
+    # Summed across devices for the "what does this machine hold" view. Only
+    # when every device answered: a partial sum understates the machine, and
+    # understating is the direction that hides a full card.
+    devices = pool.devices
+    if devices and all(d.total_bytes is not None for d in devices):
+        result.vram_total_bytes = sum(d.total_bytes or 0 for d in devices)
+        result.vram_used_bytes = sum(d.used_bytes or 0 for d in devices)
+        result.vram_free_bytes = sum(d.free_bytes or 0 for d in devices)
+    result.host_total_bytes = pool.host.total_bytes
+    result.host_available_bytes = pool.host.available_bytes
+
+
 async def status(node: Node) -> NodeStatus:
     result = NodeStatus(node=node)
 
     if node.is_local:
+        from app import accel as accel_mod
         from app import telemetry as local_telemetry
 
         snapshot = await local_telemetry.snapshot()
         result.telemetry = snapshot
-        memory = snapshot["memory"]
-        result.total_bytes = memory["total_bytes"]
-        result.available_bytes = memory["available_bytes"]
-        result.free_bytes = memory["free_bytes"]
+        _apply_pool(result, await accel_mod.pool_for(None))
     else:
         remote = await remote_telemetry(node)
         if remote.get("ok"):
             result.telemetry = remote
-            memory = remote["memory"]
-            result.total_bytes = memory["total_bytes"]
-            result.available_bytes = memory["available_bytes"]
-            result.free_bytes = memory["free_bytes"]
+            _apply_pool(result, await remote_pool(node))
         else:
             result.error = remote.get("error", "")
 
@@ -523,14 +568,29 @@ def combine(statuses: list[dict]) -> dict[str, Any]:
     any one machine's. Unreachable nodes contribute nothing rather than being
     counted optimistically.
     """
-    from app.config import settings
+    from app import accel
 
     live = [s for s in statuses if s.get("reachable") and s.get("total_bytes")]
-    reserve = int(settings.mem_reserve_gib * GIB)
+    # The reserve is a property of the machine, not a constant. Holding back the
+    # unified OS reserve — 32 GiB, the room a desktop needs in the pool it
+    # shares with the model — on a discrete node took 32 GiB out of a 45 GiB
+    # framebuffer the OS does not live in, and reported a 13 GiB ceiling for a
+    # card that can commit 43. Each node is asked what it needs, by kind.
+    reserves = {
+        id(s): accel.reserves_for(
+            s.get("pool_kind") or accel.UNIFIED,
+            s.get("total_bytes", 0),
+            s.get("host_total_bytes", 0),
+        )[0]
+        for s in live
+    }
     total = sum(s["total_bytes"] for s in live)
     available = sum(s["available_bytes"] for s in live)
-    ceiling = sum(max(0, s["total_bytes"] - reserve) for s in live)
-    biggest = max((max(0, s["total_bytes"] - reserve) for s in live), default=0)
+    ceiling = sum(max(0, s["total_bytes"] - reserves[id(s)]) for s in live)
+    biggest = max((max(0, s["total_bytes"] - reserves[id(s)]) for s in live), default=0)
+    # A mixed cluster has no single per-node reserve; report the largest, which
+    # is the one that binds when a pooled engine has to fit on every node.
+    reserve = max(reserves.values(), default=0)
     return {
         "nodes": len(live),
         "unreachable": len(statuses) - len(live),
@@ -608,25 +668,64 @@ _history: deque[dict] = deque(maxlen=int(HISTORY_SECONDS / HISTORY_INTERVAL))
 
 # What the chart plots. Each is its own panel because they are different units,
 # and putting two units on one axis makes a chart that cannot be read.
-METRICS = [
+# The first three are per device wherever a device can be told apart. The
+# fourth is the one that changes meaning with the hardware: on a unified part
+# host memory IS the GPU's memory and charting it is charting the GPU, while on
+# a discrete box it is a different pool that can sit at 12% while every card is
+# full — so there the chart follows the framebuffer instead. _metrics() picks.
+BASE_METRICS = [
     {"key": "gpu_util", "label": "GPU utilisation", "unit": "%", "max": 100},
     {"key": "temperature", "label": "GPU temperature", "unit": "°C", "max": None},
     {"key": "power", "label": "Board power", "unit": "W", "max": None},
-    {"key": "memory_pct", "label": "Host memory used", "unit": "%", "max": 100},
 ]
+HOST_MEMORY_METRIC = {"key": "memory_pct", "label": "Host memory used", "unit": "%", "max": 100}
+VRAM_METRIC = {"key": "vram_pct", "label": "GPU memory used", "unit": "%", "max": 100}
+METRICS = [*BASE_METRICS, HOST_MEMORY_METRIC]
+
+
+def _device_readings(telemetry: dict) -> dict:
+    """One reading per GPU, keyed by device index as a string for JSON.
+
+    Empty when the machine reports no per-device rows, which is what a unified
+    part does — and the caller then charts the node as a single series exactly
+    as before, so nothing about a Spark changes.
+    """
+    out: dict[str, dict] = {}
+    for row in telemetry.get("gpus") or []:
+        index = row.get("index")
+        if index is None:
+            continue
+        out[str(index)] = {
+            "name": row.get("name"),
+            "gpu_util": row.get("utilization_gpu"),
+            "temperature": row.get("temperature_gpu"),
+            "power": row.get("power_draw"),
+            "vram_pct": row.get("memory_used_pct"),
+            "vram_used_bytes": row.get("memory_used_bytes"),
+            "vram_total_bytes": row.get("memory_total_bytes"),
+        }
+    return out
 
 
 def _reading(telemetry: dict) -> dict:
     gpu = telemetry.get("gpu") or {}
     memory = telemetry.get("memory") or {}
+    vram = telemetry.get("vram") or {}
     load = telemetry.get("load") or []
+    used = vram.get("used_bytes")
+    total = vram.get("total_bytes")
     return {
         "gpu_util": gpu.get("utilization_gpu"),
         "temperature": gpu.get("temperature_gpu"),
         "power": gpu.get("power_draw"),
         "memory_pct": round(memory.get("used_fraction", 0) * 100, 1) if memory else None,
         "memory_used_bytes": memory.get("used_bytes"),
+        # Node-level VRAM, so a machine that reports a framebuffer but no
+        # per-device breakdown still charts the right pool.
+        "vram_pct": round(100 * used / total, 1) if used is not None and total else None,
+        "vram_used_bytes": used,
         "load": load[0] if load else None,
+        "devices": _device_readings(telemetry),
     }
 
 
@@ -642,6 +741,40 @@ async def record_sample() -> dict:
     return sample
 
 
+def _series(samples: list[dict], seen: list[str]) -> list[dict]:
+    """What the charts draw one line for.
+
+    A node with per-device rows contributes one series per GPU, so a second card
+    stops being invisible and a hot one stops being averaged away. A node
+    without them contributes itself, which is every Spark and any peer whose
+    driver will not break the figures out.
+    """
+    series: list[dict] = []
+    for name in seen:
+        devices: list[str] = []
+        for sample in samples:
+            for index in (sample["nodes"].get(name, {}).get("devices") or {}):
+                if index not in devices:
+                    devices.append(index)
+        if not devices:
+            series.append({"id": name, "node": name, "device": None, "label": name})
+            continue
+        for index in sorted(devices, key=lambda value: int(value)):
+            label = f"{name} GPU{index}" if len(seen) > 1 else f"GPU{index}"
+            series.append({"id": f"{name}:{index}", "node": name,
+                           "device": index, "label": label})
+    return series
+
+
+def _metrics(samples: list[dict]) -> list[dict]:
+    """Host memory, or the framebuffer, depending on what this cluster has."""
+    charts_vram = any(
+        node.get("vram_pct") is not None or (node.get("devices") or {})
+        for sample in samples for node in sample["nodes"].values()
+    )
+    return [*BASE_METRICS, VRAM_METRIC if charts_vram else HOST_MEMORY_METRIC]
+
+
 def history(minutes: float = 30.0) -> dict:
     cutoff = time.time() - minutes * 60
     samples = [s for s in _history if s["ts"] >= cutoff]
@@ -653,7 +786,8 @@ def history(minutes: float = 30.0) -> dict:
     return {
         "samples": samples,
         "nodes": seen,
-        "metrics": METRICS,
+        "series": _series(samples, seen),
+        "metrics": _metrics(samples),
         "interval_seconds": HISTORY_INTERVAL,
         "window_seconds": HISTORY_SECONDS,
     }

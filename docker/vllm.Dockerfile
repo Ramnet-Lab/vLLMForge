@@ -48,9 +48,53 @@ ARG XGRAMMAR_SPEC=">=0.2.2,<0.3"
 # install is the same dance the Heretic image does.
 ENV PIP_CONSTRAINT=""
 RUN pip install --no-cache-dir --no-deps "xgrammar${XGRAMMAR_SPEC}" \
- && python -c "\
+ && python3 -c "\
 from xgrammar import StructuralTag, normalize_tool_choice, get_model_structural_tag; \
 from vllm.tool_parsers import structural_tag_registry; \
 import importlib.metadata as m; \
 print('xgrammar', m.version('xgrammar'), '- tool calling imports cleanly')"
+# NGC ships this file and its contents matter; the official vLLM image has no
+# such path, and pointing PIP_CONSTRAINT at a missing file makes every later pip
+# in the image fail with "Could not open constraint file". An empty one is a
+# no-op constraint, so both bases end up with a valid setting.
+RUN [ -f /etc/pip/constraint.txt ] || { mkdir -p /etc/pip && : > /etc/pip/constraint.txt; }
 ENV PIP_CONSTRAINT=/etc/pip/constraint.txt
+
+# The last transformers that keeps Gemma 4's config flat. 5.15.0 moved
+# global_head_dim / num_global_key_value_heads into a per-layer structure and
+# made head_dim itself raise on global access, which vLLM reads directly:
+#   AmbiguousGlobalPerLayerAttributeError: 'head_dim' is a per-layer attribute
+# The engine dies in config parsing, before a single weight is read.
+ARG TRANSFORMERS_VERSION=5.14.1
+
+# Conditional for the same reason the xgrammar layer is: NGC's base ships 5.6.1,
+# which predates the restructure and is already correct, and reinstalling over it
+# would be a change made to fix a bug that is not there. The probe is functional
+# rather than a version comparison — it asks the config class the actual question
+# vLLM will ask it, so a future release that restores the flat keys needs no edit
+# here.
+RUN set -eu; \
+    if python3 -c "\
+from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig; \
+c = Gemma4TextConfig(global_head_dim=512, num_global_key_value_heads=4); \
+assert getattr(c, 'global_head_dim', None) == 512; \
+assert c.head_dim" >/dev/null 2>&1; then \
+        echo "base image's transformers keeps Gemma 4's config flat; not touching it"; \
+    else \
+        echo "base image's transformers hides Gemma 4's flat config; pinning ${TRANSFORMERS_VERSION}"; \
+        PIP_CONSTRAINT="" pip install --no-cache-dir "transformers==${TRANSFORMERS_VERSION}"; \
+    fi; \
+    python3 -c "\
+import transformers, vllm; \
+from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig; \
+c = Gemma4TextConfig(global_head_dim=512, num_global_key_value_heads=4); \
+assert getattr(c, 'global_head_dim', None) == 512, 'global_head_dim still hidden'; \
+print('transformers', transformers.__version__, '- Gemma 4 config reads flat, vLLM', vllm.__version__)"
+
+# The dashboard sends a complete `vllm serve ...` argv as the container command.
+# The two supported bases disagree about entrypoints — NGC's runs NVIDIA setup
+# and then execs what it was given, the official image's IS `vllm serve` — so a
+# shim keeps the first and drops the second. See docker/entrypoint.sh.
+COPY entrypoint.sh /usr/local/bin/llmd-entrypoint
+RUN chmod +x /usr/local/bin/llmd-entrypoint
+ENTRYPOINT ["/usr/local/bin/llmd-entrypoint"]

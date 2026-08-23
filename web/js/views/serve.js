@@ -1,5 +1,9 @@
-/* The vLLM control surface: what is resident, what it costs in host memory, and
-   every flag the image will accept.
+/* The vLLM control surface: what is resident, what it costs in the memory its
+   node actually spends, and every flag the image will accept.
+
+   "The memory its node spends" is the framebuffer on a discrete GPU and host
+   RAM on a unified part, and the backend decides which before any figure gets
+   here (app/accel.py). This view never assumes one of them.
 
    The parameter form is built from GET /api/servers/schema, which the backend
    generates from the image itself, so the form cannot drift from the binary
@@ -204,8 +208,9 @@ export async function render(container, ctx) {
       h('div', null,
         h('h1', null, 'Serve'),
         h('p', null,
-          'vLLM engines on the machines in this cluster. Utilisation is a fraction of the memory '
-          + 'the CPU and GPU share on one node, so every engine on a node spends the same pool — '
+          'vLLM engines on the machines in this cluster. Utilisation is a fraction of one node\'s '
+          + 'accelerator memory — the GPU\'s own framebuffer where it has one, the memory the CPU '
+          + 'and GPU share where they share it — so every engine on a node spends the same pool, '
           + 'and none of it is shared with the node next to it.')),
       h('div', { class: 'page-actions' },
         h('button', { onClick: () => { refreshStatus(); loadCluster(); } }, 'Refresh'),
@@ -359,7 +364,11 @@ function budgetPanel() {
   const level = budget.free_util <= 0 ? 'crit' : budget.free_util < 0.1 ? 'warn' : '';
   const reserveWidth = Math.max(0,
     Math.min(1 - budget.occupied_util, budget.reserve_bytes / budget.total_bytes));
-  return panel('Host memory budget', {
+  // The title is the reading. Calling a framebuffer budget "host memory" sends
+  // an operator to check free -g, which on a discrete box will look fine while
+  // this panel is refusing launches.
+  const poolLabel = budget.pool_kind === 'discrete' ? 'GPU memory budget' : 'Host memory budget';
+  return panel(poolLabel, {
     sub: `this machine · ${budget.tenants.length} engine(s) resident`,
     body: h('div', null,
       h('div', { class: 'grid cols-4' },

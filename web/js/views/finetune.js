@@ -1212,8 +1212,9 @@ function serveDialog(job) {
       field('server name', name, { flag: 'name' }),
       field('gpu memory utilization', util, {
         flag: 'gpu_memory_utilization',
-        help: 'GPU memory is host memory here. 0.25 of 121 GiB is 30 GiB — enough for a small '
-          + 'model beside whatever is already resident.',
+        help: 'A fraction of one node\'s accelerator memory: the GPU\'s framebuffer where it has '
+          + 'its own, the pool the CPU and GPU share where they share it. The Serve tab\'s budget '
+          + 'panel shows which one this machine has and how much of it is already spoken for.',
       }),
       field('max model len', maxLen, { flag: 'max_model_len' }),
       field('port', port, { flag: 'port', help: 'Blank picks the next free one.' }))), {

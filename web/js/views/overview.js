@@ -56,35 +56,77 @@ function memoryBars(segments, total) {
    compared at a glance. The local card adds what only this machine can know —
    which engines committed what — underneath, rather than in a different shape. */
 
+/** Whether this node's engines spend a framebuffer or the host's own RAM.
+ *  Everything below is labelled from this: the same bytes mean different things
+ *  on the two kinds of machine, and a panel that says "Host memory" over a
+ *  framebuffer figure is not a cosmetic problem — it is the reading an operator
+ *  sizes a model against. */
+function isDiscrete(node, budget) {
+  const kind = node.pool_kind || (node.local && budget ? budget.pool_kind : '');
+  return kind === 'discrete';
+}
+
 function nodeMemory(node, budget) {
-  const total = node.total_bytes || 0;
-  const available = Math.max(0, node.available_bytes || 0);
-  const used = Math.max(0, total - available);
   const running = node.containers || [];
   const isLocal = node.local && budget && budget.total_bytes;
+  const discrete = isDiscrete(node, budget);
+  const devices = node.device_count || 0;
+  // Two different totals, and the panel needs both. node.total_bytes is ONE
+  // device, because --gpu-memory-utilization is a fraction of one framebuffer.
+  // The bars answer a different question — how much memory is on this machine
+  // and how much of it is gone — and there the answer is every card added up.
+  // Showing the per-device figure here made a 2x45 GiB box report 45 GiB and
+  // hid a second card that was 86% full.
+  const cumulative = discrete && (node.vram_total_bytes || 0) > 0;
+  const perDevice = node.total_bytes || 0;
+  const total = cumulative ? node.vram_total_bytes : perDevice;
+  // Summed used, not total-minus-free: the two differ by driver overhead, and
+  // the measured figure is the one that matches nvidia-smi.
+  const used = cumulative
+    ? Math.max(0, node.vram_used_bytes || 0)
+    : Math.max(0, perDevice - Math.max(0, node.available_bytes || 0));
+  const available = cumulative
+    ? Math.max(0, node.vram_free_bytes || 0)
+    : Math.max(0, node.available_bytes || 0);
 
   const segments = [
     {
       key: 'other',
       label: 'In use',
       value: used,
-      note: 'everything MemAvailable does not count as reclaimable, engines included',
+      note: discrete
+        ? (devices > 1
+            ? `what every engine and CUDA context holds across all ${devices} devices`
+            : 'what the engines and any other CUDA context on this node hold in the framebuffer')
+        : 'everything MemAvailable does not count as reclaimable, engines included',
     },
     {
       key: 'free',
       label: 'Available',
       value: available,
-      note: 'what a new engine here could take before the guard steps in',
+      note: cumulative && devices > 1
+        ? 'summed across devices — a new engine draws on one of them, not on the sum'
+        : 'what a new engine here could take before the guard steps in',
     },
   ];
 
   return h('div', { class: 'stack' },
     h('div', { class: 'ov-tiles' },
-      stat('Host memory', bytes(total), 'shared by the CPU and the GPU'),
+      discrete
+        ? stat('GPU memory', bytes(total),
+            devices > 1
+              ? `${devices} devices · ${bytes(perDevice)} each — utilisation is a fraction of one`
+              : 'the framebuffer, separate from host RAM')
+        : stat('Host memory', bytes(total), 'shared by the CPU and the GPU'),
       stat('In use', bytes(used), total ? pct(used / total) : ''),
       stat('Available', bytes(available), total ? pct(available / total) : ''),
-      stat('Containers', String(running.length),
-        running.length ? running.map((c) => c.name).join(', ').slice(0, 40) : 'none running')),
+      // Host RAM stops being the headline on a discrete box but does not stop
+      // mattering: --cpu-offload-gb and the loading process both draw on it.
+      discrete && node.host_total_bytes
+        ? stat('Host RAM', bytes(node.host_total_bytes),
+            `${bytes(node.host_available_bytes || 0)} available · offload and loading only`)
+        : stat('Containers', String(running.length),
+            running.length ? running.map((c) => c.name).join(', ').slice(0, 40) : 'none running')),
     memoryBars(segments, total),
     isLocal ? localCommitment(budget) : null);
 }
@@ -185,8 +227,26 @@ const clock = (ts) => new Date(ts * 1000).toLocaleTimeString([], {
   hour: '2-digit', minute: '2-digit',
 });
 
+/** One line per GPU where the machine can tell its GPUs apart, one line per
+ *  node where it cannot. The second case is every unified part, which reports
+ *  no per-device rows and is charted exactly as it always was. */
+function seriesOf(hist) {
+  if (hist.series && hist.series.length) return hist.series;
+  return (hist.nodes || []).map((name) => ({ id: name, node: name, device: null, label: name }));
+}
+
+/** A series reads from its own device when it has one. Falling back to the
+ *  node-level figure would quietly draw the same line twice on a two-card box. */
+function seriesValue(sample, series, key) {
+  const node = sample.nodes[series.node];
+  if (!node) return undefined;
+  if (series.device === null || series.device === undefined) return node[key];
+  const device = (node.devices || {})[series.device];
+  return device ? device[key] : undefined;
+}
+
 function metricPanel(metric, hist) {
-  const nodes = hist.nodes || [];
+  const nodes = seriesOf(hist);
   const samples = hist.samples || [];
   if (samples.length < 2) {
     return h('div', { class: 'ov-plot' },
@@ -197,7 +257,7 @@ function metricPanel(metric, hist) {
 
   const t0 = samples[0].ts;
   const span = Math.max(1, samples[samples.length - 1].ts - t0);
-  const at = (sample, node) => sample.nodes[node]?.[metric.key];
+  const at = (sample, series) => seriesValue(sample, series, metric.key);
   const all = samples.flatMap((sample) => nodes.map((node) => at(sample, node)));
   // A percentage keeps its full 0-100 axis: an idle GPU should look idle, not
   // like a mountain range of rescaled jitter. Everything else follows the data.
@@ -238,9 +298,9 @@ function metricPanel(metric, hist) {
     values.push(h('b', null, reading(last, metric.unit)));
   });
 
-  const keys = nodes.map((node, index) => h('span', { class: 'ov-key' },
+  const keys = nodes.map((series, index) => h('span', { class: 'ov-key' },
     h('i', { style: { background: seriesColour(index) } }),
-    h('span', null, node), values[index]));
+    h('span', null, series.label), values[index]));
 
   const cursor = svg('line', { y1: PLOT.padT, y2: PLOT.h - PLOT.padB, class: 'ov-cursor',
     x1: -20, x2: -20 });
@@ -289,19 +349,20 @@ function metricPanel(metric, hist) {
       h('span', { class: 'ov-keys' }, keys)),
     svg('svg', { viewBox: `0 0 ${PLOT.w} ${PLOT.h}`, class: 'ov-svg',
       role: 'img', 'aria-label': `${metric.label} over the last ${Math.round(span / 60)} minutes, `
-        + `one line per node: ${nodes.join(', ')}`,
+        + `one line per series: ${nodes.map((series) => series.label).join(', ')}`,
       onMousemove: hover, onMouseleave: restore },
       gridlines, ticks, times, cursor, lines, dots,
       svg('rect', { x: 0, y: 0, width: PLOT.w, height: PLOT.h, fill: 'transparent' })));
 }
 
 function timeSeries(hist) {
-  if (!hist || !(hist.nodes || []).length) return null;
+  if (!hist || !seriesOf(hist).length) return null;
   const minutes = Math.round((hist.window_seconds || 1800) / 60);
   return h('div', { class: 'stack' },
     h('div', { class: 'ov-plot-grid' }, (hist.metrics || []).map((m) => metricPanel(m, hist))),
     h('div', { class: 'faint small' },
-      `Both machines on every panel, one colour each. Last ${minutes} minutes, `
+      `${seriesOf(hist).length} series on every panel, one colour each — a line per GPU where the `
+      + `driver breaks them out, otherwise one per machine. Last ${minutes} minutes, `
       + `sampled every ${hist.interval_seconds}s; hover to read a point. `
       + 'A node that goes unreachable stops contributing and its line simply ends.'));
 }
@@ -357,14 +418,24 @@ function clusterSection(payload) {
     combinedPool(payload.combined, registry),
     timeSeries(payload.history),
     registry.map((node) => nodeCard(node, payload.budget)),
-    notice('info',
-      h('strong', null, 'GPU memory is host memory on these machines. '),
-      h('span', null,
-        '--gpu-memory-utilization 0.50 reserves half of all '
-        + `${bytes(local.total_bytes || payload.budget.total_bytes)} on the node it runs on, so the `
-        + 'fractions of every engine on that node add up, and overcommitting does not run slowly — '
-        + 'it freezes that box while CUDA graphs are captured. The fractions do not travel: a '
-        + 'peer\'s ceiling is its own.')));
+    isDiscrete(local, payload.budget)
+      ? notice('info',
+          h('strong', null, 'GPU memory is its own pool on these machines. '),
+          h('span', null,
+            '--gpu-memory-utilization 0.50 reserves half of the '
+            + `${bytes(local.total_bytes || payload.budget.total_bytes)} framebuffer of one device, `
+            + 'so the fractions of every engine on that node add up against the card, not against '
+            + 'host RAM — which can read empty while the GPU is full. Overcommitting fails the '
+            + 'launch with a CUDA OOM rather than freezing the box. The fractions do not travel: a '
+            + 'peer\'s ceiling is its own.'))
+      : notice('info',
+          h('strong', null, 'GPU memory is host memory on these machines. '),
+          h('span', null,
+            '--gpu-memory-utilization 0.50 reserves half of all '
+            + `${bytes(local.total_bytes || payload.budget.total_bytes)} on the node it runs on, so the `
+            + 'fractions of every engine on that node add up, and overcommitting does not run slowly — '
+            + 'it freezes that box while CUDA graphs are captured. The fractions do not travel: a '
+            + 'peer\'s ceiling is its own.')));
 }
 
 /* --- live telemetry ----------------------------------------------------- */
@@ -374,6 +445,8 @@ function telemetrySection(snapshot) {
     return empty('Waiting for a sample', 'The telemetry stream has not delivered a snapshot yet.');
   }
   const gpu = snapshot.gpu || {};
+  // Empty on a unified part, where there is no separate pool to gauge.
+  const vram = snapshot.vram || {};
   const load = snapshot.load || [];
   const procs = snapshot.gpu_processes || [];
   const measured = procs.reduce((sum, proc) => sum + (proc.used_bytes || 0), 0);
@@ -389,10 +462,37 @@ function telemetrySection(snapshot) {
         gpu.pstate ? `pstate ${gpu.pstate}` : ''),
       stat('Load', load.length ? load.map((value) => value.toFixed(2)).join('  ') : '—',
         `${snapshot.cpu_count || 0} cores`)),
-    h('p', { class: 'ov-note' },
-      'nvidia-smi reports no memory total, used or free on this part — the memory is unified and '
-      + 'there is no framebuffer to measure — so there is deliberately no GPU-memory gauge here. '
-      + 'The host memory panel above is the GPU memory panel.'),
+    vram.device_count
+      ? h('div', { class: 'stack' },
+          h('div', { class: 'ov-tiles' },
+            stat('VRAM total', bytes(vram.total_bytes),
+              vram.device_count > 1
+                ? `${vram.device_count} devices · ${bytes(vram.per_device_total_bytes)} each`
+                : 'one device'),
+            stat('VRAM in use', bytes(vram.used_bytes),
+              vram.total_bytes ? pct(vram.used_bytes / vram.total_bytes) : ''),
+            stat('VRAM free', bytes(vram.free_bytes),
+              vram.total_bytes ? pct(vram.free_bytes / vram.total_bytes) : '')),
+          (vram.devices || []).length > 1
+            ? h('div', { class: 'table-wrap' },
+                h('table', null,
+                  h('thead', null, h('tr', null,
+                    h('th', null, 'Device'),
+                    h('th', { class: 'num' }, 'In use'),
+                    h('th', { class: 'num' }, 'Free'))),
+                  h('tbody', null, (vram.devices || []).map((dev) => h('tr', null,
+                    h('td', null, `${dev.index}: ${dev.name}`),
+                    h('td', { class: 'num' }, bytes(dev.used_bytes)),
+                    h('td', { class: 'num' }, bytes(dev.free_bytes)))))))
+            : null,
+          h('p', { class: 'ov-note' },
+            'Per device, because --gpu-memory-utilization is a fraction of one framebuffer. '
+            + 'A model that does not fit on the smallest device does not fit, however much the '
+            + 'totals add up to.'))
+      : h('p', { class: 'ov-note' },
+          'nvidia-smi reports no memory total, used or free on this part — the memory is unified and '
+          + 'there is no framebuffer to measure — so there is deliberately no GPU-memory gauge here. '
+          + 'The host memory panel above is the GPU memory panel.'),
     procs.length
       ? h('div', { class: 'table-wrap' },
           h('table', null,

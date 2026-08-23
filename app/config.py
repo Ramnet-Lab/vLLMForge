@@ -63,8 +63,10 @@ class Settings:
     vllm_image: str = field(
         default_factory=lambda: _env("LLMD_VLLM_IMAGE", "llmd/vllm:latest")
     )
+    # "auto" asks the hardware (app/images.py). Set a concrete image to pin it;
+    # the old behaviour is LLMD_VLLM_BASE_IMAGE=nvcr.io/nvidia/vllm:26.07-py3.
     vllm_base_image: str = field(
-        default_factory=lambda: _env("LLMD_VLLM_BASE_IMAGE", "nvcr.io/nvidia/vllm:26.07-py3")
+        default_factory=lambda: _env("LLMD_VLLM_BASE_IMAGE", "auto")
     )
     heretic_image: str = field(
         default_factory=lambda: _env("LLMD_HERETIC_IMAGE", "llmd/heretic:latest")
@@ -102,6 +104,15 @@ class Settings:
     # behaviour everywhere.
     memguard_host_action: str = field(
         default_factory=lambda: _env("LLMD_MEMGUARD_HOST_ACTION", "auto")
+    )
+    # The same watchdog, on the memory that actually runs out on a discrete box.
+    # Host MemAvailable can sit at 90 GiB while every framebuffer is full, so on
+    # discrete the trigger is device free memory and a kill there is not a
+    # self-inflicted outage — it is the only signal that saw the problem. Lower
+    # than the host threshold because a framebuffer is smaller than host RAM and
+    # nothing but engines lives in it.
+    memguard_device_threshold_mib: int = field(
+        default_factory=lambda: _env_int("LLMD_MEMGUARD_DEVICE_THRESHOLD_MIB", 2048)
     )
 
     # --- accelerator memory -----------------------------------------------

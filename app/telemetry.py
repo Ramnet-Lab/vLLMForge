@@ -1,9 +1,16 @@
 """Host and accelerator telemetry.
 
-GB10 is a unified-memory part: nvidia-smi reports no memory.total/used/free and
-no power limit, so "GPU memory" here means host memory plus the per-process
-figures that --query-compute-apps does return. Anything that reports [N/A] on
-this hardware is filtered out rather than shown as a broken tile.
+Two memories are reported, and which one matters depends on the hardware.
+
+On a discrete GPU the framebuffer is a separate pool: nvidia-smi answers
+memory.total/used/free per device, and that — not host RAM — is what an engine
+spends. On a unified part such as GB10 those fields come back [N/A], there is no
+separate pool to report, and host memory *is* the accelerator's memory.
+
+So `vram` is filled in only when the driver gives real per-device figures, and
+is empty otherwise. A consumer that finds it empty should fall back to `memory`,
+which is host RAM and always truthful. Anything reporting [N/A] is filtered out
+rather than shown as a broken tile.
 """
 
 from __future__ import annotations
@@ -16,11 +23,14 @@ from dataclasses import asdict, dataclass, field
 from app.config import settings
 
 KIB = 1024
+MIB = 1024 ** 2
 GIB = 1024 ** 3
 
-# Fields verified to return real values on GB10. memory.*, power.limit,
-# clocks.mem and fan.speed all report [N/A] on this part and are deliberately
-# absent — see docs/MEMORY.md.
+# The per-device row every part answers. memory.* is queried separately (see
+# DEVICE_FIELDS) because a unified part reports [N/A] for it while still
+# answering everything here — mixing the two would throw away a good row for a
+# field that was never going to arrive. power.limit, clocks.mem and fan.speed
+# are [N/A] on GB10 and deliberately absent — see docs/MEMORY.md.
 GPU_FIELDS = [
     "name",
     "driver_version",
@@ -63,7 +73,13 @@ class GpuProcess:
 class Snapshot:
     ts: float = field(default_factory=time.time)
     memory: dict = field(default_factory=dict)
+    # Per-device framebuffer. Empty on a unified part, where `memory` is the
+    # accelerator's memory and there is nothing separate to report.
+    vram: dict = field(default_factory=dict)
     gpu: dict = field(default_factory=dict)
+    # One entry per device, for anything that must not average two cards
+    # together or silently describe only the first.
+    gpus: list = field(default_factory=list)
     gpu_processes: list = field(default_factory=list)
     load: list = field(default_factory=list)
     cpu_count: int = 0
@@ -172,6 +188,118 @@ def parse_gpu_csv(out: str) -> dict:
     return gpu
 
 
+DEVICE_FIELDS = ["index", "name", "memory.total", "memory.used", "memory.free"]
+DEVICE_QUERY = ["--query-gpu=" + ",".join(DEVICE_FIELDS), "--format=csv,noheader,nounits"]
+
+
+def parse_device_memory(out: str) -> list[dict]:
+    """Per-device framebuffer figures, or [] when the driver will not say.
+
+    A unified part answers [N/A] for every memory field, which is not a parse
+    failure to be logged but the honest answer that no separate pool exists —
+    so a row that will not yield numbers is dropped and the caller sees the
+    empty list it uses to fall back to host memory.
+    """
+    devices: list[dict] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < len(DEVICE_FIELDS):
+            continue
+        try:
+            index = int(parts[0])
+            total = int(float(parts[2])) * MIB
+            used = int(float(parts[3])) * MIB
+            free = int(float(parts[4])) * MIB
+        except ValueError:
+            continue
+        if total <= 0:
+            continue
+        devices.append({
+            "index": index,
+            "name": parts[1],
+            "total_bytes": total,
+            "used_bytes": used,
+            "free_bytes": free,
+        })
+    return devices
+
+
+def summarise_device_memory(devices: list[dict]) -> dict:
+    """The two totals a framebuffer has, which are not the same number.
+
+    `total_bytes` sums every device, because that is how much VRAM the machine
+    has. `per_device_total_bytes` is the smallest single framebuffer, because
+    that is what --gpu-memory-utilization multiplies: the fraction applies to
+    one device, and on a mixed set the smallest is the one that runs out first.
+    Reporting only the sum is what makes a 2x45 GiB box look like it can take a
+    90 GiB model.
+    """
+    if not devices:
+        return {}
+    totals = [d["total_bytes"] for d in devices]
+    return {
+        "total_bytes": sum(totals),
+        "used_bytes": sum(d["used_bytes"] for d in devices),
+        "free_bytes": sum(d["free_bytes"] for d in devices),
+        "per_device_total_bytes": min(totals),
+        "device_count": len(devices),
+        "devices": devices,
+    }
+
+
+async def read_device_memory() -> dict:
+    return summarise_device_memory(parse_device_memory(await _nvidia_smi(DEVICE_QUERY)))
+
+
+GPUS_FIELDS = ["index"] + GPU_FIELDS
+GPUS_QUERY = ["--query-gpu=" + ",".join(GPUS_FIELDS), "--format=csv,noheader,nounits"]
+
+
+def parse_gpu_rows(out: str) -> list[dict]:
+    """Every device nvidia-smi listed, not just the first.
+
+    parse_gpu_csv takes one row because the tiles above show one device. The
+    charts must not: on a two-card box the utilisation, temperature and power
+    lines were GPU 0's, drawn unlabelled, while the second card could sit at
+    100% and 80C without appearing anywhere.
+    """
+    rows: list[dict] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        row: dict = {}
+        for name, raw in zip(GPUS_FIELDS, parts, strict=False):
+            value = _coerce(name, raw)
+            if value is not None:
+                row[name.replace(".", "_")] = value
+        try:
+            row["index"] = int(str(row.get("index", "")).strip())
+        except (TypeError, ValueError):
+            continue
+        rows.append(row)
+    return rows
+
+
+async def read_gpus() -> list[dict]:
+    """Per-device stats with each device's framebuffer merged in by index."""
+    raw, memory = await asyncio.gather(_nvidia_smi(GPUS_QUERY), read_device_memory())
+    rows = parse_gpu_rows(raw)
+    by_index = {d["index"]: d for d in (memory.get("devices") or [])}
+    for row in rows:
+        found = by_index.get(row["index"])
+        if not found:
+            continue
+        row["memory_total_bytes"] = found["total_bytes"]
+        row["memory_used_bytes"] = found["used_bytes"]
+        row["memory_free_bytes"] = found["free_bytes"]
+        if found["total_bytes"]:
+            row["memory_used_pct"] = round(100 * found["used_bytes"] / found["total_bytes"], 1)
+    return rows
+
+
 def parse_compute_apps(out: str) -> list[dict]:
     procs = []
     for line in out.splitlines():
@@ -238,8 +366,9 @@ def read_disk(path=None) -> dict:
 
 
 async def snapshot(containers: list | None = None) -> dict:
-    memory, gpu, procs = await asyncio.gather(
-        asyncio.to_thread(read_meminfo), read_gpu(), read_gpu_processes()
+    memory, vram, gpu, gpus, procs = await asyncio.gather(
+        asyncio.to_thread(read_meminfo), read_device_memory(), read_gpu(), read_gpus(),
+        read_gpu_processes()
     )
     load, cpus = read_load()
     snap = Snapshot(
@@ -248,7 +377,9 @@ async def snapshot(containers: list | None = None) -> dict:
             "used_bytes": memory.used_bytes,
             "used_fraction": memory.used_fraction,
         },
+        vram=vram,
         gpu=gpu,
+        gpus=gpus,
         gpu_processes=[asdict(p) for p in procs],
         load=load,
         cpu_count=cpus,

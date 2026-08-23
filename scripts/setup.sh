@@ -152,6 +152,8 @@ if ! command -v docker >/dev/null; then
 else
     build_image() {
         local role="$1" tag="$2" dockerfile="$3" required="${4:-no}"
+        local base_arg=""
+        [ -n "${VLLM_BASE:-}" ] && base_arg="--build-arg BASE_IMAGE=$VLLM_BASE"
         if docker image inspect "$tag" >/dev/null 2>&1; then
             note "$tag is already built"
             return
@@ -163,7 +165,8 @@ else
         # anyone pressing Enter all used to end up there.
         if [ "$required" = yes ] || [ "$IMAGES" = yes ] \
            || { [ "$IMAGES" = ask ] && confirm "Build $role now?"; }; then
-            docker build -t "$tag" -f "$REPO/docker/$dockerfile" "$REPO/docker" || {
+            # shellcheck disable=SC2086 -- base_arg is two words or none
+            docker build $base_arg -t "$tag" -f "$REPO/docker/$dockerfile" "$REPO/docker" || {
                 if [ "$required" = yes ]; then
                     fail "could not build $tag, and nothing can be served without it. Retry with:
     docker build -t $tag -f docker/$dockerfile docker/"
@@ -180,8 +183,19 @@ else
         'from app.config import settings
 print(f"HERETIC_TAG={settings.heretic_image!r}")
 print(f"FINETUNE_TAG={settings.finetune_image!r}")
-print(f"VLLM_TAG={settings.vllm_image!r}")
-print(f"VLLM_BASE={settings.vllm_base_image!r}")')"
+print(f"VLLM_TAG={settings.vllm_image!r}")')"
+    # Which vLLM the images are built on is a property of the machine, not a
+    # constant: NGC is right on a Spark and cannot serve a tied-embedding model
+    # under 4-bit quantisation anywhere else. app/images.py decides, and says why.
+    eval "$(cd "$REPO" && "$VENV/bin/python" -c \
+        'import asyncio
+from app import images
+from app.config import settings
+image, why = asyncio.run(images.detect_base_image(settings.vllm_base_image))
+print(f"VLLM_BASE={image!r}")
+print(f"VLLM_BASE_WHY={why!r}")')"
+    note "base image: $VLLM_BASE"
+    note "  $VLLM_BASE_WHY"
     # Not optional the way the other two are, so it is not asked about: it is
     # the image every server runs, and without it the NGC base 500s on any
     # request carrying tools. Build it on every node in the cluster — each rank
