@@ -76,12 +76,18 @@ async def test_a_peers_budget_never_counts_this_machines_gpu(monkeypatch):
     async def no_containers(prefix=None, *, all_containers=True, host=None):
         return []
 
-    async def remote_memory(node):
-        return TOTAL, 118 * GIB, 100 * GIB
+    from app import accel, telemetry
 
-    monkeypatch.setattr(safety, "read_gpu_processes", local_processes)
+    host = telemetry.HostMemory(total_bytes=TOTAL, available_bytes=118 * GIB,
+                                free_bytes=100 * GIB)
+
+    async def remote_pool(node):
+        return accel.build([], host, smi_ok=False)
+
+    monkeypatch.setattr(telemetry, "read_gpu_processes", local_processes)
+    monkeypatch.setattr(telemetry, "read_meminfo", lambda: host)
     monkeypatch.setattr(safety.docker_ctl, "ps", no_containers)
-    monkeypatch.setattr(nodes, "_remote_memory", remote_memory)
+    monkeypatch.setattr(nodes, "remote_pool", remote_pool)
 
     peer = nodes.Node(name="peer", address="10.0.0.9", docker_host="ssh://peer")
     budget = await safety.current_budget(node=peer)

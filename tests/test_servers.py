@@ -146,7 +146,6 @@ def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
     A launch refused for running out of memory came back as not found."""
     from fastapi.testclient import TestClient
 
-    from app import servers as svc
     from app.main import app
 
     row = servers.create_server({

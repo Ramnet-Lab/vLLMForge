@@ -32,7 +32,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from app import model_profile, safety, telemetry, vllm_spec
+from app import model_profile, safety, vllm_spec
 from app.model_profile import Profile
 
 # vLLM compares its requested memory against a snapshot of free memory taken as
@@ -260,9 +260,13 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
         replacing = server_service.container_name({"id": server_id})
 
     budget = await safety.current_budget(exclude=replacing, node=target)
-    memory = telemetry.read_meminfo() if target.is_local else None
-    total = memory.total_bytes if memory else budget.total_bytes
-    available = memory.available_bytes if memory else budget.available_bytes
+    # Both figures come from the budget, which got them from the one probe that
+    # decides what they describe. Re-reading /proc/meminfo here was harmless
+    # while every machine was unified — it was the same number — and would be a
+    # silent lie on a box whose GPU has its own memory: the guard would judge
+    # against the framebuffer while the recommendation sized against host RAM.
+    total = budget.total_bytes
+    available = budget.available_bytes
 
     # A server being reconfigured is about to be replaced, so the memory its own
     # container holds is memory it can have back. current_budget takes that off

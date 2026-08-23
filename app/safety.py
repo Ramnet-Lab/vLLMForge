@@ -32,7 +32,6 @@ from typing import Any
 
 from app import docker_ctl, vllm_spec
 from app.config import settings
-from app.telemetry import read_gpu_processes, read_meminfo
 
 GIB = 1024 ** 3
 
@@ -164,6 +163,10 @@ class Budget:
     reserve_bytes: int = 0
     warn_reserve_bytes: int = 0
     tenants: list[Tenant] = field(default_factory=list)
+    pool: Any = None
+    """The accel.Pool these figures came from: which memory they describe, how
+    that was decided, and how sure it is. Additive — every field above keeps
+    the meaning it had when they were always host memory."""
 
     @property
     def committed_bytes(self) -> int:
@@ -242,6 +245,14 @@ class Budget:
             "warn_util": round(self.warn_util, 4),
             "free_util": round(self.free_util, 4),
             "default_util": default_util(),
+            # Which memory every figure above describes, so a reader never has
+            # to assume it is host RAM. Additive: no key above changed.
+            "pool_kind": getattr(self.pool, "kind", "unified"),
+            "pool_confidence": getattr(self.pool, "confidence", "assumed"),
+            "pool_devices": getattr(self.pool, "device_count", 0),
+            "pool_evidence": list(getattr(self.pool, "evidence", ()) or ()),
+            "host_available_bytes": getattr(
+                getattr(self.pool, "host", None), "available_bytes", self.available_bytes),
             "tenants": [
                 {
                     "name": t.name,
@@ -290,29 +301,30 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
     `node` is an app.nodes.Node; omitted means this machine. A launch aimed at a
     peer has to be measured against that peer's memory, not against ours.
     """
-    host = getattr(node, "docker_host", None)
-    if host is None:
-        memory = read_meminfo()
-        total, available, free = memory.total_bytes, memory.available_bytes, memory.free_bytes
-    else:
-        from app import nodes as node_registry
+    from app import accel
 
-        total, available, free = await node_registry._remote_memory(node)
+    host = getattr(node, "docker_host", None)
+    # One probe decides what these numbers describe. On a unified machine it
+    # answers with MemTotal and MemAvailable, byte for byte, and this is the
+    # same budget it always was; on a machine whose GPU has its own memory it
+    # answers with the framebuffer, which is what the utilisation fraction
+    # actually multiplies there. Nothing below needs to know which it got.
+    pool = await accel.pool_for(node)
 
     budget = Budget(
-        total_bytes=total,
-        available_bytes=available,
-        free_bytes=free,
-        reserve_bytes=int(settings.mem_reserve_gib * GIB),
-        warn_reserve_bytes=int(settings.mem_warn_reserve_gib * GIB),
+        total_bytes=pool.total_bytes,
+        available_bytes=pool.available_bytes,
+        free_bytes=pool.free_bytes,
+        reserve_bytes=pool.reserve_bytes,
+        warn_reserve_bytes=pool.warn_reserve_bytes,
+        pool=pool,
     )
 
-    # Per-process GPU accounting comes from nvidia-smi, which reports on THIS
+    # Per-process accounting comes from nvidia-smi, which reports on THIS
     # machine. Counting it against a peer made an idle peer look half full and
     # refused launches it had ample room for.
     if host is None:
-        processes = await read_gpu_processes()
-        budget.measured_gpu_bytes = sum(p.used_bytes for p in processes)
+        budget.measured_gpu_bytes = pool.measured_bytes
 
     fallback = default_util()
     for row in await docker_ctl.ps(all_containers=False, host=host):
@@ -328,7 +340,7 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
             # and what it holds is memory the replacement can have back — so it
             # comes off the measured total too, which otherwise counts the very
             # engine being restarted against its own restart.
-            budget.excluded_bytes = footprint(command_params(info.command), total)
+            budget.excluded_bytes = footprint(command_params(info.command), pool.total_bytes)
             continue
 
         params = command_params(info.command)

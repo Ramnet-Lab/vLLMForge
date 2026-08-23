@@ -162,7 +162,12 @@ TELEMETRY_SCRIPT = (
     "echo '@@LOAD@@'; cat /proc/loadavg; nproc; "
     "echo '@@GPU@@'; nvidia-smi {gpu} 2>/dev/null; "
     "echo '@@APPS@@'; nvidia-smi {apps} 2>/dev/null; "
-    "echo '@@DISK@@'; df -PB1 {cache} 2>/dev/null | tail -1"
+    "echo '@@DISK@@'; df -PB1 {cache} 2>/dev/null | tail -1; "
+    # Asked separately from @@GPU@@, and with a timeout: nvidia-smi fails a
+    # whole query when it does not know one field, and a wedged driver on a peer
+    # must not hold up a node sweep.
+    "echo '@@ACCEL@@'; timeout 5 nvidia-smi {accel} 2>/dev/null; echo \"rc=$?\"; "
+    "echo '@@ADDR@@'; timeout 5 nvidia-smi {addr} 2>/dev/null"
 )
 
 
@@ -171,7 +176,8 @@ def _section(out: str, name: str) -> str:
     if marker not in out:
         return ""
     rest = out.split(marker, 1)[1]
-    for other in ("@@MEM@@", "@@LOAD@@", "@@GPU@@", "@@APPS@@", "@@DISK@@"):
+    for other in ("@@MEM@@", "@@LOAD@@", "@@GPU@@", "@@APPS@@", "@@DISK@@",
+                  "@@ACCEL@@", "@@ADDR@@"):
         if other in rest:
             rest = rest.split(other, 1)[0]
     return rest.strip("\n")
@@ -219,20 +225,45 @@ async def remote_telemetry(node: Node) -> dict:
     }
 
 
-async def _remote_memory(node: Node) -> tuple[int, int, int]:
-    code, out = await _ssh(node.name or node.address, "cat /proc/meminfo")
+async def remote_pool(node: Node):
+    """A peer's memory pool, measured on the peer.
+
+    Detection has to happen per node, not once per process: the dashboard runs
+    on one machine and drives others, and a cluster can perfectly well be one
+    unified box and one with a discrete card. Asking this machine what kind of
+    memory the peer has would be the same mistake as assuming its NIC name.
+
+    An unreachable peer gets an empty pool rather than a guess, and everything
+    downstream refuses on 0 bytes rather than admitting a launch onto a machine
+    it could not read.
+    """
+    from app import accel
+
+    accel_q, addr_q = accel.cheap_script()
+    script = (
+        "echo '@@MEM@@'; cat /proc/meminfo; "
+        f"echo '@@ACCEL@@'; {accel_q}; echo \"rc=$?\"; "
+        f"echo '@@ADDR@@'; {addr_q}"
+    )
+    code, out = await _ssh(node.name or node.address, script)
     if code != 0:
-        return 0, 0, 0
-    values = {}
-    for line in out.splitlines():
-        key, _, rest = line.partition(":")
-        parts = rest.split()
-        if parts:
-            try:
-                values[key] = int(parts[0]) * 1024
-            except ValueError:
-                continue
-    return (values.get("MemTotal", 0), values.get("MemAvailable", 0), values.get("MemFree", 0))
+        return accel.Pool(kind=accel.UNKNOWN, confidence="measured", can_size=False,
+                          has_accelerator=False,
+                          evidence=(f"{node.name} did not answer over ssh",))
+    accel_section = _section(out, "ACCEL")
+    # The rc line the script appends: an nvidia-smi that ran and said nothing is
+    # not the same as one that was never there.
+    rows, _, tail = accel_section.rpartition("rc=")
+    accel_ok = tail.strip() == "0"
+    return accel.from_sections(accel=rows, addr=_section(out, "ADDR"),
+                               meminfo=_section(out, "MEM"), accel_ok=accel_ok,
+                               override=settings.accel_mode)
+
+
+async def _remote_memory(node: Node) -> tuple[int, int, int]:
+    """Host RAM on a peer. Still host RAM, for the things that really mean it."""
+    pool = await remote_pool(node)
+    return pool.host.total_bytes, pool.host.available_bytes, pool.host.free_bytes
 
 
 async def status(node: Node) -> NodeStatus:

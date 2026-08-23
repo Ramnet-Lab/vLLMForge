@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 
-from app import docker_ctl, events, safety
+from app import accel, docker_ctl, events, safety
 from app.config import settings
 from app.telemetry import read_meminfo
 
@@ -41,7 +41,7 @@ async def _candidates() -> list[tuple[str, float]]:
     container with no --gpu-memory-utilization collapsed to 0.0, when in fact
     vLLM had applied its own default and it was holding more than any of them.
     """
-    total = read_meminfo().total_bytes or 1
+    total = (await accel.pool_for(None)).total_bytes or 1
     out: list[tuple[str, float, int]] = []
     for row in await docker_ctl.ps(all_containers=False):
         name = str(row.get("Names", ""))
@@ -87,6 +87,29 @@ async def watch() -> None:
                     # re-reserve the memory just freed, so the policy has to go
                     # — but it is the operator's setting, not ours, so record
                     # what it was for whoever restarts the container.
+                    pool = await accel.pool_for(None)
+                    action = settings.memguard_host_action.strip().lower()
+                    if action not in ("kill", "warn"):
+                        # On a discrete GPU this trigger — host MemAvailable —
+                        # says nothing about what the engines are holding, and
+                        # the kernel OOM killer is a working backstop there
+                        # because the desktop is not in the framebuffer. Killing
+                        # a serving engine on that signal is a self-inflicted
+                        # outage.
+                        action = "warn" if pool.kind == accel.DISCRETE else "kill"
+                    if action == "warn":
+                        entry = {
+                            "ts": time.time(), "container": name, "util": util,
+                            "action": "warn", "reason": reason + " (host memory, not "
+                            f"{pool.kind} device memory — nothing killed)",
+                        }
+                        _history.append(entry)
+                        del _history[:-50]
+                        await events.broker.publish(
+                            events.TELEMETRY, {"type": "memguard", "event": entry})
+                        last_kill = time.monotonic()
+                        continue
+
                     previous = await _restart_policy(name)
                     # A pooled engine dies as a unit or not at all. Killing one
                     # rank aborts it on its fixed world size while every other

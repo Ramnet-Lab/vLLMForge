@@ -110,9 +110,15 @@ def _cpu_count() -> int:
         return __import__("os").cpu_count() or 1
 
 
-async def _nvidia_smi(args: list[str], timeout: float = 5.0) -> str:
+async def nvidia_smi_result(args: list[str], timeout: float = 5.0) -> tuple[int, str]:
+    """(returncode, stdout). 127 when there is no nvidia-smi to run.
+
+    Detection turns on the difference between "the driver answered [N/A]" and
+    "there was nothing to ask", and the old helper flattened both to "". Callers
+    that only want the text keep using _nvidia_smi.
+    """
     if not shutil.which("nvidia-smi"):
-        return ""
+        return 127, ""
     try:
         proc = await asyncio.create_subprocess_exec(
             "nvidia-smi", *args,
@@ -121,8 +127,13 @@ async def _nvidia_smi(args: list[str], timeout: float = 5.0) -> str:
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (TimeoutError, OSError):
-        return ""
-    return out.decode(errors="replace")
+        return 124, ""
+    return proc.returncode or 0, out.decode(errors="replace")
+
+
+async def _nvidia_smi(args: list[str], timeout: float = 5.0) -> str:
+    _rc, out = await nvidia_smi_result(args, timeout)
+    return out
 
 
 def _coerce(field_name: str, raw: str):

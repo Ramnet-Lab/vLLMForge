@@ -324,12 +324,21 @@ async def test_a_restart_gets_its_own_memory_back(monkeypatch):
             name=name, exists=True, running=True, status="running",
             command=["vllm", "serve", "org/m", "--gpu-memory-utilization", "0.60"])
 
+    from app import accel, telemetry
+
+    # The pool is the seam now: what the numbers describe is decided once, by
+    # accel, and every consumer reads it from there. Stubbing the old
+    # read_gpu_processes would silently let this machine's real engines in.
     async def processes():
         return []
 
     monkeypatch.setattr(safety.docker_ctl, "ps", one_engine)
     monkeypatch.setattr(safety.docker_ctl, "state", state)
-    monkeypatch.setattr(safety, "read_gpu_processes", processes)
+    monkeypatch.setattr(telemetry, "read_gpu_processes", processes)
+    monkeypatch.setattr(telemetry, "read_meminfo", lambda: telemetry.HostMemory(
+        total_bytes=int(121.69 * GIB), available_bytes=int(100 * GIB),
+        free_bytes=int(100 * GIB)))
+    monkeypatch.setattr(accel, "ACCEL_QUERY", accel.ACCEL_QUERY)
 
     counted = await safety.current_budget()
     assert counted.committed_util == pytest.approx(0.60, abs=0.01)

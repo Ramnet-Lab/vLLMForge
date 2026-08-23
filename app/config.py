@@ -95,6 +95,30 @@ class Settings:
     memguard_enabled: bool = field(
         default_factory=lambda: _env("LLMD_MEMGUARD_ENABLED", "1") not in ("0", "false", "no")
     )
+    # On a discrete GPU the watchdog's trigger — host MemAvailable — has nothing
+    # to do with the memory the engines are holding, and the kernel OOM killer
+    # is a working backstop there because the desktop is not in the framebuffer.
+    # `auto` warns on discrete and kills on unified; `kill` restores the old
+    # behaviour everywhere.
+    memguard_host_action: str = field(
+        default_factory=lambda: _env("LLMD_MEMGUARD_HOST_ACTION", "auto")
+    )
+
+    # --- accelerator memory -----------------------------------------------
+    # Empty means detect; see app/accel.py. Set to unified/discrete/none only to
+    # override a detection that is wrong, and understand which way is safe: a
+    # machine wrongly called discrete can be talked into claiming memory the OS
+    # is living in.
+    accel_mode: str = field(default_factory=lambda: _env("LLMD_ACCEL_MODE", ""))
+    # What to hold back on a machine whose GPU has its own memory. Small,
+    # because the OS is not a tenant of a framebuffer — this is the driver's
+    # own overhead and allocator slack, not room for a desktop.
+    gpu_reserve_gib: float = field(default_factory=lambda: _env_float("LLMD_GPU_RESERVE_GIB", 2.0))
+    # Host RAM held back on a discrete machine, where it is a separate pool that
+    # only --cpu-offload-gb and the loading process draw on.
+    host_reserve_gib: float = field(
+        default_factory=lambda: _env_float("LLMD_HOST_RESERVE_GIB", 8.0)
+    )
 
     # --- cluster fabric ---------------------------------------------------
     # Both default to empty, and empty means "work it out from this machine".

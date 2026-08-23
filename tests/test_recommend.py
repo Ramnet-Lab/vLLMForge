@@ -52,18 +52,17 @@ def test_the_margin_absorbs_drift():
 @pytest.fixture
 def box(monkeypatch):
     """A machine with a known amount of memory free, and a model on its disk."""
-    from app import model_profile, safety, telemetry
+    from app import model_profile, safety
 
     async def budget(node=None, exclude=None):
         return safety.Budget(total_bytes=int(TOTAL), available_bytes=int(100 * GIB),
                              free_bytes=int(100 * GIB), reserve_bytes=int(32 * GIB))
 
+    # One stub, not two. The recommendation reads its totals from the budget,
+    # which reads them from the one probe that decides what they describe — so
+    # there is no longer a second source of memory truth to keep in step.
     monkeypatch.setattr(safety, "current_budget", budget)
     monkeypatch.setattr(recommend.safety, "current_budget", budget)
-    monkeypatch.setattr(telemetry, "read_meminfo", lambda: telemetry.HostMemory(
-        total_bytes=int(TOTAL), available_bytes=int(100 * GIB)))
-    monkeypatch.setattr(recommend.telemetry, "read_meminfo", lambda: telemetry.HostMemory(
-        total_bytes=int(TOTAL), available_bytes=int(100 * GIB)))
 
     def place(profile):
         monkeypatch.setattr(recommend.model_profile, "read", lambda ref: profile)
@@ -460,7 +459,7 @@ async def test_a_utilisation_below_the_weights_is_refused_not_offered(box, monke
     available to serve even a single token' — after reading the whole
     checkpoint. Handing over a number certain to fail that way is worse than
     saying it does not fit."""
-    from app import safety, telemetry
+    from app import safety
 
     place, mp = box
     place(mp.Profile(reference="org/big", found=True, architectures=["LlamaForCausalLM"],
@@ -475,8 +474,6 @@ async def test_a_utilisation_below_the_weights_is_refused_not_offered(box, monke
                              free_bytes=int(56 * GIB), reserve_bytes=int(32 * GIB))
 
     monkeypatch.setattr(recommend.safety, "current_budget", busy)
-    monkeypatch.setattr(recommend.telemetry, "read_meminfo", lambda: telemetry.HostMemory(
-        total_bytes=int(TOTAL), available_bytes=int(56 * GIB)))
 
     rec = (await recommend.build("org/big")).to_dict()
     assert rec["ok"] is False and rec["level"] == "block"
