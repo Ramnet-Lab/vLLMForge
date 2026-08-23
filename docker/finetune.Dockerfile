@@ -23,6 +23,14 @@ ARG UNSLOTH_ZOO_VERSION=
 # --no-deps on unsloth/unsloth_zoo is load-bearing: their pyproject gates
 # bitsandbytes and xformers behind x86_64 platform markers and pins xformers to
 # x86_64-only wheel URLs, so a resolved install produces a broken aarch64 env.
+# NGC's base provides `python`; the official vLLM image ships only `python3`.
+# The dashboard and its workers invoke `python` — the download worker runs
+# `python -u /worker/hf_download.py`, and a missing binary there surfaces as an
+# opaque docker exit 127, "executable file not found in $PATH", with nothing
+# about downloads in it. Rather than teach every caller two names, the image is
+# made to satisfy the one they use. A no-op wherever `python` already exists.
+RUN command -v python >/dev/null || ln -sf "$(command -v python3)" /usr/local/bin/python
+
 RUN pip install --no-cache-dir \
         "peft${PEFT_VERSION:+==${PEFT_VERSION}}" \
         "trl${TRL_VERSION:+==${TRL_VERSION}}" \

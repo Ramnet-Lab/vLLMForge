@@ -22,6 +22,14 @@ ENV PIP_CONSTRAINT=""
 # keeps heretic's dependency set out of the site-packages vLLM runs from.
 # build-ref.json is pip's PEP 610 record of which commit actually got installed,
 # which is the only honest answer to "what is in this image".
+# NGC's base provides `python`; the official vLLM image ships only `python3`.
+# The dashboard and its workers invoke `python` — the download worker runs
+# `python -u /worker/hf_download.py`, and a missing binary there surfaces as an
+# opaque docker exit 127, "executable file not found in $PATH", with nothing
+# about downloads in it. Rather than teach every caller two names, the image is
+# made to satisfy the one they use. A no-op wherever `python` already exists.
+RUN command -v python >/dev/null || ln -sf "$(command -v python3)" /usr/local/bin/python
+
 RUN python -m venv --system-site-packages /opt/heretic \
  && /opt/heretic/bin/pip install --no-cache-dir \
       "git+https://github.com/p-e-w/heretic@${HERETIC_REF}" \

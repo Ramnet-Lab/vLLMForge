@@ -35,6 +35,14 @@ FROM ${BASE_IMAGE}
 # 0.2.4 on aarch64, 0.2.3 on x86_64. The upper bound keeps a future major out,
 # and the import check below is what makes a range safe — a resolution without
 # the symbols fails the build instead of shipping an image that 500s.
+# NGC's base provides `python`; the official vLLM image ships only `python3`.
+# The dashboard and its workers invoke `python` — the download worker runs
+# `python -u /worker/hf_download.py`, and a missing binary there surfaces as an
+# opaque docker exit 127, "executable file not found in $PATH", with nothing
+# about downloads in it. Rather than teach every caller two names, the image is
+# made to satisfy the one they use. A no-op wherever `python` already exists.
+RUN command -v python >/dev/null || ln -sf "$(command -v python3)" /usr/local/bin/python
+
 ARG XGRAMMAR_SPEC=">=0.2.2,<0.3"
 
 # --no-deps is load-bearing, not caution. xgrammar 0.2.4 declares an upper bound
@@ -48,7 +56,7 @@ ARG XGRAMMAR_SPEC=">=0.2.2,<0.3"
 # install is the same dance the Heretic image does.
 ENV PIP_CONSTRAINT=""
 RUN pip install --no-cache-dir --no-deps "xgrammar${XGRAMMAR_SPEC}" \
- && python3 -c "\
+ && python -c "\
 from xgrammar import StructuralTag, normalize_tool_choice, get_model_structural_tag; \
 from vllm.tool_parsers import structural_tag_registry; \
 import importlib.metadata as m; \
