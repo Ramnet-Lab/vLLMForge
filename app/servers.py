@@ -302,8 +302,16 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         # Distributed wiring is appended by rank_argv, not routed through the
         # schema: build_argv drops any value equal to the flag's default, which
         # would silently swallow --node-rank 0.
-        args.pop("pipeline_parallel_size", None)
-        args.pop("distributed_executor_backend", None)
+        #
+        # Every one of these is also a settable flag in the generated form, and
+        # a value typed there would be emitted before the one rank_argv appends.
+        # argparse takes the last, so the launch would still be wired correctly
+        # — but the argv would carry two answers, and everything that reads an
+        # engine's own wiring back out of it (the port allocator most of all)
+        # would have to guess which. They belong to the launcher.
+        for owned in ("pipeline_parallel_size", "distributed_executor_backend",
+                      "nnodes", "node_rank", "master_addr", "master_port", "headless"):
+            args.pop(owned, None)
         if server.get("served_name") and not args.get("served_model_name"):
             args["served_model_name"] = server["served_name"]
 
@@ -392,22 +400,28 @@ async def start(server_id: int, *, force: bool = False) -> dict:
     return {"started": True, "safety": verdict.as_dict(), "container": name, "node": node.name}
 
 
-async def _pool_wirings(server: dict) -> list:
-    prefix = cluster._subnet_prefix()
-    return [await cluster.wiring(nodes.by_name(n), prefix) for n in pool_of(server)]
+async def _rank_locations(server: dict) -> list[tuple[str, str | None]]:
+    """Where this server's containers actually are.
+
+    Found by scanning the registered nodes rather than read off pool_nodes: that
+    row can be edited, or its peer de-registered, while the engine runs, and the
+    containers do not move when it changes. Deriving their location from it
+    would address the wrong machine — stopping nothing, and leaving far ranks
+    holding memory with no row left that names them.
+    """
+    if not is_pooled(server):
+        return [(container_name(server), host_of(server))]
+    return await cluster.find_ranks(container_name(server), nodes.registered())
 
 
 async def stop(server_id: int) -> None:
     server = get_server(server_id)
     if server is None:
         raise KeyError(server_id)
-    if is_pooled(server):
-        # Every rank, on every node. A rank left running holds its full share of
-        # a machine for an engine that no longer exists, and once the row is
-        # gone nothing else knows its name.
-        await cluster.stop_ranks(container_name(server), await _pool_wirings(server))
-    else:
-        await docker_ctl.stop(container_name(server), host=host_of(server))
+    # Every rank, wherever it is. A rank left running holds its full share of a
+    # machine for an engine that no longer exists.
+    for name, host in await _rank_locations(server):
+        await docker_ctl.stop(name, host=host)
     await events.broker.publish(events.SERVERS, {"type": "stopped", "id": server_id})
 
 
@@ -415,11 +429,8 @@ async def remove_container(server_id: int) -> None:
     server = get_server(server_id)
     if server is None:
         return
-    if is_pooled(server):
-        await cluster.stop_ranks(container_name(server), await _pool_wirings(server),
-                                 remove=True)
-    else:
-        await docker_ctl.remove(container_name(server), force=True, host=host_of(server))
+    for name, host in await _rank_locations(server):
+        await docker_ctl.remove(name, force=True, host=host)
 
 
 async def logs(server_id: int, tail: int = 400) -> str:
@@ -537,10 +548,11 @@ async def engine_containers(container: str) -> list[tuple[str, str | None]]:
     owner = engine_of(container)
     if owner is None or not is_pooled(owner):
         return [(container, None)]
-    base = container_name(owner)
-    wirings = await _pool_wirings(owner)
-    return [(cluster.rank_container(base, rank), w.node.docker_host)
-            for rank, w in enumerate(wirings)]
+    found = await _rank_locations(owner)
+    # Local first. The watchdog is starving on THIS machine, and a remote kill
+    # over ssh has no timeout — an unreachable peer would block the only kill
+    # that actually frees the memory it is trying to reclaim.
+    return sorted(found, key=lambda item: item[1] is not None)
 
 
 async def discover_foreign() -> list[dict]:
@@ -673,53 +685,95 @@ async def endpoints() -> list[dict]:
     return out
 
 
+# A pool has to look broken twice running before anything is torn down. One
+# observation cannot tell a dead rank from a peer that did not answer.
+_partial_seen: dict[str, set[str]] = {}
+
+
 async def reap_partial_pools_once() -> list[str]:
-    """Stop the surviving ranks of any engine that has already lost one.
+    """Stop the surviving ranks of any engine that has really lost one.
 
     A pooled engine has a fixed world size: when one rank dies the others do not
     carry on shorthanded, they abort or hang. What they do keep is their memory
     — a full utilisation share of a machine each, held for an engine that can
-    never re-form and that nothing else will name once the operator has moved
-    on. On a box where GPU memory is host memory, that is the difference between
-    a failed launch and a machine with nothing left to give.
+    never re-form. On a box where GPU memory is host memory, that is the
+    difference between a failed launch and a machine with nothing left to give.
 
-    Only partial pools are touched. An engine with every rank down was stopped
-    on purpose, and an engine with every rank up is working.
+    Everything here is about not doing it wrongly, because the cost of a false
+    positive is an outage this caused:
+
+    * It holds LAUNCH_LOCK. start_pooled creates rank containers one at a time,
+      so a pool is legitimately partial for the seconds between them.
+    * It asks each node whether it is answering at all before believing what it
+      says about a container. `docker inspect` over ssh reports a missing
+      container and an unreachable daemon identically, so a peer with a hiccup
+      would otherwise read as a dead rank.
+    * It finds the ranks where they actually are rather than deriving them from
+      pool_nodes, which is editable while the engine runs.
+    * It requires the same pool to look broken on two consecutive passes. A
+      transient is not a loss.
     """
     reaped: list[str] = []
-    for definition in list_servers():
-        if not is_pooled(definition):
-            continue
-        base = container_name(definition)
-        wirings = await _pool_wirings(definition)
-        if len(wirings) != len(pool_of(definition)):
-            continue
-        states = [
-            await docker_ctl.state(cluster.rank_container(base, rank), w.node.docker_host)
-            for rank, w in enumerate(wirings)
-        ]
-        running = [st.running for st in states]
-        if not any(running) or all(running):
-            continue
-        lost = [w.node.name for w, alive in zip(wirings, running, strict=True) if not alive]
-        logging.getLogger("llmd.servers").warning(
-            "%s lost its rank on %s; stopping the %d rank(s) still holding memory",
-            base, ", ".join(lost), sum(running))
-        await cluster.stop_ranks(base, wirings)
-        await events.broker.publish(events.SERVERS, {"type": "stopped", "id": definition["id"]})
-        reaped.append(base)
+    async with LAUNCH_LOCK:
+        registered = nodes.registered()
+        reachable = []
+        for node in registered:
+            try:
+                await docker_ctl.ps(all_containers=False, host=node.docker_host)
+            except Exception:
+                continue
+            reachable.append(node)
+
+        live = {definition["id"]: definition for definition in list_servers()}
+        for definition in live.values():
+            if not is_pooled(definition):
+                continue
+            base = container_name(definition)
+            expected = len(pool_of(definition))
+            if len(reachable) < len(registered):
+                # Somewhere in the cluster is not answering. Whatever is wrong,
+                # this is not the moment to conclude a rank has died.
+                _partial_seen.pop(base, None)
+                continue
+
+            found = await cluster.find_ranks(base, reachable)
+            running = [name for name, host in found
+                       if (await docker_ctl.state(name, host)).running]
+            if not running or len(running) >= expected:
+                _partial_seen.pop(base, None)
+                continue
+
+            missing = {name for name, _host in found} - set(running)
+            before = _partial_seen.get(base)
+            _partial_seen[base] = set(running)
+            if before != set(running):
+                # First sighting of this shape. Look again next pass.
+                continue
+
+            logging.getLogger("llmd.servers").warning(
+                "%s has %d of %d ranks after two passes (%s down); stopping the rest",
+                base, len(running), expected, ", ".join(sorted(missing)) or "one never started")
+            for name, host in found:
+                await docker_ctl.stop(name, host=host)
+            _partial_seen.pop(base, None)
+            await events.broker.publish(events.SERVERS,
+                                        {"type": "stopped", "id": definition["id"]})
+            reaped.append(base)
+
+        for stale in set(_partial_seen) - {container_name(d) for d in live.values()}:
+            _partial_seen.pop(stale, None)
     return reaped
 
 
 async def reap_partial_pools(interval: float = 30.0) -> None:
     while True:
+        await asyncio.sleep(interval)
         try:
             await reap_partial_pools_once()
         except asyncio.CancelledError:
             raise
         except Exception:
             logging.getLogger("llmd.servers").exception("pool reaper failed")
-        await asyncio.sleep(interval)
 
 
 async def autostart() -> None:

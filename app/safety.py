@@ -182,8 +182,16 @@ class Budget:
         The util sum misses anything that is not a vLLM engine — a fine-tuning
         job, a Heretic run, even a browser with a few GiB of GPU surfaces — so
         the measured per-process figure is used whenever it is larger.
+
+        The container being replaced comes off the measured side only. The
+        committed side never had it: current_budget drops it before it reaches
+        the tenant list. Taking it off both was invisible while only the local
+        node had tenants — measured is read from nvidia-smi and is 0 for a peer,
+        so the two figures agreed — but a pooled engine puts a real tenant on
+        every node it spans, and there the double subtraction cancelled a peer's
+        genuine occupancy and reported a full machine as empty.
         """
-        return max(0, max(self.committed_bytes, self.measured_gpu_bytes) - self.excluded_bytes)
+        return max(0, max(self.committed_bytes, self.measured_gpu_bytes - self.excluded_bytes))
 
     @property
     def occupied_util(self) -> float:

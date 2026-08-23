@@ -314,12 +314,27 @@ def rank_argv(serve_argv: list[str], rank: int, nnodes: int, master: NodeWiring,
 
 
 def parse_master_port(command: list[str] | None) -> int | None:
-    """The rendezvous port a running container is using, read off its argv."""
-    raw = safety.flag_value(command, MASTER_PORT_FLAG)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+    """The rendezvous port a running container is actually using.
+
+    The LAST occurrence, because argparse takes the last and so must anything
+    reading the value back. --master-port is a settable flag in the generated
+    form, so a container's argv can carry the operator's value followed by the
+    one rank_argv appended; believing the first would hand the allocator a port
+    nobody is on and mark the live one free for the next engine to collide with.
+    """
+    argv = safety.argv_of(command)
+    found = None
+    for index, token in enumerate(argv):
+        match = MASTER_PORT_FLAG.fullmatch(token)
+        if not match:
+            continue
+        raw = match.group(1) if match.group(1) is not None else (
+            argv[index + 1] if index + 1 < len(argv) else None)
+        try:
+            found = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return found
 
 
 async def used_master_ports(targets: list[nodes.Node], exclude: set[str] | None = None
@@ -367,6 +382,44 @@ async def allocate_master_port(targets: list[nodes.Node], exclude: set[str] | No
     raise RuntimeError(
         f"no free rendezvous port in {MASTER_PORT_RANGE.start}-{MASTER_PORT_RANGE.stop - 1}; "
         f"{len(taken)} pooled engines are already running")
+
+
+RANK_SUFFIX = re.compile(r"-r(\d+)$")
+
+
+def is_rank_of(name: str, base: str) -> bool:
+    """Whether a container is rank 0 or a far rank of the engine called `base`."""
+    if name == base:
+        return True
+    return name.startswith(base) and bool(RANK_SUFFIX.fullmatch(name[len(base):]))
+
+
+async def find_ranks(base: str, targets: list[nodes.Node]) -> list[tuple[str, str | None]]:
+    """Where this engine's containers ACTUALLY are, as (name, docker host).
+
+    Deliberately not derived from the server's pool_nodes: that row is editable
+    while the engine runs, and the ranks do not move when it changes. Reordering
+    the pool, or dropping a node from it, re-points every name at the wrong
+    machine — so stopping the engine would stop nothing, and its far ranks would
+    be left holding memory with no row left that names them.
+
+    Stopped containers count. A rank that exited still owns its name, and the
+    next launch has to remove it before it can reuse it.
+    """
+    found: list[tuple[str, str | None]] = []
+    for node in targets:
+        try:
+            rows = await docker_ctl.ps(all_containers=True, host=node.docker_host)
+        except Exception:
+            continue
+        for row in rows:
+            name = str(row.get("Names", ""))
+            if name and is_rank_of(name, base):
+                found.append((name, node.docker_host))
+    # Rank order, so a caller that acts locally first can say so.
+    found.sort(key=lambda item: int(RANK_SUFFIX.search(item[0]).group(1))
+               if RANK_SUFFIX.search(item[0]) else 0)
+    return found
 
 
 async def stop_ranks(base: str, wirings: list[NodeWiring], *, remove: bool = False) -> None:

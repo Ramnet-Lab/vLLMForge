@@ -340,3 +340,30 @@ async def test_a_restart_gets_its_own_memory_back(monkeypatch):
     assert freed.excluded_bytes > 0
     assert freed.occupied_bytes == 0
     assert freed.free_util > counted.free_util
+
+
+def test_the_container_being_replaced_comes_off_the_measured_side_only():
+    """committed_bytes never had it — current_budget drops it before it reaches
+    the tenant list — so subtracting it from both cancelled a peer's genuine
+    occupancy. It was invisible while only the local node had tenants, because
+    measured comes from nvidia-smi and reads 0 for a peer, and the two figures
+    agreed at zero. A pooled engine puts a real tenant on every node it spans,
+    and there a full machine reported itself empty."""
+    peer = safety.Budget(total_bytes=100 * GIB, available_bytes=40 * GIB,
+                         reserve_bytes=10 * GIB)
+    # 60 GiB of other engines still running there, 24 GiB of them ours.
+    peer.tenants.append(safety.Tenant(name="someone-else", util=0.36, managed=False,
+                                      bytes_committed=36 * GIB))
+    peer.excluded_bytes = 24 * GIB
+    assert peer.measured_gpu_bytes == 0, "nvidia-smi is never read for a peer"
+    assert peer.occupied_bytes == 36 * GIB, "the other engine is still there"
+
+    # Locally, measured DOES include the container being replaced, so it comes
+    # off there and the larger of the two still wins.
+    here = safety.Budget(total_bytes=100 * GIB, available_bytes=40 * GIB,
+                         reserve_bytes=10 * GIB)
+    here.tenants.append(safety.Tenant(name="someone-else", util=0.36, managed=False,
+                                      bytes_committed=36 * GIB))
+    here.measured_gpu_bytes = 60 * GIB
+    here.excluded_bytes = 24 * GIB
+    assert here.occupied_bytes == 36 * GIB
