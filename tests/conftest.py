@@ -28,3 +28,19 @@ def _database():
 
     db.init_db()
     yield
+
+
+@pytest.fixture
+def served_dir(tmp_path):
+    """A directory an engine container could actually reach.
+
+    `app.engines.llamacpp.host_path` opens only what is under the two mounts
+    every server container gets — the model cache and the output directory — so
+    a .gguf fixture written to a bare tmp_path is not a model any of the code
+    under test would look at.
+    """
+    from app.config import settings
+
+    root = settings.output_dir / f"fixtures-{tmp_path.name}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root

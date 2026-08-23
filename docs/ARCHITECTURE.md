@@ -53,11 +53,13 @@ Bottom to top; each layer only calls downwards.
 | `app/telemetry.py` | `/proc/meminfo`, `/proc/loadavg`, `nvidia-smi`. Knows which fields a unified part reports as `[N/A]` and omits them rather than showing zeros. |
 | `app/accel.py` | which memory `--gpu-memory-utilization` is a fraction of on a given machine: host RAM on a unified part, the framebuffer on a discrete GPU. Detects it per node and fails toward unified, because guessing discrete on a unified box is what freezes it. |
 | `app/events.py` | in-process pub/sub with bounded queues, one topic per stream. Slow browser tabs drop old frames instead of growing the producer. |
-| `app/safety.py` | the launch budget. Surveys every running vLLM container — managed or not — and returns a `Verdict` the API and UI both render. |
-| `app/memguard.py` | the runtime watchdog. Polls MemAvailable and kills the largest vLLM engine below the threshold — the whole engine, across nodes, since killing one rank of a pooled one aborts it while the rest keep their memory. Warns instead of killing where host pressure is not the engines' doing. |
+| `app/safety.py` | the launch budget. Surveys every running engine container — either engine, managed or not — and returns a `Verdict` the API and UI both render. Denominated in bytes throughout; a utilisation fraction is one engine's way of stating them. |
+| `app/memguard.py` | the runtime watchdog. Polls MemAvailable and kills the largest resident engine below the threshold — the whole engine, across nodes, since killing one rank of a pooled one aborts it while the rest keep their memory. Its invariant is *kill only what we understand well enough to know what dies with it*, not *kill only vLLM*. Warns instead of killing where host pressure is not the engines' doing. |
 | `app/nodes.py`, `app/cluster.py`, `app/sync.py` | the cluster: registering peers reached over `docker -H ssh://…`, detecting each node's fabric interface and memory, copying a model to a node that lacks it, and building the per-rank commands for one engine split across machines. |
 | `app/jobs.py` | one job = one detached container + a log file + a progress dict. Per-kind line parsers, reattach on restart, cancel. |
-| `app/vllm_spec.py`, `app/sampling_spec.py` | turn generated JSON schemas into a form model and back into argv or a request body. |
+| `app/engines/` | the engine seam. One object per inference engine answering the argv, the image, the container kind, the environment, the metric names, how a container is recognised and what it is estimated to cost. `engines/vllm.py` is a pure adapter over `vllm_spec` and functions moved verbatim out of `safety`, so the first engine's behaviour is unchanged by the second's existence. |
+| `app/vllm_spec.py`, `app/llamacpp_spec.py`, `app/sampling_spec.py` | turn generated JSON schemas into a form model and back into argv or a request body. The two engine specs share a document shape and therefore one renderer. |
+| `app/gguf.py` | a bounded reader for a .gguf's own metadata header. A GGUF has no config.json — its architecture, layer count and head geometry are inside the weights file — and llama.cpp's footprint is arithmetic over exactly those. |
 | `app/servers.py`, `app/hf.py`, `app/finetune.py`, `app/heretic.py` | the four features. Each owns its configuration model, its job assembly and its log parser. |
 | `app/routers/*.py` | thin HTTP over the above: validate, call, shape the response. No business logic lives here. |
 | `app/workers/*.py` | programs that run *inside* containers — the downloader and the fine-tuning trainer. Mounted read-only at `/worker`; they share no imports with the host process. |
@@ -124,8 +126,8 @@ guessed an id.
 
 ## Generated schemas
 
-Two files under `app/data/` are checked in but generated, and they are why the
-UI does not hard-code any vLLM flag or sampling parameter.
+Three files under `app/data/` are checked in but generated, and they are why the
+UI does not hard-code any engine flag or sampling parameter.
 
 `vllm_args.json` comes from `tools/gen_vllm_schema.py`, which runs the
 configured vLLM image twice: once to introspect the argparse parser for
@@ -133,6 +135,16 @@ structure (dest, type, default, choices, group) and once to scrape
 `vllm serve --help=all` for prose, because vLLM builds most of its help text
 lazily and the parser objects carry empty help strings. The Serve tab renders
 its form from the result, so the form always matches the binary that will run.
+
+`llamacpp_args.json` comes from `tools/gen_llamacpp_schema.py` and is the same
+document shape, so one renderer serves both forms. It is a single scrape rather
+than two passes: llama.cpp has no argparse to introspect — its flag table is
+hand-rolled C++ — but its `--help` is printed by one formatter with fixed column
+constants, which carries the flags, metavar, prose, default and environment
+variable together. It needs no GPU, unlike the vLLM generator. Two things it
+cannot scrape and infers by name: which `--no-` spelling negates which flag
+(llama.cpp spells its negations rather than deriving them, so a guess is an
+argument the binary rejects) and the undocumented `LLAMA_ARG_NO_*` overrides.
 
 `sampling_params.json` comes from `tools/gen_sampling_schema.py`, which reads a
 live server's `/openapi.json`. At runtime the Playground re-fetches this per
@@ -143,14 +155,27 @@ the old names would look like it worked while generating unconstrained text.
 
 ## Containers the dashboard did not start
 
-`servers.discover_foreign()` lists every running container whose command looks
-like a `vllm serve` and which the dashboard does not manage. They appear on the
-Overview and Serve pages beside managed servers, they can be stopped from the
-UI, their endpoints are offered to the Playground, and — most importantly —
-their utilisation fractions count against the memory budget. The alternative is
-a memory picture that is true about this app and false about the machine.
+`servers.discover_foreign()` lists every running container that `engines.recognise()`
+identifies as an engine and which the dashboard does not manage. They appear on
+the Overview and Serve pages beside managed servers, they can be stopped from the
+UI, their endpoints are offered to the Playground, and — most importantly — what
+they hold counts against the memory budget. The alternative is a memory picture
+that is true about this app and false about the machine.
 
-Managed containers are named `<LLMD_CONTAINER_PREFIX><kind>-<id>` and always get
+Recognition asks `Config.Cmd` first and only then `Config.Entrypoint + Cmd`. The
+fallback exists because an image is free to put the program in its ENTRYPOINT and
+leave bare flags in Cmd — the upstream llama.cpp server images do — so a container
+whose argv starts with `-m` is otherwise recognisable as nothing at all. Asking
+Cmd first means the fallback can only add a container to the picture, never move
+one that was already in it, and `ContainerState.command` keeps the meaning every
+other parser in the codebase depends on.
+
+Managed containers are named `<LLMD_CONTAINER_PREFIX><kind>-<id>`, where the kind
+is the engine's name — so an existing vLLM row keeps `llmd-vllm-<id>` and a
+llama.cpp one is `llmd-llamacpp-<id>`. The name is recomputed from the row rather
+than stored, which is why changing a saved server's engine while its container
+runs is refused: the rename would leave a live process nothing could address.
+Managed containers always get
 restart policy `no`. On a unified-memory host a crash-looping engine that
 re-reserves 60 GiB on every restart is worse than a stopped one, and the
 watchdog needs a kill to stay dead.

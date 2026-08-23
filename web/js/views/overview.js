@@ -139,16 +139,22 @@ function localCommitment(budget) {
     h('div', { class: 'row wrap' },
       h('span', { class: 'faint small' },
         `Committed ${utilText(budget.committed_util)} of a ${utilText(budget.max_util)} ceiling · `
-        + `largest new --gpu-memory-utilization that fits is ${utilText(budget.free_util)}`)),
+        + `${bytes(budget.free_bytes_to_commit ?? 0)} free for a new engine`
+        + (budget.free_util ? `, or --gpu-memory-utilization ${utilText(budget.free_util)}` : ''))),
     tenants.length
       ? h('div', { class: 'table-wrap' },
           h('table', null,
             h('thead', null, h('tr', null,
-              h('th', null, 'Engine'), h('th', { class: 'num' }, 'util'),
+              h('th', null, 'Container'), h('th', null, 'engine'),
+              h('th', { class: 'num' }, 'util'),
               h('th', { class: 'num' }, 'reserves'), h('th', null, ''))),
             h('tbody', null, tenants.map((t) =>
               h('tr', null,
                 h('td', { class: 'mono' }, t.name),
+                h('td', null, badge('plain', t.engine === 'llamacpp' ? 'llama.cpp' : 'vLLM')),
+                // utilText already renders — for a non-finite value, which is
+                // exactly what an engine with no fraction reports. The bytes
+                // beside it are the figure that is true for both.
                 h('td', { class: 'num' }, utilText(t.util)),
                 h('td', { class: 'num' }, bytes(t.bytes_committed)),
                 h('td', { class: 'faint small' },
@@ -520,7 +526,7 @@ function serversSection(payload) {
   // One machine needs no column telling you which machine it is.
   const clustered = (payload.nodes || []).length > 1;
   if (!managed.length && !foreign.length) {
-    return empty('Nothing is serving', 'No managed or hand-launched vLLM container is running.',
+    return empty('Nothing is serving', 'No managed or hand-launched engine container is running.',
       h('button', { class: 'btn-primary', onClick: () => ctxRef.navigate('serve') },
         'Define a server'));
   }
@@ -535,7 +541,9 @@ function serversSection(payload) {
       ? h('td', null, badge(entry.node_local === false ? 'info' : 'plain',
           entry.node || payload.local || 'local'))
       : null,
-    h('td', null, badge(entry.status, entry.status)),
+    h('td', null, badge(entry.status, entry.status),
+      entry.engine && entry.engine !== 'vllm'
+        ? badge('plain', entry.engine_label || entry.engine) : null),
     h('td', null, h('span', { class: 'truncate ov-model' }, entry.model || '—')),
     h('td', { class: 'num' }, entry.port || '—'),
     h('td', { class: 'num' }, utilText(entry.util)),
@@ -627,8 +635,11 @@ function environmentSection(info, imagePayload) {
     ['Host', `${info.hostname} · ${info.platform}`],
     ['Python', info.python],
     ['Docker', info.docker || 'unavailable'],
-    ['vLLM', `${info.vllm_version} · ${info.vllm_flags} flags`],
-    ['Image', info.vllm_image],
+    ...(info.engines || [{ label: 'vLLM', version: info.vllm_version,
+      flags: info.vllm_flags, image: info.vllm_image }]).map((engine) => [
+      engine.label,
+      `${engine.version} · ${engine.flags} flags · ${engine.image}`,
+    ]),
     ['HF cache', info.hf_cache],
     ['Outputs', info.output_dir],
     ['Datasets', info.dataset_dir],
@@ -648,7 +659,8 @@ function environmentSection(info, imagePayload) {
         guard.enabled ? `watchdog armed at ${guard.threshold_mib} MiB` : 'watchdog off')),
     required.length
       ? h('div', { class: 'stack' }, required.map((image) => h('div', { class: 'row' },
-          badge(image.present ? 'succeeded' : 'failed', image.role),
+          badge(image.present ? 'succeeded' : (image.essential === false ? 'absent' : 'failed'),
+            image.role),
           h('span', { class: 'truncate ov-model' }, image.tag),
           h('span', { class: 'spacer' }),
           image.present

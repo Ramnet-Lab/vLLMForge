@@ -20,41 +20,54 @@ Two independent checks run before any launch:
 Containers the dashboard did not start still count: their utils are parsed out
 of their recorded command line, so a hand-launched `vllm serve` is included in
 the budget exactly like a managed one.
+
+**Two engines, one pool.** A vLLM server declares a fraction; a llama.cpp server
+declares nothing and is priced from its own weights file. Both spend the same
+memory, so both are tenants of the same budget — but the arithmetic below was
+already denominated in bytes (`Tenant.bytes_committed` sums, not utils), and
+that is what makes a second engine a routing change rather than a rewrite.
+
+What is engine-specific — recognising a container, pricing it, and the words a
+verdict is phrased in — lives in `app/engines/`. Three things about that seam
+are deliberate and load-bearing:
+
+  * `is_vllm_command` is NOT widened. It is vLLM's own predicate and stays so;
+    `engines.recognise()` asks the general question. A container recognised
+    before this file gained a second engine cannot change what it is.
+  * Recognition and pricing are members of one object, because
+    `vllm_spec.footprint_bytes` charges its default fraction — over 100 GiB
+    here — to any argv with no utilisation flag, which is every llama.cpp argv.
+  * `check_launch` branches to a bytes-native twin at its first line and is
+    otherwise untouched, so every vLLM verdict is the string it has always been.
 """
 
 from __future__ import annotations
 
 import math
 import re
-import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from app import docker_ctl, vllm_spec
+from app import docker_ctl, engines, vllm_spec
 from app.config import settings
+from app.engines.vllm import KV_BYTES_FLAG, OFFLOAD_FLAG, UTIL_FLAG
 
 GIB = 1024 ** 3
 
-UTIL_FLAG = re.compile(r"--gpu[-_]memory[-_]utilization(?:=(\S+))?")
-KV_BYTES_FLAG = re.compile(r"--kv[-_]cache[-_]memory(?:[-_]bytes)?(?:=(\S+))?$")
-OFFLOAD_FLAG = re.compile(r"--cpu[-_]offload[-_]gb(?:=(\S+))?$")
+_VLLM = engines.get("vllm")
+
+__all_flags__ = (UTIL_FLAG, KV_BYTES_FLAG, OFFLOAD_FLAG)
 
 
 def flag_value(command: list[str] | None, pattern: re.Pattern[str]) -> str | None:
-    """The value of a flag in a container's argv, whether joined by = or spaced."""
-    command = argv_of(command)
-    if not command:
-        return None
-    for index, token in enumerate(command):
-        match = pattern.fullmatch(token)
-        if not match:
-            continue
-        if match.group(1) is not None:
-            return match.group(1)
-        if index + 1 < len(command):
-            return command[index + 1]
-        return None
-    return None
+    """The value of a flag in a container's argv, whether joined by = or spaced.
+
+    Kept here, and kept unwrapping the shell the vLLM way, because that is what
+    its callers have always meant. The engine-neutral version — which takes an
+    argv that is already tokens — is `engines.flag_value`, and each engine
+    unwraps with its own sentinel before calling it.
+    """
+    return engines.flag_value(argv_of(command), pattern)
 
 
 # How close to MemAvailable a request may sit before it is worth a warning.
@@ -64,89 +77,86 @@ DRIFT_MARGIN = 0.03
 
 def default_util() -> float:
     """vLLM's own default, read from the image's schema so it tracks upgrades."""
-    arg = vllm_spec.by_dest().get("gpu_memory_utilization") or {}
-    try:
-        return float(arg.get("default"))
-    except (TypeError, ValueError):
-        return 0.92
+    return _VLLM.implicit_util()
 
 
 def parse_util(command: list[str] | None) -> float | None:
-    """Pull --gpu-memory-utilization out of a container's argv."""
-    try:
-        return float(flag_value(command, UTIL_FLAG))
-    except (TypeError, ValueError):
-        return None
+    """Pull --gpu-memory-utilization out of a container's argv.
+
+    Deliberately vLLM's, and only vLLM's. A llama-server argv has no such flag,
+    and routing one through here returns None — which `vllm_spec.footprint_bytes`
+    then prices at the default fraction, over 100 GiB on this box. The general
+    question is `engines.recognise(...).declared_util(...)`.
+    """
+    return _VLLM.parse_util(command)
 
 
 def command_params(command: list[str] | None) -> dict[str, Any]:
-    """The memory-relevant flags of a running container, shaped like stored args.
+    """The memory-relevant flags of a running vLLM container, shaped like stored
+    args, so a hand-launched container is accounted exactly like a managed one."""
+    return _VLLM.command_params(command)
 
-    Reading them back out of the argv means a hand-launched container is
-    accounted exactly the way a managed one is.
+
+def footprint(params: dict[str, Any], total_bytes: int, *, engine: str = "vllm") -> int:
+    """A floor on the memory these params will take, priced by their own engine.
+
+    The chokepoint: every byte figure in this module and in the watchdog flows
+    through here. `engine` is a keyword with vLLM's default so every existing
+    call site keeps its exact value, and it is what stops a llama.cpp params dict
+    reaching vLLM's pricer — which would charge it the default fraction and
+    refuse every launch on the machine afterwards.
+
+    Synchronous on purpose: the watchdog calls it once per container per tick.
+    An engine whose price needs a file read does that read in `Engine.resolve()`,
+    which the async callers await before they get here.
     """
-    params: dict[str, Any] = {}
-    util = parse_util(command)
-    if util is not None:
-        params["gpu_memory_utilization"] = util
-    kv = flag_value(command, KV_BYTES_FLAG)
-    if kv is not None:
-        params["kv_cache_memory_bytes"] = kv
-    offload = flag_value(command, OFFLOAD_FLAG)
-    if offload is not None:
-        params["cpu_offload_gb"] = offload
-    return params
-
-
-def footprint(params: dict[str, Any], total_bytes: int) -> int:
-    return vllm_spec.footprint_bytes(params, total_bytes, default_util=default_util())
-
-
-# `vllm serve` as a word, anywhere in a string that may be a whole shell line.
-_VLLM_SERVE = re.compile(r"(?:^|[\s;&|])vllm\s+serve(?:\s|$)")
+    return engines.get(engine).footprint_bytes(params, total_bytes)
 
 
 def argv_of(command: list[str] | None) -> list[str]:
-    """A container's command as tokens, whether or not a shell is in the way.
+    """A vLLM container's command as tokens, unwrapping a shell if there is one.
 
-    A pooled engine is launched as `bash -lc "ray start ... && exec vllm serve
-    ..."` — one element, because the Ray head and the engine have to share a
-    container. Treating that as opaque made the dashboard's own pooled servers
-    weigh nothing in the budget, so a second launch could be admitted on top of
-    memory that was already spoken for.
+    Named for what its callers want: `cluster.parse_master_port` reads a vLLM
+    engine's own wiring back out of its argv, which is a vLLM question. Each
+    engine has its own unwrapper because each has its own sentinel.
     """
-    if not command:
-        return []
-    for token in command:
-        if not _VLLM_SERVE.search(token):
-            continue
-        if len(token.split()) == 1:
-            break
-        try:
-            parts = shlex.split(token)
-        except ValueError:
-            continue
-        for index, part in enumerate(parts):
-            if part.endswith("vllm") and parts[index + 1:index + 2] == ["serve"]:
-                return parts[index:]
-    return list(command)
+    return _VLLM.argv_of(command)
 
 
 def is_vllm_command(command: list[str] | None) -> bool:
-    argv = argv_of(command)
-    return bool(argv) and any(token == "serve" for token in argv) and any(
-        "vllm" in token for token in argv[:2]
-    )
+    """Whether this argv is a vLLM engine.
+
+    NOT widened to mean "is an engine", and that is the point. Widening it would
+    admit a llama.cpp container to every caller at once — the budget survey, the
+    watchdog's kill list, foreign discovery — while `footprint` still priced it
+    with vLLM's arithmetic. `engines.recognise()` is the general question, and
+    it routes recognition and pricing together.
+    """
+    return _VLLM.matches(command)
 
 
 @dataclass
 class Tenant:
     name: str
-    util: float
+    util: float | None
+    """The fraction the operator declared, for an engine that has such a thing.
+    None for llama.cpp, and deliberately not a fraction derived from the bytes:
+    a Util column carrying both would look summable, and it is not."""
     managed: bool
     bytes_committed: int = 0
-    implicit: bool = False        # util came from vLLM's default, not the command line
+    implicit: bool = False        # util came from the engine's default, not the argv
     note: str = ""
+    engine: str = "vllm"
+    label: str = ""
+    """How this tenant reads in a verdict message: 'llmd-vllm-3=0.52' for an
+    engine that declares a fraction, 'llmd-llamacpp-3=40.1 GiB' for one that does
+    not. Derived when it is left empty, so a Tenant built the way it always was
+    — four positional-ish fields and no label — still names itself correctly."""
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            self.label = _tenant_label(self.name, self.util, self.implicit,
+                                       self.bytes_committed)
 
 
 @dataclass
@@ -213,6 +223,26 @@ class Budget:
         return self.occupied_bytes / self.total_bytes if self.total_bytes else 0.0
 
     @property
+    def max_bytes(self) -> int:
+        """Largest total commitment that still leaves the hard reserve.
+
+        The byte twin of `max_util`, added rather than substituted. It would be
+        tidier to define one in terms of the other, and it would also be a
+        silent risk: `1 - r/t` and `(t - r)/t` can differ by one unit in the last
+        place, `free_util` is floored to two decimals and handed to the operator
+        as a value to retype, and a floor at an exact boundary is exactly where a
+        one-ULP difference changes the answer. Two independent expressions of the
+        same quantity cost nothing and cannot regress each other.
+        """
+        return max(0, self.total_bytes - self.reserve_bytes)
+
+    @property
+    def free_bytes_to_commit(self) -> int:
+        """What a new engine may take. The byte twin of `free_util`, and the only
+        answer available to an engine that declares no fraction."""
+        return max(0, self.max_bytes - self.occupied_bytes)
+
+    @property
     def max_util(self) -> float:
         """Largest total utilisation that still leaves the hard reserve."""
         if not self.total_bytes:
@@ -245,6 +275,12 @@ class Budget:
             "warn_util": round(self.warn_util, 4),
             "free_util": round(self.free_util, 4),
             "default_util": default_util(),
+            # Byte twins of max_util/free_util, for an engine that has no
+            # fraction to express them as. Additive: every key above keeps its
+            # meaning and its value, so a vLLM-only box reports exactly what it
+            # reported before there was a second engine.
+            "max_bytes": self.max_bytes,
+            "free_bytes_to_commit": self.free_bytes_to_commit,
             # Which memory every figure above describes, so a reader never has
             # to assume it is host RAM. Additive: no key above changed.
             "pool_kind": getattr(self.pool, "kind", "unified"),
@@ -261,6 +297,8 @@ class Budget:
                     "bytes_committed": t.bytes_committed,
                     "implicit": t.implicit,
                     "note": t.note,
+                    "engine": t.engine,
+                    "label": t.label,
                 }
                 for t in self.tenants
             ],
@@ -276,6 +314,11 @@ class Verdict:
     requested_util: float = 0.0
     requested_bytes: int = 0
     suggested_util: float | None = None
+    suggested_bytes: int | None = None
+    """What an engine with no utilisation fraction is told it may take. Left None
+    on the vLLM path, where `suggested_util` is the actionable answer and the
+    form labels it as the flag to type."""
+    engine: str = "vllm"
 
     def as_dict(self) -> dict:
         return {
@@ -287,6 +330,8 @@ class Verdict:
             "suggested_util": (
                 round(self.suggested_util, 3) if self.suggested_util is not None else None
             ),
+            "suggested_bytes": self.suggested_bytes,
+            "engine": self.engine,
             "budget": self.budget,
         }
 
@@ -326,50 +371,84 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
     if host is None:
         budget.measured_gpu_bytes = pool.measured_bytes
 
-    fallback = default_util()
     for row in await docker_ctl.ps(all_containers=False, host=host):
         name = str(row.get("Names", ""))
         if not name:
             continue
         info = await docker_ctl.state(name, host)
-        if not is_vllm_command(info.command):
-            continue
+        # The argv comes back with the engine: a container whose binary lives in
+        # its image's ENTRYPOINT is recognised from entrypoint+cmd, and reading
+        # its flags from `command` alone would find none of them and price a
+        # resident engine at nothing.
+        engine, argv = engines.identify(info)
 
+        # The exclusion is tested BEFORE the engine gate, and the order is a fix
+        # rather than a tidy-up. It used to sit below, so a container the gate
+        # did not recognise could never set excluded_bytes — which meant a large
+        # engine of any kind the gate did not know was guaranteed to block its
+        # own restart, charged through measured_gpu_bytes for memory it was about
+        # to release. For a vLLM container both orders reach the same branch, and
+        # for an unrecognised one both leave excluded_bytes at zero.
         if exclude and name == exclude:
             # The container this survey is about to replace. It is not a tenant,
             # and what it holds is memory the replacement can have back — so it
             # comes off the measured total too, which otherwise counts the very
             # engine being restarted against its own restart.
-            budget.excluded_bytes = footprint(command_params(info.command), pool.total_bytes)
+            if engine is not None:
+                params = await engine.resolve(engine.command_params(argv))
+                credit = engine.footprint_bytes(params, pool.total_bytes)
+                # Capped by what the machine is actually measured to be holding.
+                # `excluded_bytes` is subtracted from occupancy AND added to
+                # available memory, so an estimate biased high — which llama.cpp's
+                # deliberately is — would flip its own safe direction on a
+                # restart and credit back more than the container can release.
+                if engine.declared_util(params) is None and pool.measured_bytes:
+                    credit = min(credit, pool.measured_bytes)
+                budget.excluded_bytes = credit
             continue
 
-        params = command_params(info.command)
-        util = params.get("gpu_memory_utilization")
-        implicit = util is None
-        notes = []
+        if engine is None:
+            continue
+
+        params = await engine.resolve(engine.command_params(argv))
+        util = engine.declared_util(params)
+        # "Implicit" means the engine has a default fraction and is applying it
+        # because nothing was declared — a vLLM serve with no
+        # --gpu-memory-utilization is not free, it takes over 100 GiB here. An
+        # engine with no such concept is not implicit, it is simply unpriced by
+        # fraction, and saying "(implied)" beside an empty column would be noise.
+        implicit = util is None and engine.implicit_util() is not None
         if implicit:
-            # A serve command with no --gpu-memory-utilization is not free: vLLM
-            # applies its own default, which on this host is over 100 GiB.
-            util = fallback
-            notes.append(
-                f"no --gpu-memory-utilization set, so vLLM uses its default of {fallback:g}"
-            )
-        if "kv_cache_memory_bytes" in params:
-            notes.append("--kv-cache-memory overrides the utilisation fraction")
-        if "cpu_offload_gb" in params:
-            notes.append("--cpu-offload-gb lands in the same unified pool")
+            util = engine.implicit_util()
+        committed = engine.footprint_bytes(params, budget.total_bytes)
 
         budget.tenants.append(
             Tenant(
                 name=name,
                 util=util,
                 managed=name.startswith(settings.container_prefix),
-                bytes_committed=footprint(params, budget.total_bytes),
+                bytes_committed=committed,
                 implicit=implicit,
-                note="; ".join(notes),
+                note="; ".join(engine.notes(params, implicit=implicit)),
+                engine=engine.name,
+                label=_tenant_label(name, util, implicit, committed),
             )
         )
     return budget
+
+
+def _tenant_label(name: str, util: float | None, implicit: bool, committed: int) -> str:
+    """How one resident engine reads inside a verdict message.
+
+    For anything declaring a fraction this is character-for-character the string
+    the message used to build inline, so a vLLM-only box's verdicts are the ones
+    it has always produced. An engine without a fraction reports what it is
+    actually holding, and an engine whose weights could not be read says so
+    rather than reporting a confident nothing.
+    """
+    if util is not None:
+        return f"{name}={util:g}{' (implied)' if implicit else ''}"
+    return f"{name}={_gib(committed)}" if committed else f"{name}=size unknown"
 
 
 async def check_launch(
@@ -378,12 +457,29 @@ async def check_launch(
     replacing: str | None = None,
     params: dict[str, Any] | None = None,
     node: Any = None,
+    engine: str = "vllm",
 ) -> Verdict:
     """Decide whether a launch is safe right now.
 
     Pass `params` — the whole stored argument dict — wherever it is available:
     the utilisation fraction alone does not describe what a config will take.
+
+    `engine` is a keyword with vLLM's default, and everything below this first
+    branch is the code it has always been. That is on purpose. The four verdict
+    messages, the preface they are assembled from and the two-decimal floor on
+    the suggestion are the observable contract — tests assert on their
+    substrings and the form renders `suggested_util` as the flag to type — so
+    the bytes-native path is a separate function that shares the *policy* rather
+    than a template that has to be proved equal to these strings.
+
+    It also has to be a branch and not a fall-through: `footprint` below would
+    price a llama.cpp params dict with vLLM's arithmetic and charge it the
+    default fraction, which on this box is over 100 GiB.
     """
+    if engine != "vllm":
+        return await _check_launch_bytes(
+            engines.get(engine), params or {}, replacing=replacing, node=node)
+
     budget = await current_budget(exclude=replacing, node=node)
     payload = budget.as_dict()
     fallback = default_util()
@@ -419,12 +515,9 @@ async def check_launch(
     safe_now = math.floor(max(0.0, budget.free_util) * 100) / 100
     suggested = safe_now or None
 
-    if budget.tenants:
-        tenants = ", ".join(
-            f"{t.name}={t.util:g}{' (implied)' if t.implicit else ''}" for t in budget.tenants
-        )
-    else:
-        tenants = "none"
+    # `label` is built at construction and, for a tenant declaring a fraction,
+    # is exactly the string this line used to assemble inline.
+    tenants = ", ".join(t.label for t in budget.tenants) if budget.tenants else "none"
 
     if projected_bytes > budget.total_bytes - budget.reserve_bytes:
         return Verdict(
@@ -513,3 +606,101 @@ async def check_launch(
         requested_util=util,
         requested_bytes=requested_bytes,
     )
+
+
+async def _check_launch_bytes(
+    engine: Any,
+    params: dict[str, Any],
+    *,
+    replacing: str | None = None,
+    node: Any = None,
+) -> Verdict:
+    """The same decision for an engine that states its appetite in bytes.
+
+    The *policy* is shared with `check_launch` above and must stay so: the same
+    four `Budget` properties, read in the same order, against the same
+    thresholds. What differs is only how the request was arrived at and how the
+    answer is phrased — an operator running llama.cpp is going to act on a layer
+    count and a context length, and being told the largest safe
+    `--gpu-memory-utilization` would be advice about a flag their engine has
+    never heard of.
+
+    One asymmetry is worth stating because it inverts a comment above. The
+    available-memory check on the vLLM path merely *predicts* vLLM's own refusal:
+    the engine compares its request against free memory and declines to start.
+    Recent llama.cpp does something similar when `-ngl` is left on `auto`, but it
+    aims to leave 1 GiB free where this host wants tens, and an explicit `-ngl`
+    turns the fitting off entirely. So here the check is not a prediction of
+    somebody else's politeness — it is the only thing standing between an
+    explicit layer count and a machine that stops responding.
+    """
+    budget = await current_budget(exclude=replacing, node=node)
+    payload = budget.as_dict()
+
+    resolved = await engine.resolve(params)
+    requested_bytes = engine.footprint_bytes(resolved, budget.total_bytes)
+    unsized = str(resolved.get("_sizing") or "")
+
+    projected_bytes = budget.occupied_bytes + requested_bytes
+    headroom_after = budget.total_bytes - projected_bytes
+    live_available = budget.available_after_replacement
+    free = budget.free_bytes_to_commit
+    tenants = ", ".join(t.label for t in budget.tenants) if budget.tenants else "none"
+
+    def verdict(ok: bool, level: str, message: str) -> Verdict:
+        return Verdict(
+            ok=ok,
+            level=level,
+            message=message,
+            budget=payload,
+            # A display figure only, exactly as app/heretic.py and
+            # app/finetune.py already compute one for workloads that take no
+            # fraction. Never handed back as advice.
+            requested_util=(requested_bytes / budget.total_bytes) if budget.total_bytes else 0.0,
+            requested_bytes=requested_bytes,
+            suggested_util=None,
+            suggested_bytes=free,
+            engine=engine.name,
+        )
+
+    if projected_bytes > budget.total_bytes - budget.reserve_bytes:
+        return verdict(False, "block", (
+            f"Refusing to launch: this configuration needs {_gib(requested_bytes)} on top of "
+            f"{_gib(budget.occupied_bytes)} already in use ({tenants}), which would leave only "
+            f"{_gib(headroom_after)} of {_gib(budget.total_bytes)}. This host needs at least "
+            f"{_gib(budget.reserve_bytes)} free. There is room for {_gib(free)} right now — "
+            "lower --n-gpu-layers, shorten --ctx-size, or quantise the cache with -ctk q8_0."))
+
+    if requested_bytes > live_available:
+        return verdict(False, "block", (
+            f"Refusing to launch: this configuration needs {_gib(requested_bytes)} but only "
+            f"{_gib(live_available)} is free right now. Unlike vLLM, llama-server does not "
+            "check before it allocates — with an explicit --n-gpu-layers it simply tries, and "
+            "on this host that is what takes the machine down. Stop something first."))
+
+    if unsized:
+        # Nothing about the request could be measured, so nothing above tested
+        # it. Saying "fits" here would be a claim the guard has no basis for.
+        return verdict(True, "warn", (
+            f"This launch cannot be sized: {unsized}. Nothing is refused, but the memory guard "
+            f"is not protecting you here — there is {_gib(free)} free, and llama.cpp will take "
+            "what it takes. Point the Model field at a .gguf already on this machine to get a "
+            "real answer."))
+
+    if requested_bytes > live_available * (1 - DRIFT_MARGIN):
+        return verdict(True, "warn", (
+            f"Tight: {_gib(requested_bytes)} of the {_gib(live_available)} free — close enough "
+            "that a little more activity before the weights finish loading would push it over. "
+            f"{_gib(free)} is the comfortable ceiling."))
+
+    if projected_bytes > budget.total_bytes - budget.warn_reserve_bytes:
+        return verdict(True, "warn", (
+            f"Tight: {_gib(projected_bytes)} of {_gib(budget.total_bytes)} would be spoken for, "
+            f"leaving {_gib(headroom_after)}. Keep --parallel and --ubatch-size low; the compute "
+            "buffer grows with both, and it is what runs out during a long prompt rather than "
+            "during loading."))
+
+    return verdict(True, "ok", (
+        f"Fits: {_gib(requested_bytes)} of {_gib(budget.total_bytes)}, leaving "
+        f"{_gib(headroom_after)}. This is an estimate from the GGUF's own header — llama.cpp "
+        "measures the real buffers at startup and prints them."))

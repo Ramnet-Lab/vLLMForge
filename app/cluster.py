@@ -108,7 +108,8 @@ async def wiring(node: nodes.Node, prefix: str) -> NodeWiring:
 
 async def plan(node_names: list[str], model: str = "",
                args: dict[str, Any] | None = None,
-               replacing: str | None = None) -> dict[str, Any]:
+               replacing: str | None = None,
+               image: str = "") -> dict[str, Any]:
     """Everything that has to be true before a pooled engine can start.
 
     Given a model, this also reports which nodes are missing it — the answer the
@@ -151,13 +152,18 @@ async def plan(node_names: list[str], model: str = "",
         return {"ok": False, "reason": f"no interface on the {prefix}.0/24 subnet on: "
                                        f"{', '.join(problems)}"}
 
+    # The image the launch will actually use, not the configured default. A
+    # server may carry its own, and checking the wrong tag either passes a plan
+    # for an image no node has or refuses one every node does.
+    image = image or settings.vllm_image
     images = await asyncio.gather(*(
-        docker_ctl.image_exists(settings.vllm_image, host=w.node.docker_host) for w in wirings
+        docker_ctl.image_exists(image, host=w.node.docker_host) for w in wirings
     ))
     missing_image = [w.node.name for w, has in zip(wirings, images, strict=True) if not has]
 
     budgets = await asyncio.gather(*(safety.current_budget(node=w.node) for w in wirings))
-    pooled_bytes = sum(int(b.max_util * b.total_bytes) for b in budgets)
+    # Byte twins, so the pooled total is not round-tripped through a fraction.
+    pooled_bytes = sum(b.max_bytes for b in budgets)
 
     missing_model_on = await missing_model(model, node_names) if model else []
 
@@ -183,7 +189,7 @@ async def plan(node_names: list[str], model: str = "",
     # before starting the engine, so it is work to be done, not a refusal.
     reasons = []
     if missing_image:
-        reasons.append(f"{settings.vllm_image} is not pulled on: {', '.join(missing_image)}")
+        reasons.append(f"{image} is not pulled on: {', '.join(missing_image)}")
     incompatible = _pipeline_incompatible(model)
     if incompatible:
         reasons.append(incompatible)
@@ -218,7 +224,7 @@ async def plan(node_names: list[str], model: str = "",
         # A pooled engine can only ask for what the tightest node can give.
         "free_util": round(min((b.free_util for b in budgets), default=0.0), 3),
         "pooled_bytes": pooled_bytes,
-        "single_node_bytes": int(budgets[0].max_util * budgets[0].total_bytes),
+        "single_node_bytes": budgets[0].max_bytes,
         "missing_image": missing_image,
     }
 

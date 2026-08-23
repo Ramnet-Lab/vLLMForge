@@ -9,6 +9,13 @@ first is missing most of what the box actually holds:
 
 Adapters and datasets are deliberately excluded: neither can be loaded on its
 own, and offering them in a model picker only produces a failure minutes later.
+
+**The two engines want different granularity.** vLLM is pointed at a repo and
+resolves the weights itself. llama.cpp is pointed at one .gguf FILE — and a GGUF
+release routinely ships six of them, one per quantisation, in a single repo. So
+offering "TheBloke/Something-GGUF" to a llama.cpp form is not an answer to the
+question it asked; the entries have to be the files. `path_options(engine=…)` is
+where that fork lives, and it is the only place the two differ.
 """
 
 from __future__ import annotations
@@ -17,18 +24,36 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from app import hf, jobs, servers
+from app import engines, gguf, hf, jobs, servers
 from app.config import settings
 
-# A directory only counts as a model if transformers could actually open it.
+# A directory only counts as a model if something could actually open it.
 REQUIRED_FILE = "config.json"
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".gguf")
 
+# How many .gguf files to offer before giving up on listing them. A cache with a
+# few dozen quantisations in it is normal; a thousand is a sign the walk found
+# something it should not have.
+MAX_GGUF = 400
+
 
 def _is_model_dir(path: Path) -> bool:
-    if not path.is_dir() or not (path / REQUIRED_FILE).is_file():
+    """Whether this directory holds something an engine on this box can load.
+
+    config.json plus weights is a transformers model. A directory of .gguf files
+    and nothing else is a llama.cpp model — that is the normal shape of a GGUF
+    release and of anything llama-quantize wrote, and requiring config.json
+    excluded exactly the artefacts the second engine exists to serve.
+    """
+    if not path.is_dir():
         return False
-    return any(child.suffix in WEIGHT_SUFFIXES for child in path.iterdir())
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return False
+    if (path / REQUIRED_FILE).is_file():
+        return any(child.suffix in WEIGHT_SUFFIXES for child in children)
+    return any(child.suffix == ".gguf" for child in children)
 
 
 def _dir_bytes(path: Path) -> int:
@@ -86,7 +111,10 @@ def _heretic_outputs() -> list[dict]:
     return out
 
 
-def _finetune_outputs() -> list[dict]:
+def _finetune_outputs(engine: str = "vllm") -> list[dict]:
+    """Merged exports for vLLM; the gguf export is llama.cpp's and is offered by
+    `_gguf_files` instead. Offering it here too would put a file vLLM cannot read
+    into the vLLM model picker."""
     out = []
     for job in jobs.manager.list("finetune", limit=100):
         if job["status"] != jobs.SUCCEEDED:
@@ -95,8 +123,18 @@ def _finetune_outputs() -> list[dict]:
         result = job.get("result") or (job.get("progress") or {}).get("result") or {}
         export = meta.get("export") or result.get("export") or "adapter"
         run_dir = Path(meta.get("run_dir") or "")
-        # An adapter is not loadable on its own; only a merged export is.
-        candidate = run_dir / export if export.startswith("merged") else run_dir / "model"
+        # An adapter is not loadable on its own; a merged export is, and so is a
+        # gguf export — which the worker writes to <run_dir>/gguf and which was
+        # not offered here at all, so the one artefact llama.cpp exists to serve
+        # had to be typed by hand under "Other".
+        if export == "gguf":
+            if engine == "vllm":
+                continue
+            candidate = run_dir / "gguf"
+        elif export.startswith("merged"):
+            candidate = run_dir / export
+        else:
+            candidate = run_dir / "model"
         if not _is_model_dir(candidate):
             continue
         source = meta.get("model") or result.get("model") or "unknown"
@@ -222,8 +260,23 @@ def _directory_options() -> list[dict]:
     return out
 
 
-def _adapter_options(local: dict) -> list[dict]:
-    """LoRA adapters: cached ones from the Hub, and what fine-tuning produced."""
+def _adapter_options(local: dict, engine: str = "vllm",
+                     gguf_files: list[dict] | None = None) -> list[dict]:
+    """LoRA adapters: cached ones from the Hub, and what fine-tuning produced.
+
+    llama.cpp takes a converted `.gguf` adapter as a bare filename; vLLM takes a
+    PEFT directory as `name=path`. Neither can read the other's, so offering a
+    llama.cpp form the directories a fine-tune wrote would be offering it files
+    it cannot open.
+    """
+    if engine != "vllm":
+        # Reuses the caller's scan rather than walking the cache a second time
+        # for the same request.
+        return [
+            item for item in (gguf_files if gguf_files is not None else _gguf_files(local))
+            if "lora" in item["label"].lower() or "adapter" in item["label"].lower()
+        ]
+
     out = []
     for repo in local.get("repos", []) if local.get("ok") else []:
         if repo.get("repo_type") != "model":
@@ -254,18 +307,101 @@ def _adapter_options(local: dict) -> list[dict]:
     return out
 
 
-async def path_options() -> dict[str, Any]:
-    """Everything a path-valued serve flag could be set to, by kind."""
+def _gguf_files(local: dict) -> list[dict]:
+    """Every .gguf on this box, as one entry per FILE.
+
+    This is what a llama.cpp model picker needs and what a repo-level list can
+    never express: `bartowski/Qwen3-8B-GGUF` is not a model, it is six of them,
+    and `-m` takes exactly one.
+
+    The cache is walked one snapshot directory at a time rather than with an
+    unbounded rglob. `catalog.SCAN_ROOTS` deliberately excludes the cache
+    because it holds tens of thousands of blob files — but a snapshot directory
+    is a small tree of symlinks into those blobs, and `scan_cache_dir` has
+    already told us where each one is, so this stays a handful of listings.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+
+    def add(path: Path, label: str, note: str) -> None:
+        value = servers.container_path(path)
+        if value in seen or len(out) >= MAX_GGUF:
+            return
+        seen.add(value)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        header = gguf.read_cached(path)
+        detail = f"{size / 1024 ** 3:.1f} GiB"
+        if header is not None and header.quant:
+            detail = f"{header.quant} · {detail}"
+        out.append(_entry(value, label, kind="path", detail=detail, note=note))
+
+    for repo in local.get("repos", []) if local.get("ok") else []:
+        if repo.get("repo_type") != "model":
+            continue
+        for revision in repo.get("revisions", []):
+            snapshot = Path(revision.get("path") or "")
+            if not snapshot.is_dir():
+                continue
+            try:
+                # Two levels: GGUF releases sometimes put a quantisation in its
+                # own subdirectory, and multi-part shards always do.
+                found = sorted({*snapshot.glob("*.gguf"), *snapshot.glob("*/*.gguf")})
+            except OSError:
+                continue
+            for path in found:
+                add(path, f"{repo['repo_id']} · {path.name}", str(path))
+
+    root = Path(settings.output_dir)
+    if root.is_dir():
+        # Bounded as it walks rather than sorted-then-sliced: a real outputs
+        # directory is full of fine-tune runs and their checkpoints, and
+        # materialising every match before taking the first few hundred is the
+        # walk this cap exists to avoid.
+        for path in _bounded_glob(root, "**/*.gguf", MAX_GGUF - len(out)):
+            add(path, str(path.relative_to(root)), str(path))
+    return out
+
+
+def _bounded_glob(root: Path, pattern: str, limit: int) -> list[Path]:
+    """At most `limit` matches, stopping the walk once it has them."""
+    found: list[Path] = []
+    if limit <= 0:
+        return found
+    try:
+        for path in root.glob(pattern):
+            found.append(path)
+            if len(found) >= limit:
+                break
+    except OSError:
+        pass
+    return sorted(found)
+
+
+async def path_options(engine: str = "vllm") -> dict[str, Any]:
+    """Everything a path-valued serve flag could be set to, by kind.
+
+    The `model` kind is the only one the engine changes, and it changes
+    completely: a repo id for vLLM, a .gguf file for llama.cpp.
+    """
+    chosen = engines.get(engine)
     try:
         local = await hf.local_models()
     except Exception as exc:
         local = {"ok": False, "error": str(exc), "repos": []}
 
     def build() -> dict[str, list[dict]]:
-        models = _cached_models(local) + _heretic_outputs() + _finetune_outputs()
+        if chosen.name == "vllm":
+            models = _cached_models(local) + _heretic_outputs() + _finetune_outputs("vllm")
+            gguf_files = None
+        else:
+            models = _gguf_files(local)
+            gguf_files = models
         return {
             "model": models,
-            "adapter": _adapter_options(local),
+            "adapter": _adapter_options(local, chosen.name, gguf_files),
             "template": _file_options("template"),
             "plugin": _file_options("plugin"),
             "cert": _file_options("cert"),
@@ -278,4 +414,5 @@ async def path_options() -> dict[str, Any]:
         "options": options,
         "counts": {kind: len(items) for kind, items in options.items()},
         "cache_ok": bool(local.get("ok")),
+        "engine": chosen.name,
     }

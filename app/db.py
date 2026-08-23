@@ -124,6 +124,18 @@ MIGRATIONS = [
     ("servers", "node", "ALTER TABLE servers ADD COLUMN node TEXT NOT NULL DEFAULT 'local'"),
     ("servers", "pool_nodes",
      "ALTER TABLE servers ADD COLUMN pool_nodes TEXT NOT NULL DEFAULT '[]'"),
+    # Which inference engine this definition runs. Defaulting to 'vllm' is what
+    # makes the upgrade a no-op: the engine name is also the container kind, so
+    # an existing row keeps the llmd-vllm-<id> container it already has, and
+    # every one of its args keeps meaning what it meant.
+    ("servers", "engine", "ALTER TABLE servers ADD COLUMN engine TEXT NOT NULL DEFAULT 'vllm'"),
+    # Per-engine argument sets, so switching a definition from vLLM to llama.cpp
+    # and back does not throw away either. `args` remains AUTHORITATIVE and holds
+    # the active engine's arguments; this column is the editor's memory of the
+    # others and nothing may read it to make a decision. If the two disagree,
+    # `args` wins.
+    ("servers", "args_by_engine",
+     "ALTER TABLE servers ADD COLUMN args_by_engine TEXT NOT NULL DEFAULT '{}'"),
 ]
 
 

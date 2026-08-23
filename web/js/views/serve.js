@@ -1,5 +1,19 @@
-/* The vLLM control surface: what is resident, what it costs in the memory its
+/* The engine control surface: what is resident, what it costs in the memory its
    node actually spends, and every flag the image will accept.
+
+   Two engines live here. A server names one — vLLM or llama.cpp — and that
+   choice reaches almost everything below it: the flag form is generated from
+   that engine's own binary, the presets are measurements of that engine, the
+   memory verdict is phrased in the units that engine has (a fraction for vLLM,
+   bytes for llama.cpp, which declares no fraction at all), and pooling is
+   offered only for the engine that can do it. The editor therefore keeps a
+   schema and an argument set PER ENGINE and swaps between them, rather than one
+   of each: switching to llama.cpp and back must not throw away what was typed.
+
+   The dropdown picks itself when the answer is obvious. A model reference with
+   'gguf' in it can only be served by llama.cpp — vLLM cannot read the format —
+   so choosing one selects the engine, and keeps selecting it only for as long
+   as the operator has not overridden the choice by hand.
 
    "The memory its node spends" is the framebuffer on a discrete GPU and host
    RAM on a unified part, and the backend decides which before any figure gets
@@ -129,7 +143,8 @@ const STYLES = `
    this box; the third is derived from them. The UI repeats that distinction,
    because an operator who trusts a preset that was never measured pays for it
    in a frozen machine. */
-const PRESETS = [
+const PRESETS_BY_ENGINE = {
+  vllm: [
   {
     title: '27B NVFP4 chat · util 0.52',
     note: 'Measured: the vllm-qwen container on this host runs these values beside the embedder '
@@ -166,17 +181,79 @@ const PRESETS = [
       max_num_seqs: 8,
     },
   },
-];
+  ],
+
+  /* llama.cpp's presets are shapes rather than measurements, and they say so.
+     The reason is structural: a vLLM preset is a fraction of THIS box and is
+     the same fraction whatever the model, so it can be measured once. A
+     llama.cpp configuration is a layer count and a context length, and both
+     depend on the .gguf — 40 layers is a whole model or a third of one. What
+     transfers between models is the intent, so that is what these carry. */
+  llamacpp: [
+    {
+      title: 'Everything on the GPU',
+      note: 'The fast case, for a model that fits. -ngl all offloads every layer; if it '
+        + 'does not fit, llama.cpp will not quietly do less — it fails. Check the memory '
+        + 'verdict below before starting.',
+      args: {
+        n_gpu_layers: 'all',
+        ctx_size: 8192,
+        flash_attn: 'on',
+      },
+    },
+    {
+      title: 'Long context on a busy box',
+      note: 'Quantising the KV cache to q8_0 roughly halves it against f16 for very little '
+        + 'quality, which is what buys the context. Flash attention is required for a '
+        + 'quantised V cache and also keeps the compute buffer from growing with length.',
+      args: {
+        n_gpu_layers: 'all',
+        ctx_size: 32768,
+        cache_type_k: 'q8_0',
+        cache_type_v: 'q8_0',
+        flash_attn: 'on',
+        ubatch_size: 256,
+      },
+    },
+    {
+      title: 'Split with the CPU',
+      note: 'What llama.cpp can do and vLLM cannot: run a model larger than the '
+        + 'accelerator by keeping some layers on the CPU. It is slower per token in '
+        + 'proportion to how much stayed behind. Start at half and raise it until the '
+        + 'verdict says no.',
+      args: {
+        n_gpu_layers: 20,
+        ctx_size: 4096,
+        flash_attn: 'on',
+      },
+    },
+  ],
+};
+
+const presetsFor = (engine) => PRESETS_BY_ENGINE[engine] || [];
 
 const DETAIL_TABS = [['command', 'Command'], ['logs', 'Logs'], ['metrics', 'Metrics']];
 const LIVE = ['running', 'loading', 'starting', 'unhealthy'];
 const LOCAL = 'local';
 
+const DEFAULT_ENGINE = 'vllm';
+
+/* A model reference only llama.cpp can serve. Matched against the WHOLE trimmed
+   reference rather than its tail, because both spellings occur: a Hub repo says
+   it at the end (`bartowski/Qwen3-8B-GGUF`) and a fine-tune export says it in
+   the middle (`/outputs/finetune/run7/gguf/model-q4_k_m.gguf`). */
+const GGUF_HINT = /gguf/i;
+
 const state = {
   ctx: null,
   main: null,
-  schema: null,
-  flagIndex: null,
+  // One schema per engine, fetched lazily. The default engine's is fetched at
+  // render; a second engine's is fetched the first time it is selected, and its
+  // failure is contained to the dropdown rather than to the whole view — see
+  // schemaFor().
+  schemas: {},
+  engines: [],
+  flagIndexes: {},
   status: { servers: [], foreign: [], nodes: [], budgets: {}, budget: null },
   cluster: [],
   mode: 'list',
@@ -208,24 +285,29 @@ export async function render(container, ctx) {
       h('div', null,
         h('h1', null, 'Serve'),
         h('p', null,
-          'vLLM engines on the machines in this cluster. Utilisation is a fraction of one node\'s '
-          + 'accelerator memory — the GPU\'s own framebuffer where it has one, the memory the CPU '
-          + 'and GPU share where they share it — so every engine on a node spends the same pool, '
-          + 'and none of it is shared with the node next to it.')),
+          'vLLM and llama.cpp engines on the machines in this cluster. Every engine on a node '
+          + 'spends the same pool — the GPU\'s own framebuffer where it has one, the memory the '
+          + 'CPU and GPU share where they share it — and none of it is shared with the node next '
+          + 'to it. vLLM claims its share as a fraction of that pool; llama.cpp claims no share '
+          + 'at all, so what it takes is worked out from its weights file and its context.')),
       h('div', { class: 'page-actions' },
         h('button', { onClick: () => { refreshStatus(); loadCluster(); } }, 'Refresh'),
         h('button', { class: 'btn-primary', onClick: () => openEditor(null) }, 'New server'))),
     state.main);
 
-  const [schema] = await Promise.all([
-    get('/servers/schema'), refreshStatus({ render: false }), loadCluster(),
+  // Only the default engine's schema is awaited here. Everything on this page —
+  // the list, the timers, the detail panel — is downstream of this await, so a
+  // second engine's schema failing to load would have taken the whole Serve tab
+  // down with it. The others are fetched when they are first selected.
+  const [schema, engineList] = await Promise.all([
+    get('/servers/schema'), get('/servers/engines').catch(() => null),
+    refreshStatus({ render: false }), loadCluster(),
   ]);
   if (state.stopped) return;
-  state.schema = schema;
-  state.flagIndex = new Map();
-  for (const section of [...schema.featured, ...schema.advanced]) {
-    for (const arg of section.flags) state.flagIndex.set(arg.dest, arg);
-  }
+  rememberSchema(DEFAULT_ENGINE, schema);
+  state.engines = engineList?.engines || [
+    { name: DEFAULT_ENGINE, label: schema.label || 'vLLM' },
+  ];
 
   // Two tabs link here: Overview sends a server id, Models sends a repo id.
   const detail = routeDetail(ctx);
@@ -245,6 +327,46 @@ export async function render(container, ctx) {
   // Pool status inspects a container on every peer over ssh, which is far too
   // slow to ride along with the three-second detail poll.
   state.timers.push(setInterval(refreshPoolStatus, 10000));
+}
+
+/* --- per-engine schemas --------------------------------------------------
+
+   `state.schema` used to be one object fetched once. It is now one per engine,
+   because the flag index built from it is the gate on everything that applies a
+   flag programmatically: applyArgs silently drops any dest the index does not
+   hold, which is what makes a preset degrade instead of exploding — and a stale
+   index would let a vLLM preset write gpu_memory_utilization into a llama.cpp
+   payload that then 422s on save. */
+
+function rememberSchema(engine, schema) {
+  state.schemas[engine] = schema;
+  const index = new Map();
+  for (const section of [...(schema.featured || []), ...(schema.advanced || [])]) {
+    for (const arg of section.flags) index.set(arg.dest, arg);
+  }
+  state.flagIndexes[engine] = index;
+  return schema;
+}
+
+const currentEngine = () => state.editor?.form.engine || DEFAULT_ENGINE;
+const schemaOf = (engine) => state.schemas[engine || currentEngine()] || null;
+const indexOf = (engine) => state.flagIndexes[engine || currentEngine()] || new Map();
+const engineLabel = (name) => state.engines.find((e) => e.name === name)?.label
+  || (name === 'llamacpp' ? 'llama.cpp' : 'vLLM');
+const engineInfo = (name) => state.engines.find((e) => e.name === name) || {};
+
+/** Fetch an engine's schema once, keeping the failure local.
+ *  Returns null rather than throwing: an engine whose schema will not load is a
+ *  dropdown entry that cannot be selected, not a broken page. */
+async function schemaFor(engine) {
+  if (state.schemas[engine]) return state.schemas[engine];
+  try {
+    return rememberSchema(engine, await get(`/servers/schema?engine=${encodeURIComponent(engine)}`));
+  } catch (error) {
+    toast(`Could not load the ${engineLabel(engine)} parameter list: ${error.message}`,
+      { level: 'danger', title: 'Engine unavailable' });
+    return null;
+  }
 }
 
 export function dispose() {
@@ -373,7 +495,7 @@ function budgetPanel() {
     body: h('div', null,
       h('div', { class: 'grid cols-4' },
         stat('Committed', pct(budget.committed_util, 0),
-          `${bytes(budget.committed_bytes)} claimed by vLLM flags`),
+          `${bytes(budget.committed_bytes)} the resident engines are estimated to hold`),
         stat('Measured', bytes(budget.measured_gpu_bytes), 'actually held by GPU processes'),
         stat('Free to commit', pct(budget.free_util, 0),
           `ceiling ${pct(budget.max_util, 0)} · ${bytes(budget.reserve_bytes)} kept for the OS`),
@@ -387,8 +509,13 @@ function budgetPanel() {
         h('span', null, h('i', { style: { background: 'var(--border-strong)' } }), 'reserve'),
         h('span', null, 'the rest is available to a new engine')),
       h('div', { class: 'serve-tenants' },
+        // `label` is the backend's rendering of a tenant, and it is the only
+        // one that works for an engine with no fraction: it prints bytes there
+        // and the fraction where there is one, so the strip never shows a blank
+        // number beside a container holding 40 GiB.
         budget.tenants.map((tenant) => h('span', { class: 'tag', title: tenant.note || '' },
-          `${tenant.name} ${tenant.util}${tenant.implicit ? ' (implied)' : ''}`)),
+          tenant.label
+          || `${tenant.name} ${tenant.util}${tenant.implicit ? ' (implied)' : ''}`)),
         budget.tenants.length ? null : h('span', { class: 'faint small' }, 'nothing resident'))),
   });
 }
@@ -484,14 +611,36 @@ function poolGroupRow(group) {
         : null)));
 }
 
-function utilCell(util) {
-  return util === null || util === undefined
-    ? h('span', {
-      class: 'faint',
-      title: 'no --gpu-memory-utilization set, so vLLM applies its own default',
-    }, 'default')
-    : String(util);
+/* The Util column, which only one engine has.
+   For vLLM an empty value means "the default applies", which is a real
+   reservation of over 100 GiB on a unified box and is worth saying. For an
+   engine with no fraction at all it means nothing of the kind, and the old
+   tooltip named a flag that engine has never had. A byte figure is shown
+   instead where the backend could work one out. */
+function utilCell(util, engine = DEFAULT_ENGINE, footprintBytes = 0) {
+  if (util !== null && util !== undefined) return String(util);
+  if (engine !== 'vllm') {
+    return footprintBytes
+      ? h('span', { class: 'faint', title: `${engineLabel(engine)} declares no memory `
+        + 'fraction; this is what its configuration is estimated to take.' },
+      bytes(footprintBytes))
+      : h('span', { class: 'faint', title: `${engineLabel(engine)} declares no memory `
+        + 'fraction, and its footprint could not be estimated from here.' }, '—');
+  }
+  return h('span', {
+    class: 'faint',
+    title: 'no --gpu-memory-utilization set, so vLLM applies its own default',
+  }, 'default');
 }
+
+/* Which engine a row runs, beside the pooled and peer tags it already carries.
+   A badge in the name cell rather than a column: the table has six already, and
+   this belongs with the other things that say what a row IS. Shown only for the
+   non-default engine, so a single-engine box looks exactly as it did. */
+const engineTag = (engine) => (engine && engine !== DEFAULT_ENGINE
+  ? h('span', { class: 'tag', style: { marginLeft: '6px' }, title: 'inference engine' },
+    engineLabel(engine))
+  : null);
 
 function servingCell(entry) {
   const models = entry.health?.models || [];
@@ -520,13 +669,14 @@ function serverRow(server) {
   },
   h('td', null,
     h('div', { class: 's-name' }, server.name,
+      engineTag(server.engine),
       pool.length
         ? h('span', { class: 'tag', style: { marginLeft: '6px' }, title: poolTitle(pool) },
           poolLabel(pool))
         : (peer ? h('span', { class: 'tag', style: { marginLeft: '6px' } }, server.node) : null)),
     h('div', { class: 's-model truncate', title: server.model }, server.model)),
   h('td', { class: 'num' }, String(server.port)),
-  h('td', { class: 'num' }, utilCell(server.util)),
+  h('td', { class: 'num' }, utilCell(server.util, server.engine, server.footprint_bytes)),
   h('td', null,
     statusBadge(server.status),
     server.oom_killed ? h('div', { class: 'faint small' }, 'OOM-killed') : null,
@@ -552,9 +702,11 @@ function renderForeignTable() {
     h('div', { style: { padding: '12px 14px 0' } },
       notice('info',
         h('strong', null, 'Not managed here. '),
-        'These were launched outside the dashboard — by hand or by a script. Their utilisation '
-        + 'still counts against the budget above, so stopping one is the quickest way to make '
-        + 'room. Nothing else about them can be changed from here.')),
+        'These were launched outside the dashboard — by hand or by a script. What they hold '
+        + 'counts against the budget above, so stopping one is the quickest way to make room. '
+        + 'A vLLM container declares a fraction the guard can read; a llama.cpp one declares '
+        + 'nothing, so its column is an estimate from its own weights file. Nothing else about '
+        + 'them can be changed from here.')),
     h('div', { class: 'table-wrap' },
       h('table', null,
         h('thead', null, h('tr', null,
@@ -570,10 +722,10 @@ function renderForeignTable() {
 function foreignRow(item) {
   return h('tr', { class: 'serve-unmanaged' },
     h('td', null,
-      h('div', { class: 's-name' }, item.name),
+      h('div', { class: 's-name' }, item.name, engineTag(item.engine)),
       h('div', { class: 's-model truncate', title: item.model }, item.model || item.image)),
     h('td', { class: 'num' }, item.port ? String(item.port) : '—'),
-    h('td', { class: 'num' }, utilCell(item.util)),
+    h('td', { class: 'num' }, utilCell(item.util, item.engine, item.footprint_bytes)),
     h('td', null, statusBadge(item.status)),
     h('td', null, servingCell(item)),
     h('td', null, h('div', { class: 'serve-actions' },
@@ -628,10 +780,17 @@ async function refreshVerdict() {
     renderDetailSafety();
     return;
   }
-  const util = server.util;
-  const query = util === null || util === undefined ? '' : `?util=${util}`;
   try {
-    const verdict = await get(`/system/budget/check${query}`);
+    // The saved definition's own arguments, asked of its own engine — the same
+    // question the editor asks, so a selected server and the form that produced
+    // it cannot disagree about whether it fits.
+    const verdict = await post('/system/budget/check', {
+      engine: server.engine || DEFAULT_ENGINE,
+      args: server.args || {},
+      model: server.model,
+      node: server.node,
+      server_id: server.id,
+    });
     if (state.selected !== server.id) return;
     state.verdict = verdict;
     renderDetail();
@@ -649,7 +808,8 @@ function renderDetail() {
     state.detailKey = '';
     return mount(state.nodes.detail);
   }
-  const key = [server.id, server.status, state.detailTab, state.verdict?.level ?? ''].join('|');
+  const key = [server.id, server.status, server.engine, state.detailTab,
+    state.verdict?.level ?? ''].join('|');
   if (key === state.detailKey) return undefined;
   state.detailKey = key;
 
@@ -667,6 +827,8 @@ function renderDetail() {
       ? `${server.model} · ${server.url} on ${pool[0]}, the head`
       : `${server.model} · ${server.url}`,
     actions: [
+      server.engine && server.engine !== DEFAULT_ENGINE
+        ? badge('info', engineLabel(server.engine)) : null,
       pool.length
         ? badge('info', `pooled · ${poolLabel(pool)}`)
         : badge(peer ? 'info' : 'absent', server.node || LOCAL),
@@ -713,7 +875,7 @@ function renderDetailSafety() {
     return;
   }
   mount(host, server.node_local === false
-    ? remoteLaunchNotice(server.node, server.util)
+    ? remoteLaunchNotice(server.node, server.util, server.engine)
     : (state.verdict ? verdictNotice(state.verdict) : null));
 }
 
@@ -816,11 +978,18 @@ async function refreshPoolStatus() {
    honest substitute is that peer's own headroom plus where the decision is
    actually taken. Showing the local verdict instead would read as an answer
    about the wrong machine. */
-function remoteLaunchNotice(name, util) {
+function remoteLaunchNotice(name, util, engine = DEFAULT_ENGINE) {
   const budget = (state.status.budgets || {})[name];
-  const asked = util === null || util === undefined
-    ? 'No --gpu-memory-utilization is set, so vLLM applies its own default there.'
-    : `You are asking for ${util} of that node.`;
+  let asked;
+  if (engine !== 'vllm') {
+    asked = `${engineLabel(engine)} declares no memory fraction, so how much of that node this `
+      + 'takes is decided by the .gguf, --n-gpu-layers and --ctx-size — and it is worked out '
+      + 'there, where the file is.';
+  } else if (util === null || util === undefined) {
+    asked = 'No --gpu-memory-utilization is set, so vLLM applies its own default there.';
+  } else {
+    asked = `You are asking for ${util} of that node.`;
+  }
 
   if (!budget) {
     return notice('info',
@@ -830,7 +999,11 @@ function remoteLaunchNotice(name, util) {
   }
 
   const resident = budget.tenants.length
-    ? budget.tenants.map((tenant) => `${tenant.name} ${tenant.util}`).join(', ')
+    // `label` is the backend's own rendering of a tenant, and it is the only one
+    // that works for both engines: a fraction where there is one, bytes where
+    // there is not.
+    ? budget.tenants.map((tenant) => tenant.label
+      || `${tenant.name} ${tenant.util}`).join(', ')
     : 'nothing resident';
 
   return notice('info',
@@ -841,20 +1014,30 @@ function remoteLaunchNotice(name, util) {
     h('div', { class: 'faint', style: { marginTop: '4px' } },
       'This is that node\'s headroom, not a verdict — the memory guard runs on '
       + `${name} at start time and it is the one that can refuse. Per-process GPU allocation is `
-      + 'only readable on the machine running this dashboard, so a peer is measured by the '
-      + 'utilisation fractions its containers declare.'));
+      + 'only readable on the machine running this dashboard, so a peer is measured by what '
+      + 'its containers declare or, for an engine that declares nothing, by what its weights '
+      + 'and context imply.'));
 }
 
 function verdictNotice(verdict) {
   const level = { ok: 'ok', warn: 'warn', block: 'danger' }[verdict.level] || 'info';
   const lead = { ok: 'Fits. ', warn: 'Tight. ', block: 'Blocked. ' }[verdict.level] || '';
+  // Two different advices, because the two engines act on different things. A
+  // vLLM operator retypes a fraction; a llama.cpp operator has no fraction to
+  // retype and needs to know how many bytes are going spare. Rendering
+  // suggested_util unguarded printed the word "null" into the advice as soon as
+  // a bytes-native verdict came back.
+  let advice = null;
+  if (verdict.suggested_util !== null && verdict.suggested_util !== undefined) {
+    advice = `Largest --gpu-memory-utilization that fits right now: ${verdict.suggested_util}`;
+  } else if (verdict.suggested_bytes) {
+    advice = `${bytes(verdict.suggested_bytes)} is free for this engine right now — spend it `
+      + 'on layers with --n-gpu-layers or on context with --ctx-size.';
+  }
   return notice(level,
     h('strong', null, lead),
     verdict.message,
-    verdict.suggested_util
-      ? h('div', { class: 'faint', style: { marginTop: '4px' } },
-        `Largest --gpu-memory-utilization that fits right now: ${verdict.suggested_util}`)
-      : null);
+    advice ? h('div', { class: 'faint', style: { marginTop: '4px' } }, advice) : null);
 }
 
 function loadDetailBody() {
@@ -890,7 +1073,7 @@ async function loadCommand(server, host) {
       'Exactly what Start runs. Nothing is hidden: paste it into a shell and you get the same '
       + 'container.'),
     commandBlock('docker run', preview.command),
-    commandBlock('vllm serve', argv));
+    commandBlock(server.engine === 'llamacpp' ? 'llama-server' : 'vllm serve', argv));
 }
 
 function commandBlock(title, text) {
@@ -945,15 +1128,32 @@ async function loadMetrics(server, host) {
   }
   if (state.selected !== server.id || state.detailTab !== 'metrics') return;
 
+  const engine = server.engine || DEFAULT_ENGINE;
   const selected = data.selected || {};
   if (!Object.keys(selected).length) {
-    mount(host, notice('warn', server.status === 'running'
-      ? 'The server is up but published no vLLM metrics. --disable-log-stats turns them off.'
-      : 'Loading. vLLM binds no port until the weights are in and CUDA graphs are captured, so '
-        + 'there is nothing to scrape yet — this is not an unreachable server.'));
+    mount(host, notice('warn', emptyMetricsReason(engine, server.status)));
     return;
   }
+  mount(host, h('div', { class: 'serve-metrics' },
+    ...(engine === 'llamacpp' ? llamacppMetrics(selected) : vllmMetrics(selected))));
+}
 
+function emptyMetricsReason(engine, status) {
+  if (engine === 'llamacpp') {
+    return status === 'running'
+      ? 'The server is up but published no metrics. The dashboard always launches '
+        + 'llama-server with --metrics, so a container started by hand without it will '
+        + 'never fill this panel.'
+      : 'Loading. llama-server answers /metrics only once the model is in, so there is '
+        + 'nothing to scrape yet — this is not an unreachable server.';
+  }
+  return status === 'running'
+    ? 'The server is up but published no vLLM metrics. --disable-log-stats turns them off.'
+    : 'Loading. vLLM binds no port until the weights are in and CUDA graphs are captured, so '
+      + 'there is nothing to scrape yet — this is not an unreachable server.';
+}
+
+function vllmMetrics(selected) {
   const value = (name) => selected[`vllm:${name}`];
   const queries = value('prefix_cache_queries_total');
   const hits = value('prefix_cache_hits_total');
@@ -962,7 +1162,7 @@ async function loadMetrics(server, host) {
   const rate = value('gpu_prefix_cache_hit_rate') ?? (queries ? hits / queries : null);
   const kv = value('kv_cache_usage_perc') ?? value('gpu_cache_usage_perc');
 
-  mount(host, h('div', { class: 'serve-metrics' },
+  return [
     stat('Running', count(value('num_requests_running') ?? 0), 'in the current batch'),
     stat('Waiting', count(value('num_requests_waiting') ?? 0), 'queued behind max-num-seqs'),
     stat('KV cache', kv === undefined || kv === null ? '—' : pct(kv, 1), 'of allocated blocks'),
@@ -971,7 +1171,35 @@ async function loadMetrics(server, host) {
     stat('Prompt tokens', count(value('prompt_tokens_total') ?? 0), 'cumulative'),
     stat('Generated', count(value('generation_tokens_total') ?? 0), 'cumulative'),
     stat('Completed', count(value('request_success_total') ?? 0), 'successful requests'),
-    stat('Preemptions', count(value('num_preemptions_total') ?? 0), 'KV cache pressure')));
+    stat('Preemptions', count(value('num_preemptions_total') ?? 0), 'KV cache pressure'),
+  ];
+}
+
+/* Not a rename of the panel above: llama.cpp measures different things.
+   There is no KV-usage gauge and no prefix-cache hit rate, and there are two
+   throughput gauges vLLM does not publish. Rendering vendor metric names into
+   the same eight tiles would have produced four permanent dashes and thrown
+   away the two figures that are actually there. */
+function llamacppMetrics(selected) {
+  const value = (name) => selected[`llamacpp:${name}`];
+  const drafted = value('spec_decode_num_draft_tokens_total');
+  const accepted = value('spec_decode_num_accepted_tokens_total');
+
+  return [
+    stat('Processing', count(value('requests_processing') ?? 0), 'in a slot right now'),
+    stat('Deferred', count(value('requests_deferred') ?? 0), 'waiting for a free slot'),
+    stat('Busy slots', (value('n_busy_slots_per_decode') ?? 0).toFixed(2),
+      'average per decode — near --parallel means saturated'),
+    stat('Prompt', `${count(Math.round(value('prompt_tokens_seconds') ?? 0))}/s`,
+      `${count(value('prompt_tokens_total') ?? 0)} tokens read`),
+    stat('Generation', `${count(Math.round(value('predicted_tokens_seconds') ?? 0))}/s`,
+      `${count(value('tokens_predicted_total') ?? 0)} tokens written`),
+    stat('Decodes', count(value('n_decode_total') ?? 0), 'llama_decode calls'),
+    stat('Longest context', count(value('n_tokens_max') ?? 0), 'tokens seen in one request'),
+    stat('Draft accepted', drafted ? pct(accepted / drafted, 1) : '—',
+      drafted ? `${count(accepted)} of ${count(drafted)} drafted`
+        : 'speculative decoding is off'),
+  ];
 }
 
 /* --- lifecycle ----------------------------------------------------------- */
@@ -1082,15 +1310,23 @@ const pathOptions = (kind) => state.editor?.paths.options[kind] || [];
  *  sixteen requests. */
 async function loadPaths() {
   let payload;
+  // Parameterised by engine, and for one kind that is the whole point: vLLM is
+  // pointed at a repo and resolves the weights itself, while llama.cpp is
+  // pointed at ONE .gguf file — and a GGUF release ships six of them. Fetching
+  // the vLLM list for a llama.cpp form would offer repo ids to a field that
+  // takes a filename.
+  const engine = state.editor?.form.engine || DEFAULT_ENGINE;
   try {
-    payload = await get('/servers/paths');
+    payload = await get(`/servers/paths?engine=${encodeURIComponent(engine)}`);
   } catch (error) {
     // A failed scan costs the operator nothing but the list: an empty kind
     // falls through to its text box, so the form stays usable.
     toast(error.message, { level: 'warn', title: 'Could not list what is on disk' });
     return;
   }
-  if (!state.editor) return;
+  // The engine may have changed while this was in flight; a list of the other
+  // engine's models is worse than none.
+  if (!state.editor || state.editor.form.engine !== engine) return;
   state.editor.paths = payload;
   if (!payload.cache_ok) {
     toast('The Hub cache could not be read, so only local paths are listed.', { level: 'warn' });
@@ -1246,13 +1482,25 @@ function setArg(arg, value) {
   else editor.args[arg.dest] = value;
   const el = editor.fields.get(arg.dest);
   if (el) el.classList.toggle('changed', !isDefaultValue(arg, editor.args[arg.dest]));
-  if (arg.dest === 'gpu_memory_utilization') {
+  if (MEMORY_DESTS[editor.form.engine]?.has(arg.dest)) {
     scheduleSafety();
     // A pooled definition has no single-node verdict; its answer comes from
     // the plan, so the plan is what has to be re-asked.
     if (state.editor?.form.pooled) schedulePlan();
   }
 }
+
+/* The flags that change what a launch will cost, and therefore the ones whose
+   editing has to re-ask the memory guard. vLLM has exactly one — the fraction
+   IS the reservation. llama.cpp has no fraction at all, so its footprint moves
+   with the layer count, the context, the cache dtypes and the batch. Leaving
+   this keyed on one vLLM dest would mean nothing on screen changed as a
+   llama.cpp operator moved the two numbers that actually decide it. */
+const MEMORY_DESTS = {
+  vllm: new Set(['gpu_memory_utilization', 'kv_cache_memory_bytes', 'cpu_offload_gb']),
+  llamacpp: new Set(['n_gpu_layers', 'ctx_size', 'cache_type_k', 'cache_type_v',
+    'ubatch_size', 'flash_attn', 'parallel', 'cpu_moe', 'n_cpu_moe']),
+};
 
 /** Returns [control element, setter] — the setter is what presets drive. */
 function controlFor(arg) {
@@ -1416,10 +1664,14 @@ function paramSection(section, { collapsed = false } = {}) {
   return el;
 }
 
-function applyFilter(query) {
+function applyFilter(query, generation) {
   // The debounce outlives the form it filters: saving or cancelling within the
-  // keystroke window tears the editor down before this runs.
+  // keystroke window tears the editor down before this runs, and an engine
+  // switch rebuilds every registry it walks — so a stale callback would hide
+  // and show nodes belonging to a form that is no longer on screen, against a
+  // query the (new, empty) search box does not show.
   if (!state.editor) return;
+  if (generation !== undefined && generation !== state.editor.generation) return;
   const needle = query.trim().toLowerCase();
   for (const el of state.editor.searchable) {
     el.hidden = Boolean(needle) && !el.dataset.search.includes(needle);
@@ -1452,11 +1704,22 @@ const statusBadge = (status) => badge(status, STATUS_LABEL[status] || status);
 
 /** The tail of a model reference, as a container-safe slug.
  *  `Qwen/Qwen3-Embedding-8B` and `/outputs/heretic/Qwen3-Embedding-8B/` both
- *  become `qwen3-embedding-8b`. */
+ *  become `qwen3-embedding-8b`.
+ *
+ *  Once a model could be a FILE rather than a repo, the tail became a filename —
+ *  so `.../Qwen3-8B-Q4_K_M.gguf` would derive `qwen3-8b-q4-k-m-gguf`. That is
+ *  not cosmetic: the served name becomes the engine's --alias, which is the
+ *  exact string every OpenAI client has to put in its `model` field. The suffix
+ *  and the quantisation tag are stripped for that reason. */
 function slugFromModel(model) {
   const trimmed = String(model || '').trim().replace(/\/+$/, '');
   if (!trimmed) return '';
-  const tail = trimmed.split('/').filter(Boolean).pop() || '';
+  let tail = trimmed.split('/').filter(Boolean).pop() || '';
+  tail = tail.replace(/\.gguf$/i, '')
+    // A shard suffix, then a quantisation tag. Both describe the file rather
+    // than the model, and a client should not have to type either.
+    .replace(/-0{0,4}\d+-of-0{0,4}\d+$/i, '')
+    .replace(/[.-](?:[IQ]Q?\d(?:_[A-Za-z0-9]+)*|[QF]\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32|MXFP4)$/i, '');
   const slug = tail.toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
@@ -1501,7 +1764,15 @@ function autoName(model) {
     editor.form.served_name = slug;
     if (editor.refs?.served_name) editor.refs.served_name.value = slug;
   }
-  editor.derived = { name: editor.form.name, served: editor.form.served_name };
+  // The engine key is carried through rather than rebuilt. It records whether
+  // the engine is still ours to derive, and it is written by maybeAdoptEngine
+  // and by applyEngine — assigning a fresh object here would forget a manual
+  // choice on the very next model change.
+  editor.derived = {
+    ...(previous.engine === undefined ? {} : { engine: previous.engine }),
+    name: editor.form.name,
+    served: editor.form.served_name,
+  };
 }
 
 /* --- what the model is ----------------------------------------------------
@@ -1518,7 +1789,11 @@ async function loadProfile() {
   const model = String(editor.form.model || '').trim();
   // A pooled engine reads the model from its head, which is the first node.
   const node = editor.form.pooled ? (editor.form.pool[0] || LOCAL) : editor.form.node;
-  const key = `${node}\u0000${model}\u0000${editor.form.pooled ? editor.form.pool.join(',') : ''}`;
+  // The engine is part of the key, not just the body: without it the
+  // short-circuit below would serve the previous engine's recommendation after
+  // a switch, and suppress the re-fetch that would have corrected it.
+  const key = `${editor.form.engine}\u0000${node}\u0000${model}\u0000`
+    + `${editor.form.pooled ? editor.form.pool.join(',') : ''}`;
   if (key === editor.profileFor) return;
 
   editor.profileFor = key;
@@ -1533,7 +1808,7 @@ async function loadProfile() {
     // The recommendation carries the profile it was built from, so one call
     // answers both "what is this" and "what should it be set to".
     const rec = await post('/servers/recommend', {
-      model, node, args: { ...editor.args },
+      model, node, engine: editor.form.engine, args: { ...editor.args },
       pool: editor.form.pooled ? editor.form.pool : [],
       // So an existing server's own container is not counted against itself.
       server_id: editor.id,
@@ -1561,14 +1836,14 @@ async function loadProfile() {
    have to know which of ~190 flags matter before a model will load. */
 
 /** Apply a set of {dest: value} through the form's own machinery.
- *  Going through state.flagIndex is not optional: the backend refuses a dest
+ *  Going through the ACTIVE engine's flag index is not optional: the backend refuses a dest
  *  this image does not have, so a flag that would 422 on save is skipped here
  *  with a word about it instead. */
 function applyArgs(args) {
   const missing = [];
   let applied = 0;
   for (const [dest, value] of Object.entries(args || {})) {
-    const arg = state.flagIndex.get(dest);
+    const arg = indexOf().get(dest);
     if (!arg) {
       missing.push(dest);
       continue;
@@ -1611,8 +1886,8 @@ function applyRecommendation() {
   const { applied, missing } = applyArgs(rec.args);
   const envApplied = applyEnv(rec.env);
   if (missing.length) {
-    toast(`This vLLM build has no ${missing.join(', ')}; the rest was applied.`,
-      { level: 'warn' });
+    toast(`This ${engineLabel(currentEngine())} build has no ${missing.join(', ')}; `
+      + 'the rest was applied.', { level: 'warn' });
   }
   const parts = [];
   if (applied) parts.push(`${applied} flag${applied === 1 ? '' : 's'}`);
@@ -1651,10 +1926,27 @@ function renderRecommendation(options = {}) {
     .filter(([name, value]) => currentEnv[name] !== value);
   const outstanding = pending.length + pendingEnv.length;
 
+  // A refusal that names the engine which WOULD serve this model is one click
+  // from a working configuration, and leaving the operator to find the dropdown
+  // themselves is the difference between a dead end and a next step. It is
+  // offered only where the backend was certain — GGUF weights and nothing else,
+  // or safetensors and nothing else — never inferred from a name.
+  // Offered only when the backend was certain, and `ok` is how it says so: the
+  // llama.cpp advisor sets engine_hint='vllm' whenever it cannot open the file,
+  // which is the ordinary state of a repo that has not been pulled yet — and a
+  // primary "Switch to vLLM" button on a model that is still downloading is
+  // advice pointing the wrong way.
+  const hint = !rec.ok && rec.engine_hint && rec.engine_hint !== editor.form.engine
+    ? rec.engine_hint : '';
+
   mount(host, h('div', { class: `serve-rec lv-${recLevelClass(rec.level)}` },
     h('div', { class: 'sr-head' },
       h('strong', null, rec.headline),
       h('span', { class: 'spacer' }),
+      hint
+        ? h('button', { class: 'btn-primary btn-sm', onClick: () => applyEngine(hint) },
+          `Switch to ${engineLabel(hint)}`)
+        : null,
       rec.ok && outstanding
         ? h('button', { class: 'btn-primary btn-sm', onClick: applyRecommendation },
           `Apply ${outstanding} setting${outstanding === 1 ? '' : 's'}`)
@@ -1692,7 +1984,7 @@ function renderRecommendation(options = {}) {
       : null));
 }
 
-const flagOf = (dest) => state.flagIndex.get(dest)?.flag || `--${dest.replace(/_/g, '-')}`;
+const flagOf = (dest) => indexOf().get(dest)?.flag || `--${dest.replace(/_/g, '-')}`;
 
 const formatValue = (value) => (value === true ? '' : String(value));
 
@@ -1721,13 +2013,33 @@ function profileFacts(profile) {
 
 function profileFlags(profile) {
   const flags = [];
-  if (profile.supported === false) flags.push(badge('failed', 'architecture not in this image'));
-  if (profile.custom_sampler) flags.push(badge('starting', 'one machine only'));
-  if (profile.runner === 'pooling') flags.push(badge('starting', 'embeddings, not chat'));
+  const llamacpp = currentEngine() === 'llamacpp';
+  // Every one of these except the GGUF badge is a question about what THIS
+  // vLLM image can construct, and none of them is the question a llama.cpp
+  // server is asking. `supported` in particular reads the vLLM architecture
+  // registry, so under llama.cpp it would report a red failure about a build
+  // that is not the one running the model.
+  if (!llamacpp && profile.supported === false) {
+    flags.push(badge('failed', 'architecture not in this image'));
+  }
+  if (!llamacpp && profile.custom_sampler) flags.push(badge('starting', 'one machine only'));
+  if (!llamacpp && profile.runner === 'pooling') {
+    flags.push(badge('starting', 'embeddings, not chat'));
+  }
   if (profile.is_multimodal) flags.push(badge('info', 'multimodal'));
-  if (profile.requires_remote_code) flags.push(badge('starting', 'needs trust-remote-code'));
+  if (!llamacpp && profile.requires_remote_code) {
+    flags.push(badge('starting', 'needs trust-remote-code'));
+  }
   if (profile.is_adapter) flags.push(badge('failed', 'LoRA adapter, not a model'));
-  if (profile.has_gguf && !profile.has_safetensors) flags.push(badge('failed', 'GGUF only'));
+  // The single most inverted line on this page before there were two engines.
+  // GGUF-only is a hard failure for vLLM and the success condition for
+  // llama.cpp — the same fact, and opposite verdicts.
+  if (profile.has_gguf && !profile.has_safetensors) {
+    flags.push(llamacpp ? badge('running', 'GGUF') : badge('failed', 'GGUF only'));
+  }
+  if (llamacpp && profile.has_safetensors && !profile.has_gguf) {
+    flags.push(badge('failed', 'safetensors — llama.cpp needs GGUF'));
+  }
   if (profile.num_experts) flags.push(badge('plain', `${profile.num_experts} experts`));
   // rope_kind is worked out on the server, where the two spellings and the
   // nested-by-layer-type shape are already untangled.
@@ -1764,8 +2076,13 @@ function renderProfile(options = {}) {
   }
 
   const adapter = profile.is_adapter;
-  const pooling = profile.runner === 'pooling';
-  const unsupported = profile.supported === false;
+  // Both of these describe what THIS vLLM image will do with the repo — one
+  // reads its architecture registry, the other its runner resolution — and
+  // llama.cpp decides neither the same way. Under it they are simply not
+  // findings, rather than findings with different wording.
+  const vllm = currentEngine() === 'vllm';
+  const pooling = vllm && profile.runner === 'pooling';
+  const unsupported = vllm && profile.supported === false;
   mount(host, h('div', { class: `serve-profile${adapter || unsupported ? ' bad' : ''}` },
     h('div', { class: 'sp-head' },
       h('strong', null, 'What this model is'),
@@ -1803,9 +2120,24 @@ async function openEditor(server, prefill = {}) {
   state.mode = 'edit';
   closeSync();
   const pool = poolOf(server);
+  // An existing definition keeps the engine it was saved with, always. Its model
+  // reference may say 'gguf' or may not, and either way the operator already
+  // made this decision once — re-deciding it on open would flip a working server
+  // under them.
+  const engine = server?.engine || DEFAULT_ENGINE;
   state.editor = {
     id: server?.id ?? null,
+    // A LIVE POINTER into argsByEngine, not a copy. Every reader either takes it
+    // at control-build time or goes through state.editor.args, so swapping the
+    // pointer and rebuilding the form is all an engine change needs.
     args: { ...(server?.args || {}) },
+    // What was typed for the engines that are not selected. Seeded from the
+    // row's own stash so a definition edited, switched, saved and reopened comes
+    // back with both sets intact.
+    argsByEngine: {
+      ...(server?.args_by_engine || {}),
+      [engine]: { ...(server?.args || {}) },
+    },
     verdict: null,
     plan: null,
     planning: false,
@@ -1816,9 +2148,19 @@ async function openEditor(server, prefill = {}) {
     // The basics are plain inputs rather than generated flags, so autofill needs
     // its own handles on them.
     refs: {},
-    // What the currently selected model derived. A field still holding this is
-    // fair game to refill; anything else is the user's and is left alone.
+    // What the currently selected model derived — name, served name, and now the
+    // engine. A field still holding this is fair game to refill; anything else
+    // is the user's and is left alone.
     derived: null,
+    // The machines a pooled definition named, held while an engine that cannot
+    // pool is selected so switching back restores them rather than silently
+    // converting a three-machine server into a single-node one.
+    stashedPool: pool.length > 1 ? [...pool] : [],
+    // Which render the form on screen belongs to; see applyFilter.
+    generation: 0,
+    // The question the outstanding budget check was asked, so a slower answer
+    // for a previous engine cannot land after a newer one.
+    safetyFor: '',
     // What the files beside the chosen model's weights say it is, and what
     // that implies for the handful of flags that decide whether it starts.
     profile: null,
@@ -1832,6 +2174,7 @@ async function openEditor(server, prefill = {}) {
     budgetFor: null,
     form: {
       name: server?.name || '',
+      engine,
       node: server?.node || LOCAL,
       pooled: pool.length > 0,
       pool,
@@ -1845,20 +2188,71 @@ async function openEditor(server, prefill = {}) {
     },
   };
 
+  // A new definition arriving with a model already chosen — the Models page's
+  // Serve button, or a deep link — settles its engine BEFORE anything is
+  // fetched or drawn. Doing it after would paint the form from one engine's
+  // schema and then rebuild it from another's while the operator watched.
+  if (!server && state.editor.form.model) {
+    const wanted = engineForModel(state.editor.form.model);
+    if (wanted && wanted !== state.editor.form.engine) state.editor.form.engine = wanted;
+  }
+  if (!state.schemas[state.editor.form.engine]) {
+    const loaded = await schemaFor(state.editor.form.engine);
+    if (state.mode !== 'edit' || !state.editor) return;
+    if (!loaded) {
+      // A saved server keeps the engine it was saved with, always. Falling back
+      // here would turn a transient failure on GET /servers/schema into a
+      // llama.cpp definition silently rewritten to vLLM on the next Save —
+      // with its flags dropped as unknown. Only a NEW definition, whose engine
+      // was merely inferred from a model name, falls back.
+      if (server) {
+        closeEditor();
+        toast(`${engineLabel(state.editor?.form.engine || '')} is not available right now, `
+          + 'so this server cannot be edited without changing what it is.',
+        { level: 'danger', title: 'Engine unavailable' });
+        return;
+      }
+      state.editor.form.engine = DEFAULT_ENGINE;
+    }
+  }
+  state.editor.args = argsFor(state.editor.form.engine);
+
   await Promise.all([loadPaths(), loadCluster(), server ? null : suggest()]);
   if (state.mode !== 'edit' || state.stopped) return;
-  // A new definition arriving with a model already chosen — the Models page's
-  // Serve button, or a preset — gets its names before it is ever shown. An
-  // existing server keeps whatever it was saved with.
+  // The names derive from the model, and are only ever refilled while they still
+  // hold what a previous model put there.
   if (!server && state.editor.form.model) autoName(state.editor.form.model);
+  syncEnginePlacement();
   renderEditor();
   scheduleSafety();
   if (state.editor.form.pooled) runPlan();
 }
 
+/** The engine a model reference can only be served by, or '' for "no opinion".
+ *
+ *  GGUF is the one unambiguous signal available before anything is read off
+ *  disk: vLLM cannot load the format at all, so a reference naming it has
+ *  exactly one answer. The reverse is deliberately NOT inferred — a repo id
+ *  with no 'gguf' in it may still be a GGUF repo, and guessing vLLM for it
+ *  would fight an operator who has just chosen llama.cpp on purpose. */
+function engineForModel(model) {
+  const text = String(model || '').trim();
+  if (!text) return '';
+  return GGUF_HINT.test(text) ? 'llamacpp' : '';
+}
+
+/** The argument set belonging to one engine, created on first use.
+ *  Returns the stored object itself so `editor.args` stays a live pointer. */
+function argsFor(engine) {
+  const editor = state.editor;
+  if (!editor.argsByEngine[engine]) editor.argsByEngine[engine] = {};
+  return editor.argsByEngine[engine];
+}
+
 async function suggest() {
   try {
-    const suggestion = await get('/servers/suggest');
+    const engine = state.editor?.form.engine || DEFAULT_ENGINE;
+    const suggestion = await get(`/servers/suggest?engine=${encodeURIComponent(engine)}`);
     if (!state.editor) return;
     state.editor.form.port = state.editor.form.port || suggestion.port;
     state.editor.form.image = state.editor.form.image || suggestion.image;
@@ -1866,6 +2260,91 @@ async function suggest() {
     console.error('port suggestion failed', error);
   }
 }
+
+/** Switch the editor to another engine.
+ *
+ *  Deliberately mirrors applyPreset's tail — invalidate the profile, re-check
+ *  the memory verdict, re-plan if pooled — and adds the four things only an
+ *  engine change needs: the schema, the argument pointer, the registries the
+ *  form appends to, and a full redraw. */
+async function applyEngine(next, { manual = true } = {}) {
+  const editor = state.editor;
+  if (!editor || editor.form.engine === next) return;
+  if (!await schemaFor(next)) {
+    // Put the select back where it was: the engine could not be loaded, so the
+    // form must not claim to be showing it.
+    renderEditor();
+    return;
+  }
+  if (state.mode !== 'edit' || !state.editor) return;
+
+  editor.form.engine = next;
+  editor.args = argsFor(next);
+  // The suggested image belongs to the engine, and suggest() only fills an empty
+  // box — so an image left at another engine's default has to be cleared for the
+  // new suggestion to land. An image the operator typed is theirs and stays.
+  const previousDefault = state.engines.find((e) => e.image === editor.form.image);
+  if (!editor.form.image || previousDefault) {
+    editor.form.image = engineInfo(next).image || '';
+  }
+  syncEnginePlacement();
+  renderEditor();
+  if (manual) {
+    // Once chosen by hand, the choice stops being derivable — see autoName's
+    // `ours` test, which this marks as no longer ours.
+    editor.derived = { ...(editor.derived || {}), engine: null };
+  }
+  editor.profileFor = '';
+  loadProfile();
+  scheduleSafety();
+  if (editor.form.pooled) schedulePlan();
+
+  // What is on disk is a different list for each engine — a repo id for vLLM,
+  // a .gguf file for llama.cpp — so the pickers are refilled, then re-synced.
+  // Deliberately last and unawaited: the form is already correct without it,
+  // and a slow cache scan must not hold the redraw.
+  loadPaths().then(() => {
+    if (state.mode !== 'edit' || !state.editor || state.editor.form.engine !== next) return;
+    for (const sync of state.editor.pathViews) sync();
+  });
+}
+
+/** Pooling is one engine's feature, so selecting the other has to actually turn
+ *  it off — not merely hide the control. `save()` writes pool_nodes from
+ *  form.pooled and renderFootActions gates Save & start on a pool plan, so a
+ *  hidden-but-still-true flag would post a pooled llama.cpp definition and
+ *  disable the button that could fix it. */
+function syncEnginePlacement() {
+  const editor = state.editor;
+  if (!editor) return;
+  if (enginePools(editor.form.engine)) {
+    // Coming back to an engine that pools: restore the machines the definition
+    // named. Without this a vLLM -> llama.cpp -> vLLM round trip silently
+    // converted a three-machine pooled server into a single-node one, and the
+    // only sign was that Placement had reset itself.
+    if (!editor.form.pooled && editor.stashedPool?.length > 1) {
+      editor.form.pool = [...editor.stashedPool];
+      editor.form.pooled = true;
+    }
+    return;
+  }
+  if (editor.form.pooled) {
+    editor.stashedPool = [...editor.form.pool];
+    editor.form.pooled = false;
+    editor.form.pool = [];
+    editor.plan = null;
+  }
+}
+
+/* Whether this engine can be split across machines.
+   Defaults to FALSE for a name the registry does not carry, which is the safe
+   direction: GET /servers/engines is fetched with a .catch, so a failed
+   request leaves only vLLM in the list — and treating the unknown as capable
+   would offer Placement for a llama.cpp server and let save() post pool_nodes
+   the API then rejects. vLLM is named explicitly because it is the one engine
+   that is always present. */
+const enginePools = (name) => (name === DEFAULT_ENGINE
+  ? true : engineInfo(name).supports_pooling === true);
 
 function closeEditor() {
   closeSync();
@@ -1876,6 +2355,26 @@ function closeEditor() {
 
 function renderEditor() {
   const editor = state.editor;
+  const schema = schemaOf(editor.form.engine);
+  if (!schema) return;
+
+  // Cleared HERE rather than in openEditor, and that is the point: these five
+  // registries are append-only — paramField, diskPicker and pathListControl all
+  // push into them — so a second render without a reset leaves setArg toggling
+  // the changed-highlight on detached elements and applyFilter walking two
+  // engines' worth of sections, hiding nodes that are no longer in the document.
+  // Making a clean registry a precondition of every render means no future
+  // caller has to remember. For the single-engine path this is a no-op:
+  // openEditor only ever called renderEditor once.
+  editor.fields = new Map();
+  editor.setters = new Map();
+  editor.sections = [];
+  editor.searchable = [];
+  editor.pathViews = [];
+  // Bumped on every render, so a debounced callback queued against the previous
+  // form can tell that it is no longer the form on screen.
+  editor.generation = (editor.generation || 0) + 1;
+
   const input = (key, props = {}) => {
     const el = h('input', {
       type: 'text',
@@ -1898,7 +2397,7 @@ function renderEditor() {
   state.nodes.profileBox = h('div');
   state.nodes.recBox = h('div');
 
-  const flagCount = [...state.schema.featured, ...state.schema.advanced]
+  const flagCount = [...schema.featured, ...schema.advanced]
     .reduce((total, section) => total + section.flags.length, 0);
 
   // The field that gets typed most, so the one that most wants a list. Refresh
@@ -1909,6 +2408,10 @@ function renderEditor() {
     placeholder: 'org/repo, or a path the container can see',
     onChange: (next) => {
       editor.form.model = next;
+      // Before autoName, so the derived name is computed with the engine already
+      // settled — and only for a new definition, because an existing server's
+      // engine is a decision its operator already made.
+      maybeAdoptEngine(next);
       autoName(next);
       scheduleProfile();
       schedulePlan();
@@ -1926,15 +2429,24 @@ function renderEditor() {
       + 'downloads it the first time that server starts.',
   });
 
+  // Second in the grid, and everything after it is downstream of it: what
+  // Placement may offer, which image is suggested, which flags the form below
+  // is built from, and which presets are measurements of anything.
+  state.nodes.engineField = field('Engine', enginePicker(), {
+    help: engineHelp(editor.form.engine),
+  });
+  state.nodes.placementField = field('Placement', placementControl(), {
+    help: 'One engine on one machine, or one engine split by layer across several so their '
+      + 'memory adds up. Pooling costs a network hop per token per stage boundary and a fixed '
+      + 'world size; a model that fits on one box should stay on one box.',
+  });
+
   const basics = h('div', { class: 'param-grid' },
     field('Name', input('name', { placeholder: 'qwen3-chat' }), {
       help: 'Names the container and identifies the server everywhere in this dashboard.',
     }),
-    field('Placement', placementControl(), {
-      help: 'One engine on one machine, or one engine split by layer across several so their '
-        + 'memory adds up. Pooling costs a network hop per token per stage boundary and a fixed '
-        + 'world size; a model that fits on one box should stay on one box.',
-    }),
+    state.nodes.engineField,
+    state.nodes.placementField,
     state.nodes.nodeField,
     field('Model', modelPicker, {
       flag: 'positional',
@@ -1977,35 +2489,33 @@ function renderEditor() {
   const search = h('input', {
     type: 'search',
     placeholder: `Filter ${flagCount} flags by name or help text…`,
-    onInput: debounce((event) => applyFilter(event.target.value), 160),
+    onInput: (() => {
+      // The generation is captured now, when the box is built, not read when
+      // the debounce fires.
+      const generation = editor.generation;
+      return debounce((event) => applyFilter(event.target.value, generation), 160);
+    })(),
   });
 
   mount(state.main,
     panel(editor.id ? `Edit ${editor.form.name}` : 'New server', {
-      sub: `${state.schema.image} · vLLM ${state.schema.vllm_version}`,
+      sub: `${schema.image} · ${schema.label || engineLabel(editor.form.engine)} `
+        + `${schema.version || schema.vllm_version || ''}`.trim(),
       actions: h('button', { onClick: closeEditor }, 'Cancel'),
       body: h('div', { class: 'serve-form' },
         basics,
         state.nodes.profileBox,
         state.nodes.recBox,
         state.nodes.poolBox,
-        h('div', { class: 'param-section' },
-          h('h3', null, 'Presets'),
-          h('p', { class: 'blurb' },
-            'Two of these are configurations that have actually run on this box; the third is '
-            + 'derived from them. Applying one sets only the flags it names.'),
-          h('div', { class: 'serve-presets' }, PRESETS.map((preset) => h('button', {
-            class: 'serve-preset',
-            onClick: () => applyPreset(preset),
-          }, h('b', null, preset.title), h('span', null, preset.note))))),
+        presetSection(editor.form.engine),
         h('div', { class: 'param-search' }, search),
-        state.schema.featured.map((section) => paramSection(section)),
+        schema.featured.map((section) => paramSection(section)),
         h('div', { class: 'param-section' },
           h('h3', null, 'All other parameters'),
           h('p', { class: 'blurb' },
             'Every remaining flag this image accepts, grouped the way vLLM groups them. '
-            + `${state.schema.managed.join(', ')} are set by the dashboard and are not listed.`),
-          state.schema.advanced.map((section) => paramSection(section, { collapsed: true })))),
+            + `${schema.managed.join(', ')} are set by the dashboard and are not listed.`),
+          schema.advanced.map((section) => paramSection(section, { collapsed: true })))),
     }),
     h('div', { class: 'serve-foot' }, state.nodes.safety, state.nodes.footActions));
 
@@ -2015,6 +2525,101 @@ function renderEditor() {
   renderProfile();
   renderRecommendation();
   loadProfile();
+}
+
+/* --- the engine ---------------------------------------------------------- */
+
+/** Which inference engine runs this definition.
+ *
+ *  A plain select rather than a segmented control, because the list comes from
+ *  the backend and is not fixed at two: an engine this build does not have
+ *  simply is not in it. A saved server whose engine has since been removed keeps
+ *  its own name here rather than silently becoming something else, the same way
+ *  the node picker treats a de-registered peer. */
+function enginePicker() {
+  const editor = state.editor;
+  const choices = state.engines.length
+    ? state.engines
+    : [{ name: DEFAULT_ENGINE, label: engineLabel(DEFAULT_ENGINE) }];
+
+  const select = h('select', {
+    onChange: (event) => applyEngine(event.target.value),
+  },
+  choices.map((engine) => h('option', {
+    value: engine.name,
+    selected: engine.name === editor.form.engine,
+  }, engine.version && engine.version !== 'unknown'
+    ? `${engine.label} ${engine.version}`
+    : engine.label)),
+  choices.some((engine) => engine.name === editor.form.engine)
+    ? null
+    : h('option', { value: editor.form.engine, selected: true },
+      `${editor.form.engine} — not available in this build`));
+
+  return select;
+}
+
+function engineHelp(engine) {
+  if (engine === 'llamacpp') {
+    return 'llama.cpp serves GGUF, one file at a time, and can run a model larger than the '
+      + 'accelerator by leaving some layers on the CPU. It declares no memory fraction — '
+      + 'what it takes is worked out from the file and --ctx-size. Every flag below comes '
+      + "from llama-server's own help, and pooling across machines is vLLM's alone.";
+  }
+  return 'vLLM serves safetensors and cannot read GGUF. It reserves a fraction of the '
+    + 'node\'s memory up front — that fraction is the memory decision — and it is the '
+    + 'engine that can be pooled across machines. Choosing a .gguf model switches this '
+    + 'to llama.cpp for you.';
+}
+
+function presetSection(engine) {
+  const presets = presetsFor(engine);
+  if (!presets.length) return null;
+  const blurb = engine === 'vllm'
+    ? 'Two of these are configurations that have actually run on this box; the third is '
+      + 'derived from them. Applying one sets only the flags it names.'
+    : 'Starting points rather than measurements: what a llama.cpp launch costs depends on '
+      + 'the .gguf, so these carry the intent and the memory verdict below carries the '
+      + 'number. Applying one sets only the flags it names.';
+  return h('div', { class: 'param-section' },
+    h('h3', null, 'Presets'),
+    h('p', { class: 'blurb' }, blurb),
+    h('div', { class: 'serve-presets' }, presets.map((preset) => h('button', {
+      class: 'serve-preset',
+      onClick: () => applyPreset(preset),
+    }, h('b', null, preset.title), h('span', null, preset.note)))));
+}
+
+/** Adopt the engine a newly chosen model implies — while the choice is still
+ *  ours to make.
+ *
+ *  The test is the one autoName already uses for the derived name: a field is
+ *  still ours while it holds what the PREVIOUS model put there. That forgives,
+ *  where a plain "the user touched it once" flag would not — set it back by
+ *  hand and the form starts deriving again. An existing server never enters
+ *  here at all. */
+function maybeAdoptEngine(model) {
+  const editor = state.editor;
+  if (!editor || editor.id !== null) return;
+  const wanted = engineForModel(model);
+  if (!wanted || wanted === editor.form.engine) return;
+
+  const previous = editor.derived || {};
+  // `engine: null` is what applyEngine writes when the operator chooses by
+  // hand, and it can never equal a real engine name — so a manual pick stays.
+  const ours = !('engine' in previous) || previous.engine === editor.form.engine;
+  if (!ours) return;
+
+  applyEngine(wanted, { manual: false }).then(() => {
+    if (state.mode !== 'edit' || !state.editor) return;
+    // The first switch of a session awaits a real schema fetch, and the model
+    // field is editable throughout. If it has moved on to something this engine
+    // is not the answer for, the adoption is stale and saying so would be wrong.
+    if (engineForModel(state.editor.form.model) !== wanted) return;
+    state.editor.derived = { ...(state.editor.derived || {}), engine: wanted };
+    toast(`${model.split('/').pop()} is GGUF, so this is a llama.cpp server. `
+      + 'Change the Engine field if that is not what you want.', { level: 'info' });
+  });
 }
 
 /** A select over the registry. Unreachable peers stay selectable: a node that
@@ -2078,6 +2683,10 @@ function placementControl() {
 
 function setPooled(pooled) {
   const editor = state.editor;
+  // Nothing may turn pooling on for an engine that has none — not a stale
+  // handler, not a queued debounce. The control is hidden, but the guard is
+  // what makes `form.pooled` trustworthy to save() and renderFootActions.
+  if (pooled && !enginePools(editor.form.engine)) return;
   if (editor.form.pooled === pooled) return;
   editor.form.pooled = pooled;
   if (pooled && editor.form.pool.length < 2) editor.form.pool = defaultPool();
@@ -2102,10 +2711,15 @@ function defaultPool() {
 }
 
 function syncPlacement() {
-  const pooled = state.editor.form.pooled;
+  const pools = enginePools(state.editor.form.engine);
+  const pooled = pools && state.editor.form.pooled;
   for (const [index, button] of (state.nodes.segButtons || []).entries()) {
     button.setAttribute('aria-pressed', String(pooled === (index === 1)));
   }
+  // Hidden rather than disabled when the engine cannot pool at all: a greyed
+  // two-way control with one reachable side is a question that was never a
+  // question. The Node picker stays — a llama.cpp server still runs somewhere.
+  if (state.nodes.placementField) state.nodes.placementField.hidden = !pools;
   // The single-node picker is not merely irrelevant when pooling: the backend
   // ignores `node` entirely for a pooled server, so leaving it on screen would
   // invite a choice that has no effect.
@@ -2361,7 +2975,7 @@ function missingImageNotice(names) {
     'Every rank loads the model itself, so each machine in the pool needs the image locally. '
     + 'Pull it on each of those machines and re-plan:',
     h('div', { class: 'cmdbox', style: { marginTop: '6px' } },
-      `docker pull ${state.schema?.image || 'nvcr.io/nvidia/vllm:26.07-py3'}`));
+      `docker pull ${schemaOf()?.image || 'the engine image'}`));
 }
 
 function syncModelTo(name, button) {
@@ -2493,8 +3107,8 @@ function mountPoolSafety() {
 function applyPreset(preset) {
   const { missing } = applyArgs(preset.args);
   if (missing.length) {
-    toast(`This vLLM build has no ${missing.join(', ')}; the rest of the preset was applied.`,
-      { level: 'warn' });
+    toast(`This ${engineLabel(currentEngine())} build has no ${missing.join(', ')}; `
+      + 'the rest of the preset was applied.', { level: 'warn' });
   }
   scheduleSafety();
   if (state.editor.form.pooled) schedulePlan();
@@ -2527,21 +3141,37 @@ async function checkSafety() {
     }
     state.editor.verdict = null;
     mount(state.nodes.safety,
-      remoteLaunchNotice(node, state.editor.args.gpu_memory_utilization));
+      remoteLaunchNotice(node, state.editor.args.gpu_memory_utilization,
+        state.editor.form.engine));
     renderFootActions();
     return;
   }
   state.editor.budgetFor = null;
-  const util = state.editor.args.gpu_memory_utilization;
-  const query = util === undefined || util === null || util === '' ? '' : `?util=${util}`;
+  // Keyed against the question it asked, the way loadProfile keys on profileFor
+  // and runPlan on planKey. Without it a slower verdict for the previous engine
+  // or node lands after a newer one and drives the Save & start gate.
+  const asked = `${state.editor.form.engine}\u0000${state.editor.form.node}`
+    + `\u0000${state.editor.form.model}\u0000${JSON.stringify(state.editor.args)}`;
+  state.editor.safetyFor = asked;
+  // The whole argument set, not one number: llama.cpp has no fraction to send,
+  // and even vLLM's fraction understates a config that sets --kv-cache-memory.
   let verdict;
   try {
-    verdict = await get(`/system/budget/check${query}`);
+    verdict = await post('/system/budget/check', {
+      engine: state.editor.form.engine,
+      args: { ...state.editor.args },
+      // Separately, because it is a managed flag and never lives in args — and
+      // an engine priced from its weights file cannot be sized without it.
+      model: state.editor.form.model,
+      node: state.editor.form.node,
+      // So an existing server's own container is not counted against itself.
+      server_id: state.editor.id,
+    });
   } catch (error) {
     console.error('budget check failed', error);
     return;
   }
-  if (state.mode !== 'edit' || !state.editor) return;
+  if (state.mode !== 'edit' || !state.editor || state.editor.safetyFor !== asked) return;
   state.editor.verdict = verdict;
   mount(state.nodes.safety, verdictNotice(verdict));
   renderFootActions();
@@ -2613,6 +3243,7 @@ async function save({ start = false, force = false } = {}) {
 
   const payload = {
     name: form.name.trim(),
+    engine: form.engine,
     node: form.node || LOCAL,
     // More than one name is what makes it pooled, and the first is the head.
     // The backend ignores `node` for placement once this is set.
@@ -2622,6 +3253,10 @@ async function save({ start = false, force = false } = {}) {
     served_name: form.served_name.trim(),
     image: form.image.trim() || null,
     args: { ...editor.args },
+    // What the other engines hold, so switching back after a save finds it
+    // still there. `args` above stays the authoritative set for the engine
+    // actually selected; this is only the editor's memory of the rest.
+    args_by_engine: { ...editor.argsByEngine, [form.engine]: { ...editor.args } },
     env: parseEnv(form.env),
     notes: form.notes,
     autostart: form.autostart,

@@ -8,14 +8,16 @@ import contextlib
 
 import pytest
 
-from app import docker_ctl, memguard, safety, telemetry
+from app import docker_ctl, engines, memguard, safety, telemetry
 
 
 class FakeDocker:
     """Stands in for the running-container view the watchdog surveys."""
 
-    def __init__(self, containers: dict[str, list[str] | None]):
+    def __init__(self, containers: dict[str, list[str] | None],
+                 entrypoints: dict[str, list[str]] | None = None):
         self.containers = containers
+        self.entrypoints = entrypoints or {}
         self.killed: list[str] = []
         self.restart_policies: dict[str, str] = {}
 
@@ -29,6 +31,7 @@ class FakeDocker:
             status="running",
             running=True,
             command=self.containers.get(name),
+            entrypoint=self.entrypoints.get(name),
         )
 
     async def kill(self, name, host=None):
@@ -60,8 +63,8 @@ async def until(predicate, timeout: float = 10.0) -> bool:
 
 @pytest.fixture
 def fake(monkeypatch):
-    def install(containers):
-        stub = FakeDocker(containers)
+    def install(containers, entrypoints=None):
+        stub = FakeDocker(containers, entrypoints)
         for method in ("ps", "state", "kill", "set_restart_policy", "inspect"):
             monkeypatch.setattr(memguard.docker_ctl, method, getattr(stub, method))
         return stub
@@ -69,8 +72,12 @@ def fake(monkeypatch):
     return install
 
 
+def ranked(victims):
+    return [name for name, _util, _bytes in victims]
+
+
 @pytest.mark.asyncio
-async def test_candidates_are_vllm_only_and_biggest_first(fake):
+async def test_candidates_are_engines_only_and_biggest_first(fake):
     fake(
         {
             "vllm-small": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.16"],
@@ -80,22 +87,51 @@ async def test_candidates_are_vllm_only_and_biggest_first(fake):
             "ray-head": ["ray", "start", "--head"],
         }
     )
-    victims = await memguard._candidates()
-    assert [name for name, _ in victims] == ["vllm-big", "vllm-small"]
+    assert ranked(await memguard._candidates()) == ["vllm-big", "vllm-small"]
 
 
 @pytest.mark.asyncio
 async def test_a_serve_container_with_no_util_flag_is_still_a_candidate(fake):
     fake({"vllm-plain": ["vllm", "serve", "m"]})
-    victims = await memguard._candidates()
-    assert [name for name, _ in victims] == ["vllm-plain"]
+    assert ranked(await memguard._candidates()) == ["vllm-plain"]
 
 
 @pytest.mark.asyncio
-async def test_nothing_is_killed_when_no_vllm_is_running(fake):
+async def test_nothing_is_killed_when_no_engine_is_running(fake):
     stub = fake({"llmd-heretic-xyz": ["heretic", "--model", "m"], "nginx": ["nginx"]})
     assert await memguard._candidates() == []
     assert stub.killed == []
+
+
+@pytest.mark.asyncio
+async def test_a_hand_launched_llama_server_is_a_candidate(fake):
+    """The failure this fixes is inverted, not merely incomplete.
+
+    Before the watchdog recognised a second engine, a llama-server holding tens
+    of gigabytes was not a candidate — so when the threshold was crossed the
+    watchdog killed the largest *vLLM* engine instead, which freed memory the
+    machine was not short of and left the actual offender untouched.
+    """
+    fake({
+        "llama-hand": ["llama-server", "-m", "/hf/big.gguf", "-ngl", "99"],
+        "vllm-small": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.16"],
+    })
+    assert "llama-hand" in ranked(await memguard._candidates())
+
+
+@pytest.mark.asyncio
+async def test_an_engine_hiding_in_its_images_entrypoint_is_seen(fake):
+    """The upstream llama.cpp server images put the binary in ENTRYPOINT and
+    leave bare flags in Cmd, so the command alone reads as no engine at all."""
+    stub = fake(
+        {"llama-upstream": ["-m", "/models/x.gguf", "-ngl", "99"]},
+        {"llama-upstream": ["/app/llama-server"]},
+    )
+    assert ranked(await memguard._candidates()) == ["llama-upstream"]
+    # And the fallback only ever ADDS: what docker calls the command is
+    # untouched, because every other parser in the codebase reads it directly.
+    assert (await stub.state("llama-upstream")).command == ["-m", "/models/x.gguf",
+                                                            "-ngl", "99"]
 
 
 @pytest.mark.asyncio
@@ -149,12 +185,45 @@ async def test_a_healthy_host_is_left_alone(fake, monkeypatch):
     assert stub.killed == []
 
 
-def test_the_watchdog_recognises_exactly_what_the_launch_guard_does():
-    # Both sides must agree, or the guard could budget for an engine the
-    # watchdog would refuse to kill.
-    command = ["vllm", "serve", "m", "--gpu-memory-utilization", "0.5"]
-    assert safety.is_vllm_command(command)
-    assert safety.parse_util(command) == 0.5
+@pytest.mark.parametrize(
+    "command,engine,util",
+    [
+        (["vllm", "serve", "m", "--gpu-memory-utilization", "0.5"], "vllm", 0.5),
+        (["llama-server", "-m", "/hf/x.gguf", "-ngl", "99"], "llamacpp", None),
+    ],
+)
+def test_the_watchdog_recognises_exactly_what_the_launch_guard_does(command, engine, util):
+    # Both sides must agree, or the guard budgets for an engine the watchdog
+    # would refuse to kill — which is not a gap but an inversion: the threshold
+    # is crossed, the offender survives, and something healthy dies instead.
+    # They agree by construction now, because both ask engines.recognise().
+    found = engines.recognise_argv(command)
+    assert found is not None and found.name == engine
+    assert found.declared_util(found.command_params(command)) == util
+
+
+def test_the_vllm_gate_was_not_widened():
+    """The predicate the budget and the watchdog shared for one engine is still
+    about that one engine. Widening it would have admitted a llama.cpp container
+    to every caller at once while `footprint` still priced it vLLM's way."""
+    assert safety.is_vllm_command(["vllm", "serve", "m"])
+    assert not safety.is_vllm_command(["llama-server", "-m", "x.gguf"])
+    assert safety.parse_util(["llama-server", "-m", "x.gguf", "-ngl", "99"]) is None
+
+
+def test_a_llamacpp_config_is_never_priced_at_vllms_default():
+    """The one mistake that would take the whole machine's launching down.
+
+    vLLM's pricer charges its default fraction to any argv with no utilisation
+    flag — which is every llama.cpp argv there is. On this box that is over
+    100 GiB, so a single mis-routed llama.cpp server would refuse every launch
+    after it.
+    """
+    total = 130_663_006_208
+    llama = engines.get("llamacpp")
+    priced = llama.footprint_bytes({"n_gpu_layers": "99"}, total)
+    assert priced != int(safety.default_util() * total)
+    assert priced < total
 
 
 @pytest.mark.asyncio
@@ -166,7 +235,7 @@ async def test_the_implicit_default_holder_is_killed_first(fake):
         "vllm-declared": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.52"],
         "vllm-implicit": ["vllm", "serve", "m"],
     })
-    assert [name for name, _ in await memguard._candidates()] == ["vllm-implicit", "vllm-declared"]
+    assert ranked(await memguard._candidates()) == ["vllm-implicit", "vllm-declared"]
 
 
 @pytest.mark.asyncio
@@ -178,8 +247,17 @@ async def test_an_explicit_kv_cache_outranks_a_small_fraction(fake):
         ],
         "vllm-mid": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.30"],
     })
-    ranked = [name for name, _ in await memguard._candidates()]
-    assert ranked[0] == "vllm-small-frac-big-kv"
+    assert ranked(await memguard._candidates())[0] == "vllm-small-frac-big-kv"
+
+
+def test_a_victim_with_no_fraction_is_named_by_what_it_holds():
+    """The kill notice reaches the operator through the history and the live
+    telemetry feed. Printing "util 0.92" for an engine that has no such flag
+    would put a fabricated number in both."""
+    starved = memguard.Starvation(kind="device", available_bytes=1024 ** 3,
+                                  threshold_bytes=2 * 1024 ** 3, pool_kind="discrete")
+    assert "util 0.52" in starved.reason("llmd-vllm-1", 0.52)
+    assert "holding 40960 MiB" in starved.reason("llmd-llamacpp-2", None, 40 * 1024 ** 3)
 
 
 def discrete_pool(free_bytes: int, total_bytes: int = 48 * 1024 ** 3):

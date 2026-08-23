@@ -152,8 +152,14 @@ if ! command -v docker >/dev/null; then
 else
     build_image() {
         local role="$1" tag="$2" dockerfile="$3" required="${4:-no}"
+        # Which base to build ON. Defaults to the vLLM base, which is right for
+        # three of the four images — they are all layers on top of the same vLLM
+        # container. The llama.cpp image is not: its upstream is a llama.cpp
+        # server build, and handing it an NGC vLLM base would produce an image
+        # with no llama-server in it at all.
+        local base="${5:-${VLLM_BASE:-}}"
         local base_arg=""
-        [ -n "${VLLM_BASE:-}" ] && base_arg="--build-arg BASE_IMAGE=$VLLM_BASE"
+        [ -n "$base" ] && base_arg="--build-arg BASE_IMAGE=$base"
         if docker image inspect "$tag" >/dev/null 2>&1; then
             note "$tag is already built"
             return
@@ -183,7 +189,9 @@ else
         'from app.config import settings
 print(f"HERETIC_TAG={settings.heretic_image!r}")
 print(f"FINETUNE_TAG={settings.finetune_image!r}")
-print(f"VLLM_TAG={settings.vllm_image!r}")')"
+print(f"VLLM_TAG={settings.vllm_image!r}")
+print(f"LLAMACPP_TAG={settings.llamacpp_image!r}")
+print(f"LLAMACPP_BASE={settings.llamacpp_base_image!r}")')"
     # Which vLLM the images are built on is a property of the machine, not a
     # constant: NGC is right on a Spark and cannot serve a tied-embedding model
     # under 4-bit quantisation anywhere else. app/images.py decides, and says why.
@@ -201,6 +209,10 @@ print(f"VLLM_BASE_WHY={why!r}")')"
     # request carrying tools. Build it on every node in the cluster — each rank
     # of a pooled engine runs it on its own machine.
     build_image "the vLLM image" "$VLLM_TAG" vllm.Dockerfile yes
+    # Optional in exactly the way Heretic and fine-tuning are: a box that only
+    # ever serves with vLLM never needs it. Note the fifth argument — this one
+    # does NOT sit on the vLLM base.
+    build_image llama.cpp "$LLAMACPP_TAG" llamacpp.Dockerfile no "$LLAMACPP_BASE"
     build_image Heretic "$HERETIC_TAG" heretic.Dockerfile
     build_image fine-tuning "$FINETUNE_TAG" finetune.Dockerfile
 fi

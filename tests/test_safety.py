@@ -404,3 +404,131 @@ async def test_a_restart_is_judged_against_the_memory_it_is_about_to_free(monkey
     restart = await safety.check_launch(0.34, replacing="llmd-vllm-44",
                                         params={"gpu_memory_utilization": 0.34})
     assert restart.ok, "the engine being replaced releases what the new one needs"
+
+
+# --- an engine that states its appetite in bytes --------------------------
+
+def _llamacpp_budget(monkeypatch, *, occupied_bytes=0, available_bytes=None):
+    """The budget survey, stubbed the way every other test in this file stubs
+    it — the docker seam plus the two telemetry reads."""
+    from app import docker_ctl, telemetry
+
+    async def ps(prefix=None, all_containers=True, host=None):
+        return []
+
+    async def state(name, host=None):
+        return docker_ctl.ContainerState(name=name, exists=False)
+
+    monkeypatch.setattr(safety.docker_ctl, "ps", ps)
+    monkeypatch.setattr(safety.docker_ctl, "state", state)
+    monkeypatch.setattr(telemetry, "read_gpu_processes", _no_processes(occupied_bytes))
+    monkeypatch.setattr(telemetry, "read_meminfo", lambda: telemetry.HostMemory(
+        total_bytes=TOTAL,
+        available_bytes=TOTAL - occupied_bytes if available_bytes is None else available_bytes,
+        free_bytes=TOTAL - occupied_bytes))
+
+
+def _served_gguf(tmp_path, name: str, gib: float):
+    """A .gguf where a server container could actually see it — under the output
+    directory, which is one of the two mounts host_path will open."""
+    from app.config import settings
+    from tests.test_gguf import write_gguf
+
+    root = settings.output_dir / f"safety-{tmp_path.name}"
+    root.mkdir(parents=True, exist_ok=True)
+    return write_gguf(root / name, file_bytes=int(gib * GIB))
+
+
+def _no_processes(used: int):
+    async def read():
+        from app.telemetry import GpuProcess
+
+        return [GpuProcess(pid=1, name="x", used_bytes=used)] if used else []
+    return read
+
+
+@pytest.mark.anyio
+async def test_a_llamacpp_launch_is_judged_in_bytes(monkeypatch, tmp_path):
+    """The policy is shared with the vLLM path — the same four Budget properties
+    in the same order — and only the prose differs. What must not leak across is
+    the vLLM pricer, which would charge this config the default fraction."""
+    model = _served_gguf(tmp_path, "m-Q4_K_M.gguf", 4.92)
+    _llamacpp_budget(monkeypatch)
+
+    verdict = await safety.check_launch(
+        None, engine="llamacpp",
+        params={"model": str(model), "n_gpu_layers": "99", "ctx_size": "8192"})
+    assert verdict.ok and verdict.level == "ok"
+    assert verdict.engine == "llamacpp"
+    # No fraction is handed back as advice: the form labels suggested_util as
+    # the flag to type, and llama.cpp has no such flag.
+    assert verdict.suggested_util is None
+    assert verdict.suggested_bytes > 0
+    assert "--gpu-memory-utilization" not in verdict.message
+    # requested_util exists for display only, exactly as heretic.py computes one.
+    assert 0 < verdict.requested_util < 1
+
+
+@pytest.mark.anyio
+async def test_a_llamacpp_launch_that_does_not_fit_is_blocked(monkeypatch, tmp_path):
+    model = _served_gguf(tmp_path, "huge-Q8_0.gguf", 110)
+    _llamacpp_budget(monkeypatch)
+    verdict = await safety.check_launch(
+        None, engine="llamacpp",
+        params={"model": str(model), "n_gpu_layers": "99", "ctx_size": "8192"})
+    assert not verdict.ok and verdict.level == "block"
+    # The advice names the levers that engine actually has.
+    assert "--n-gpu-layers" in verdict.message
+
+
+@pytest.mark.anyio
+async def test_an_unsized_llamacpp_launch_warns_rather_than_blessing_it(monkeypatch):
+    """Zero bytes would otherwise pass every threshold and come back "Fits",
+    which is a claim the guard has no basis for."""
+    _llamacpp_budget(monkeypatch)
+    verdict = await safety.check_launch(
+        None, engine="llamacpp", params={"model": "org/repo:Q4_K_M"})
+    assert verdict.ok and verdict.level == "warn"
+    assert "cannot be sized" in verdict.message
+
+
+@pytest.mark.anyio
+async def test_the_vllm_verdict_is_unchanged_by_the_second_engine(monkeypatch):
+    """Every existing message, the preface, and the two-decimal floor on the
+    suggestion are the observable contract. The bytes path is a separate
+    function precisely so none of this had to be re-derived."""
+    _llamacpp_budget(monkeypatch)
+    verdict = await safety.check_launch(0.30)
+    assert verdict.engine == "vllm"
+    assert verdict.suggested_bytes is None
+    assert "0.3" in verdict.message
+
+
+def test_the_byte_twins_agree_with_the_fractions_they_shadow():
+    """Added as independent expressions rather than defined in terms of each
+    other: `1 - r/t` and `(t - r)/t` can differ by one unit in the last place,
+    and free_util is floored to two decimals and handed to the operator as a
+    value to retype."""
+    b = budget([("llmd-vllm-1", 0.5)])
+    assert b.max_bytes == TOTAL - 32 * GIB
+    assert b.max_bytes / b.total_bytes == pytest.approx(b.max_util, abs=1e-9)
+    assert b.free_bytes_to_commit == b.max_bytes - b.occupied_bytes
+    assert b.free_bytes_to_commit / b.total_bytes == pytest.approx(b.free_util, abs=1e-9)
+    assert b.as_dict()["max_bytes"] == b.max_bytes
+
+
+def test_a_tenant_with_no_fraction_names_itself_by_what_it_holds():
+    """The verdict message joins these labels, and `{util:g}` on a None would
+    raise. For a tenant that does declare a fraction the label is
+    character-for-character the string the message used to build inline."""
+    declared = safety.Tenant(name="llmd-vllm-1", util=0.52, managed=True,
+                             bytes_committed=60 * GIB)
+    implied = safety.Tenant(name="llmd-vllm-2", util=0.92, managed=True,
+                            bytes_committed=110 * GIB, implicit=True)
+    bytes_only = safety.Tenant(name="llmd-llamacpp-3", util=None, managed=True,
+                               bytes_committed=40 * GIB, engine="llamacpp")
+    unsized = safety.Tenant(name="llama-hand", util=None, managed=False, engine="llamacpp")
+    assert declared.label == "llmd-vllm-1=0.52"
+    assert implied.label == "llmd-vllm-2=0.92 (implied)"
+    assert "40.0 GiB" in bytes_only.label
+    assert "size unknown" in unsized.label

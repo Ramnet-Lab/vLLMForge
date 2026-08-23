@@ -138,11 +138,17 @@ async def test_weights_larger_than_free_memory_is_a_block_not_a_setting(box):
 
 
 @pytest.mark.anyio
-async def test_gguf_only_is_a_block(box):
+async def test_gguf_only_is_a_block_for_vllm_and_a_route_to_the_other_engine(box):
+    """Still a block: this module recommends vLLM flags and vLLM genuinely
+    cannot read GGUF. What changed is that it stopped being a dead end — the
+    operator is one dropdown away from a configuration that works, and the
+    refusal now says so and names which one."""
     place, mp = box
     place(mp.Profile(reference="org/gguf", found=True, has_gguf=True, has_safetensors=False))
     rec = (await recommend.build("org/gguf")).to_dict()
     assert rec["ok"] is False and "GGUF" in rec["headline"]
+    assert rec["engine_hint"] == "llamacpp"
+    assert "llama.cpp" in rec["findings"][0]["text"]
 
 
 @pytest.mark.anyio

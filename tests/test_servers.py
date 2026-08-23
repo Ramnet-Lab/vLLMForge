@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app import db, servers, vllm_spec
+from app.config import settings
 
 
 async def _noop_publish(*a, **k):
@@ -153,7 +154,7 @@ def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
         "pool_nodes": ["local", "node2"],
     })
 
-    async def refused(pool, model="", args=None, replacing=None):
+    async def refused(pool, model="", args=None, replacing=None, image=""):
         return {
             "ok": False,
             "reason": "local: 0.92 would reserve more than is free",
@@ -198,7 +199,7 @@ def test_an_environment_failure_stays_a_502(monkeypatch):
         "pool_nodes": ["local", "node2"],
     })
 
-    async def no_image(pool, model="", args=None, replacing=None):
+    async def no_image(pool, model="", args=None, replacing=None, image=""):
         return {"ok": False, "reason": "ray image is not built on: node2", "nodes": []}
 
     monkeypatch.setattr(cluster, "plan", no_image)
@@ -287,3 +288,133 @@ async def test_a_pool_that_really_lost_a_rank_stops_the_ranks_still_holding_memo
     assert await servers.reap_partial_pools_once() == []
     assert await servers.reap_partial_pools_once() == []
     assert stopped == []
+
+
+# --- two engines ---------------------------------------------------------
+
+def test_an_existing_row_reads_back_as_vllm_and_keeps_its_container_name():
+    """The compatibility guarantee for every row already in an installed
+    database. The engine name IS the container kind, so a row that predates the
+    column has to yield the llmd-vllm-<id> name its running container already
+    has — otherwise the upgrade renames a live process out from under stop()."""
+    row = servers.create_server({"name": f"legacy-{db.now():.6f}", "model": "org/m",
+                                 "port": 8421})
+    try:
+        fetched = servers.get_server(int(row["id"]))
+        assert fetched["engine"] == "vllm"
+        assert servers.container_name(fetched) == f"llmd-vllm-{row['id']}"
+        assert servers.engine_for(fetched).name == "vllm"
+    finally:
+        servers.delete_server(int(row["id"]))
+
+
+def test_a_llamacpp_row_builds_a_llama_server_command():
+    row = servers.create_server({
+        "name": f"gguf-{db.now():.6f}", "engine": "llamacpp", "port": 8422,
+        "model": "/hf/hub/models--x/snapshots/abc/m-Q4_K_M.gguf",
+        "served_name": "my-model", "args": {"n_gpu_layers": 40, "ctx_size": 8192},
+    })
+    try:
+        fetched = servers.get_server(int(row["id"]))
+        assert servers.container_name(fetched) == f"llmd-llamacpp-{row['id']}"
+        command = servers.build_command(fetched)
+        assert command[0] == "llama-server"
+        # served_name becomes each engine's own flag for it.
+        assert command[command.index("--alias") + 1] == "my-model"
+        assert command[command.index("--n-gpu-layers") + 1] == "40"
+        assert "--served-model-name" not in command
+        # No vLLM-only environment leaks in.
+        env = servers.build_env(fetched)
+        assert "VLLM_ALLOW_RUNTIME_LORA_UPDATING" not in env
+        assert env["HF_HOME"] == "/hf" and env["LLAMA_CACHE"] == "/hf/llamacpp"
+        # And the image follows the engine rather than defaulting to vLLM's.
+        assert servers.image_of(fetched) == settings.llamacpp_image
+    finally:
+        servers.delete_server(int(row["id"]))
+
+
+def test_switching_engine_keeps_the_other_engines_arguments():
+    """`args` stays authoritative for the active engine; the stash is the
+    editor's memory of the rest. Switching and switching back must not throw
+    away what was typed either time."""
+    row = servers.create_server({
+        "name": f"switch-{db.now():.6f}", "model": "org/m", "port": 8423,
+        "args": {"gpu_memory_utilization": 0.4},
+    })
+    try:
+        sid = int(row["id"])
+        assert servers.get_server(sid)["args_by_engine"] == {
+            "vllm": {"gpu_memory_utilization": 0.4}}
+
+        servers.update_server(sid, {"engine": "llamacpp", "model": "/hf/m.gguf",
+                                    "args": {"n_gpu_layers": 40}})
+        after = servers.get_server(sid)
+        assert after["engine"] == "llamacpp"
+        assert after["args"] == {"n_gpu_layers": 40}
+        assert after["args_by_engine"]["vllm"] == {"gpu_memory_utilization": 0.4}
+
+        # Back again with no args named: the stash answers, not the other
+        # engine's flags carried forward.
+        servers.update_server(sid, {"engine": "vllm", "model": "org/m"})
+        back = servers.get_server(sid)
+        assert back["args"] == {"gpu_memory_utilization": 0.4}
+        assert back["args_by_engine"]["llamacpp"] == {"n_gpu_layers": 40}
+    finally:
+        servers.delete_server(int(row["id"]))
+
+
+def test_a_pooled_llamacpp_definition_is_refused_at_the_api():
+    """Pooling is vLLM's pipeline-parallel path. app/cluster.py has no llama.cpp
+    analogue, so the refusal is at the boundary rather than a half-port."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    response = client.post("/api/servers", json={
+        "name": f"pooled-gguf-{db.now():.6f}", "engine": "llamacpp",
+        "model": "/hf/m.gguf", "port": 8424, "pool_nodes": ["local", "node2"]})
+    assert response.status_code == 422
+    assert "cannot be pooled" in response.text
+
+
+def test_a_llamacpp_args_dict_is_validated_against_llama_cpp():
+    """Both the create and the patch path. The patch one has to load the row
+    first — without it, every edit to a llama.cpp server came back as 'unknown
+    parameter for this vLLM build'."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    created = client.post("/api/servers", json={
+        "name": f"validated-{db.now():.6f}", "engine": "llamacpp",
+        "model": "/hf/m.gguf", "port": 8425, "args": {"n_gpu_layers": 40}})
+    assert created.status_code == 201, created.text
+    row = created.json()
+    try:
+        patched = client.patch(f"/api/servers/{row['id']}", json={"args": {"ctx_size": 4096}})
+        assert patched.status_code == 200, patched.text
+        # A vLLM flag on a llama.cpp row is refused, not silently accepted.
+        rejected = client.patch(f"/api/servers/{row['id']}",
+                                json={"args": {"gpu_memory_utilization": 0.5}})
+        assert rejected.status_code == 422
+        assert "llama.cpp build" in rejected.text
+    finally:
+        servers.delete_server(int(row["id"]))
+
+
+def test_the_schema_endpoint_answers_per_engine():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    # No parameter returns exactly what it always returned.
+    assert client.get("/api/servers/schema").json()["engine"] == "vllm"
+    llama = client.get("/api/servers/schema?engine=llamacpp").json()
+    assert llama["engine"] == "llamacpp" and llama["featured"]
+    assert client.get("/api/servers/suggest?engine=llamacpp").json()["image"] \
+        == settings.llamacpp_image
+    names = [e["name"] for e in client.get("/api/servers/engines").json()["engines"]]
+    assert names == ["vllm", "llamacpp"]

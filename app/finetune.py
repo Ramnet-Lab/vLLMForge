@@ -423,7 +423,10 @@ async def check_memory(config: FinetuneConfig) -> dict:
     budget = await safety.current_budget()
     payload = budget.as_dict()
     need, params_b, basis = estimate_bytes(config)
-    tenants = ", ".join(f"{t.name}={t.util:g}" for t in budget.tenants) or "none"
+    # `label` rather than the fraction: a tenant whose engine declares no
+    # utilisation has util=None, and formatting that with :g raises. For one
+    # that does declare it the label is the identical string.
+    tenants = ", ".join(t.label for t in budget.tenants) or "none"
     util = need / budget.total_bytes if budget.total_bytes else 0.0
 
     if params_b is None:
@@ -764,9 +767,38 @@ def serve_plan(job: dict, *, name: str) -> dict:
 
     config = meta.get("config") or {}
     export = meta.get("export") or result.get("export") or "adapter"
+
+    # A gguf export is a llama.cpp model, and until there was a llama.cpp engine
+    # this branch did not exist: "gguf".startswith("merged") is False, so a gguf
+    # run fell through to the adapter branch, found no <run_dir>/adapter, and
+    # the Serve button answered "no adapter or merged export" about a model
+    # sitting on disk.
+    if export == "gguf":
+        gguf_dir = run_dir / "gguf"
+        found = sorted(gguf_dir.glob("*.gguf")) if gguf_dir.is_dir() else []
+        if not found:
+            raise ValueError(f"this run exported gguf but wrote no .gguf under {gguf_dir}")
+        quant = (config.get("gguf_quant") or "").lower()
+        # A quantised export writes both the f16 intermediate and the quant, and
+        # the quant is the one that was asked for.
+        chosen = next((p for p in found if quant and quant in p.name.lower()), found[-1])
+        return {
+            "engine": "llamacpp",
+            "model": _served_path(chosen),
+            "args": {},
+            "adapter": None,
+            "note": (
+                f"Serving the gguf export {chosen.name} with llama.cpp. vLLM cannot read GGUF, "
+                f"so this definition uses the other engine."
+                + (f" The run wrote {len(found)} files; this is the {quant} one."
+                   if len(found) > 1 else "")
+            ),
+        }
+
     merged = run_dir / export if export.startswith("merged") else None
     if merged is not None and merged.exists():
         return {
+            "engine": "vllm",
             "model": _served_path(merged),
             "args": {},
             "adapter": None,
@@ -784,6 +816,7 @@ def serve_plan(job: dict, *, name: str) -> dict:
     if rank not in SERVABLE_RANKS:
         raise ValueError(f"LoRA rank {rank} is not one of {SERVABLE_RANKS}; merge instead")
     return {
+        "engine": "vllm",
         "model": base,
         "args": {
             "enable_lora": True,

@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from app import finetune as svc
-from app import hf, jobs, servers, vllm_spec
+from app import hf, jobs, servers
 from app.config import settings
 
 router = APIRouter(prefix="/finetune", tags=["finetune"])
@@ -147,14 +147,18 @@ async def serve(job_id: str, payload: ServeIn) -> dict:
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from None
 
-    args = {
-        **plan["args"],
-        **payload.args,
-        "gpu_memory_utilization": payload.gpu_memory_utilization,
-    }
-    if payload.max_model_len:
-        args["max_model_len"] = payload.max_model_len
-    problems = vllm_spec.validate(args)
+    from app import engines
+
+    engine = engines.get(plan.get("engine"))
+    args = {**plan["args"], **payload.args}
+    # The utilisation fraction and max-model-len are vLLM's, and a gguf export
+    # is served by llama.cpp — forcing them onto it would produce a definition
+    # that fails validation with flags the operator never typed.
+    if engine.name == "vllm":
+        args["gpu_memory_utilization"] = payload.gpu_memory_utilization
+        if payload.max_model_len:
+            args["max_model_len"] = payload.max_model_len
+    problems = engine.validate(args)
     if problems:
         raise HTTPException(422, "; ".join(problems))
 
@@ -163,6 +167,7 @@ async def serve(job_id: str, payload: ServeIn) -> dict:
         servers.create_server,
         {
             "name": payload.name,
+            "engine": engine.name,
             "model": plan["model"],
             "served_name": payload.served_name or payload.name,
             "port": port,

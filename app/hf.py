@@ -309,7 +309,16 @@ def _gib(value: int) -> str:
 
 
 def _compatibility(detail: dict, available_bytes: int) -> dict:
-    """One sentence about serving this repo with vLLM on this box."""
+    """One sentence about serving this repo on this box, and with what.
+
+    "With what" is the part that changed when a second engine arrived. The two
+    engines read different file formats — vLLM loads safetensors and cannot read
+    GGUF at all; llama.cpp reads GGUF and nothing else — so a verdict phrased for
+    one of them is wrong about half the repos on the Hub. A GGUF-only repo used
+    to be reported as unservable, which was the single most misleading sentence
+    in the dashboard: it said no about exactly the model the operator had come
+    to serve.
+    """
     if detail["is_adapter"]:
         base = detail.get("base_model") or "its base model"
         return {
@@ -317,12 +326,18 @@ def _compatibility(detail: dict, available_bytes: int) -> dict:
             "note": f"LoRA adapter, not a servable model — serve {base} with --enable-lora "
                     "and attach this on top.",
         }
+    if detail["has_gguf"] and not detail["has_safetensors"]:
+        return {
+            "level": "ok",
+            "engine": "llamacpp",
+            "note": "GGUF weights — serve this with llama.cpp. Pick the one quantisation "
+                    "you want rather than pulling the whole repo; vLLM cannot read GGUF.",
+        }
     if not detail["has_safetensors"]:
-        kind = "GGUF" if detail["has_gguf"] else "PyTorch .bin"
         return {
             "level": "block",
-            "note": f"{kind} weights only, no safetensors — the vLLM image on this box "
-                    "will not load it.",
+            "note": "PyTorch .bin weights only, no safetensors and no GGUF — neither "
+                    "engine on this box will load it.",
         }
 
     config = detail["config"]
@@ -521,12 +536,29 @@ async def dataset_detail(repo_id: str, revision: str = "main") -> dict:
 
 
 def _snapshot_kind(path: Path) -> str:
-    """A snapshot is only servable if it carries a real config.json."""
+    """What this snapshot is, and therefore whether anything can serve it.
+
+    A transformers repo announces itself with config.json. A GGUF repo has no
+    config.json at all — its metadata is inside the weights file — and used to
+    fall through to "other", which is what drives the Models tab's badge and
+    gates its Serve button. So the one repo shape llama.cpp exists to serve was
+    the one shape the Models tab said could not be served, while the Serve tab's
+    own model picker offered it quite happily. The two surfaces disagreed; this
+    is the half that was wrong.
+    """
     try:
         if (path / "config.json").is_file():
             return "model"
         if (path / "adapter_config.json").is_file():
             return "adapter"
+        # Two levels, not a recursive walk. This runs for every revision of
+        # every cached repo — datasets included, which match neither branch
+        # above — and a cached parquet dataset is thousands of files deep.
+        # A GGUF release puts its files at the top or one directory down.
+        if next(path.glob("*.gguf"), None) is not None:
+            return "model"
+        if next(path.glob("*/*.gguf"), None) is not None:
+            return "model"
     except OSError:
         return "unknown"
     return "other"
@@ -626,7 +658,7 @@ async def delete_local(repo_id: str, repo_type: str = "model", node: str = "") -
     directory = await asyncio.to_thread(cache_dir_for, repo_id, repo_type)
     freed = await asyncio.to_thread(_dir_size, directory)
     code, out, err = await docker_ctl.run_capture(
-        image=settings.vllm_image,
+        image=settings.utility_image or settings.vllm_image,
         command=["-rf", f"{CONTAINER_CACHE}/hub/{directory.name}"],
         entrypoint="rm",
         mounts=[docker_ctl.Mount(settings.hf_cache, CONTAINER_CACHE)],
@@ -736,7 +768,7 @@ async def submit_download(
     spec = jobs.JobSpec(
         kind="download",
         title=f"Download {repo_id}" + (" (dataset)" if repo_type == "dataset" else ""),
-        image=settings.vllm_image,
+        image=settings.utility_image or settings.vllm_image,
         command=command,
         env=env,
         mounts=[
@@ -789,7 +821,7 @@ async def _delete_remote(repo_id: str, repo_type: str, node_name: str) -> dict:
     freed = int(out.split()[0]) if out.split() and out.split()[0].isdigit() else 0
 
     code, out, err = await docker_ctl.run_capture(
-        image=settings.vllm_image,
+        image=settings.utility_image or settings.vllm_image,
         command=["-rf", f"{CONTAINER_CACHE}/hub/{name}"],
         entrypoint="rm",
         mounts=[docker_ctl.Mount(settings.hf_cache, CONTAINER_CACHE)],

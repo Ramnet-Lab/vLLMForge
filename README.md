@@ -8,8 +8,9 @@ on a unified-memory part and false on a discrete GPU (see
 interfaces — is detected or configurable. It unifies four
 things that are otherwise four sets of shell scripts:
 
-* **Serving.** Define, launch and watch vLLM servers as containers, with a
-  parameter form generated from the vLLM image itself.
+* **Serving.** Define, launch and watch vLLM or llama.cpp servers as
+  containers, with a parameter form generated from the image itself. Pick the
+  engine per server; a GGUF model picks llama.cpp for you.
 * **Models.** Search the HuggingFace Hub, see what a repo will cost before you
   pull it, and manage the shared local cache.
 * **Fine-tuning.** QLoRA training with Unsloth, from an uploaded JSONL to an
@@ -45,17 +46,33 @@ what is already cached, with per-revision sizes, and can delete a repo. Gated
 repos are flagged before you queue a pull, and this is where the HuggingFace
 token lives if you do not want it in the environment.
 
-**Serve** is the vLLM control surface. Every one of the image's flags is
-available: the form is generated from the binary that will run, so it cannot
-drift from it, with the memory, scheduling and LoRA parameters promoted to the
-top and the remaining two hundred searchable underneath. Three presets carry
-their provenance in the UI — two are configurations measured on this host, the
-third is derived from them and says so. Before a launch you get the exact
-`docker run` command, and a verdict from the memory budget: fits, tight, or
-refused with the reason and the largest value that would work. Refusals can be
-forced, deliberately, from a separate button. Once running, each server shows
-its health, its vLLM metrics (KV cache usage, running and waiting requests,
-prefix cache hit rate) and its logs.
+**Serve** is the engine control surface, and the first field after the name is
+which engine: **vLLM** or **llama.cpp**. Everything below it follows from that
+choice, because the two share almost nothing but a lifecycle. Every one of the
+selected image's flags is available — the form is generated from the binary that
+will run, so it cannot drift from it — with the parameters that decide whether it
+starts promoted to the top and the rest searchable underneath. The presets are
+that engine's; so are the metrics; so is whether pooling across machines is even
+offered.
+
+Choosing a model whose name says GGUF selects llama.cpp for you, because vLLM
+cannot read the format at all. It is a suggestion, not a rule: change the field
+and it stays changed. Switching engines keeps each one's flags, so going to
+llama.cpp and back does not throw away what you typed.
+
+Before a launch you get the exact `docker run` command and a verdict from the
+memory budget: fits, tight, or refused with the reason. What that verdict is
+*about* differs, and it has to. A vLLM server declares a fraction of the node's
+memory and is told the largest fraction that still fits. A llama.cpp server
+declares nothing — what it takes is read out of the .gguf's own header and
+worked out from `--n-gpu-layers` and `--ctx-size` — so it is told how many bytes
+are going spare, and the recommendation turns that into a layer count and a
+context length. Refusals can be forced, deliberately, from a separate button.
+
+Once running, each server shows its health, its own engine's metrics, and its
+logs. Those metric sets are genuinely different rather than renamed: vLLM
+publishes KV-cache usage and a prefix-cache hit rate, llama.cpp publishes
+prompt and generation throughput and its slot occupancy.
 
 **Playground** chats against any healthy endpoint — managed or not — with the
 full sampling surface built from that endpoint's own OpenAPI schema, so the
@@ -103,6 +120,14 @@ reattaches to their logs when it comes back.
   base is about 22 GB and is pulled by the build; pull it beforehand if you
   would rather not wait. **Every node in a cluster needs this image**, because
   each rank of a pooled engine runs it on its own machine.
+* Optionally, the llama.cpp image, if you want to serve GGUF. `scripts/setup.sh`
+  offers it as `llmd/llamacpp:latest` from `docker/llamacpp.Dockerfile`, built on
+  `ghcr.io/ggml-org/llama.cpp:server-cuda` — the only image here that is not
+  built on the vLLM base. It undoes two things upstream does that a driven
+  container cannot live with: an ENTRYPOINT that would swallow the argv, and a
+  healthcheck hard-wired to port 8080 that would mark every server on any other
+  port permanently unhealthy. Only needed on the machine that serves with it;
+  pooling is vLLM's.
 * `nvidia-smi` for GPU telemetry. Without it the dashboard still works and the
   GPU tiles simply go quiet.
 * Roughly 25 GB of disk for the images, plus whatever the models need.
@@ -238,8 +263,11 @@ so a `.env` value will not reach a process you launch by hand with
 | `LLMD_HF_CACHE` | `~/models/hf-cache` | Shared HuggingFace cache, mounted into every container at `/hf`. |
 | `LLMD_OUTPUT_DIR` | `~/models/outputs` | Job artefacts: fine-tunes, Heretic exports. Mounted into server containers at `/outputs`. |
 | `LLMD_DATASET_DIR` | `~/models/datasets` | Uploaded training data. |
-| `LLMD_VLLM_IMAGE` | `llmd/vllm:latest` | Image used for serving and downloads. Built by `scripts/setup.sh` from `docker/vllm.Dockerfile`; not something you can pull. |
-| `LLMD_VLLM_BASE_IMAGE` | `nvcr.io/nvidia/vllm:26.07-py3` | The NGC image the three worker images are built on top of. |
+| `LLMD_VLLM_IMAGE` | `llmd/vllm:latest` | Image vLLM servers run in, and the fallback for cache work. Built by `scripts/setup.sh` from `docker/vllm.Dockerfile`; not something you can pull. |
+| `LLMD_VLLM_BASE_IMAGE` | `nvcr.io/nvidia/vllm:26.07-py3` | The NGC image the vLLM, Heretic and fine-tuning images are built on top of. Not the llama.cpp one. |
+| `LLMD_LLAMACPP_IMAGE` | `llmd/llamacpp:latest` | Image llama.cpp servers run in. Built from `docker/llamacpp.Dockerfile`; optional, and only needed where you serve GGUF. |
+| `LLMD_LLAMACPP_BASE_IMAGE` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | What that image is built on. Change it for another backend (`:server-vulkan`, `:server-rocm`, `:server` for CPU) or an architecture the CUDA tag has no build for. |
+| `LLMD_UTILITY_IMAGE` | empty | A container to run root cache work in — deleting a repo, running the download worker. Empty means the vLLM image, which is what has always done it. Set something small on a box that never serves with vLLM. |
 | `LLMD_HERETIC_IMAGE` | `llmd/heretic:latest` | Tag the Heretic tab builds and runs. |
 | `LLMD_FINETUNE_IMAGE` | `llmd/finetune:latest` | Tag the fine-tuning tab builds and runs. |
 | `LLMD_CONTAINER_PREFIX` | `llmd-` | Prefix for containers the dashboard creates, so it can tell its own from yours. |
@@ -259,8 +287,9 @@ so a `.env` value will not reach a process you launch by hand with
 
 ## How servers are launched
 
-A "server" is a saved parameter set plus a container. Starting one is a single
-detached `docker run` that the dashboard shows you in full before it happens:
+A "server" is a saved parameter set, an engine, and a container. Starting one is
+a single detached `docker run` that the dashboard shows you in full before it
+happens. For a vLLM server:
 
 ```
 docker run --name llmd-vllm-3 -d --runtime nvidia --gpus all \
@@ -272,6 +301,27 @@ docker run --name llmd-vllm-3 -d --runtime nvidia --gpus all \
     --gpu-memory-utilization 0.52 --max-model-len 262144 \
     --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name qwen3
 ```
+
+and for a llama.cpp one, which differs in every part that is about the engine
+and in none of the parts that are about the container:
+
+```
+docker run --name llmd-llamacpp-4 -d --runtime nvidia --gpus all \
+  --network host --ipc host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v ~/models/hf-cache:/hf -v ~/models/outputs:/outputs \
+  -e HF_HOME=/hf -e LLAMA_CACHE=/hf/llamacpp \
+  llmd/llamacpp:latest \
+  llama-server --host 0.0.0.0 --port 8011 \
+    -m /hf/hub/models--bartowski--Qwen3-8B-GGUF/snapshots/abc/Qwen3-8B-Q4_K_M.gguf \
+    --metrics --n-gpu-layers 40 --ctx-size 8192 --flash-attn on --alias qwen3-8b
+```
+
+`--metrics` is not optional and is not offered in the form: llama.cpp serves
+`/metrics` only when it is passed, and without it the Metrics tab is a panel
+that can never fill. The container name carries the engine (`llmd-llamacpp-4`,
+not `llmd-vllm-4`), which is why the dashboard refuses to change a saved
+server's engine while its container is still running — the rename would leave a
+live process nothing could address.
 
 Three things about that are load-bearing.
 
@@ -307,6 +357,12 @@ the reason the feature exists — a memory picture that is true about this app a
 false about the machine is worse than none.
 
 ## Serving across several machines
+
+**vLLM only.** llama.cpp distributes with `--rpc` and `rpc-server` processes —
+no world size, no rendezvous, no NCCL — which is a different topology with
+different failure modes, and it is not wired up here. Selecting llama.cpp hides
+the Placement control rather than greying it, and a pooled llama.cpp definition
+is refused by the API rather than half-attempted.
 
 A model that does not fit on one box can be split across several: the layers are
 divided between them and each machine holds a stage. Pipeline parallel, not
@@ -419,10 +475,16 @@ document to read before using this tool.
 
 ## The worker images
 
-There are three, all built from `docker/*.Dockerfile` and none of them
-pullable. `llmd/vllm:latest` is the one every server runs; Heretic and Unsloth
-each add a layer the vLLM image does not provide. All three are built **on top
-of** `LLMD_VLLM_BASE_IMAGE`, and that is not an implementation detail: the NGC image
+There are four, all built from `docker/*.Dockerfile` and none of them pullable.
+`llmd/vllm:latest` is the one vLLM servers run; Heretic and Unsloth each add a
+layer the vLLM image does not provide; `llmd/llamacpp:latest` is the second
+serving engine and is the odd one out — it is built on a llama.cpp server image,
+not on the vLLM base, and handing it `LLMD_VLLM_BASE_IMAGE` would produce an
+image with no `llama-server` in it at all. `scripts/setup.sh` passes it its own
+base for that reason.
+
+The other three are built **on top of** `LLMD_VLLM_BASE_IMAGE`, and that is not
+an implementation detail: the NGC image
 already carries working aarch64 CUDA 13 builds of torch, xformers, triton and
 flash-attn, which is why nothing in either build compiles. Unsloth's own
 DGX Spark Dockerfile builds those from source and takes ten minutes to fail in
@@ -460,17 +522,19 @@ optional version pins (`UNSLOTH_VERSION`, `TRL_VERSION`, …); unpinned means
 | `~/models/outputs/<name>-<job_id>/` | One directory per job: config, checkpoints, and the exported model or adapter. |
 | `~/models/datasets/` | Uploaded JSONL training sets. |
 | `app/data/vllm_args.json` | Generated vLLM flag schema. Checked in. |
+| `app/data/llamacpp_args.json` | llama.cpp flag schema, in the same shape. Authored from a real `llama-server --help`, regenerable from your own image. Checked in. |
 | `app/data/vllm_archs.json` | Generated list of the architectures the image can load. Checked in. |
 | `app/data/sampling_params.json` | Generated sampling-parameter schema, used as a fallback. Checked in. |
 
 Deleting the state directory loses your server definitions and job history and
 nothing else; the models and outputs are untouched.
 
-## Regenerating the vLLM parameter schema
+## Regenerating the parameter schemas
 
-The Serve form is rendered from `app/data/vllm_args.json`, which is generated
-from a vLLM image. When you change `LLMD_VLLM_IMAGE`, regenerate it so the form
-matches the binary that will run:
+The Serve form is rendered from one schema per engine — `app/data/vllm_args.json`
+and `app/data/llamacpp_args.json` — each generated from the image that will run.
+When you change either image, regenerate its schema so the form matches the
+binary:
 
 ```bash
 .venv/bin/python tools/gen_vllm_schema.py \
@@ -478,7 +542,27 @@ matches the binary that will run:
     --out app/data/vllm_args.json
 ```
 
-It runs the image twice — once to introspect argparse for structure, once to
+The llama.cpp one is a single scrape, and needs no GPU:
+
+```bash
+.venv/bin/python tools/gen_llamacpp_schema.py \
+    --image llmd/llamacpp:latest \
+    --out app/data/llamacpp_args.json
+```
+
+The difference is in the two binaries, not in taste. llama.cpp has no argparse
+to introspect — its flag table is hand-rolled C++ — but its `--help` is printed
+by one formatter with fixed column constants, so a single scrape gets the flags,
+the metavar, the prose, the default and the environment variable together. It
+also prints a table and exits, where vLLM needs a visible device before it will
+build its config dataclasses at all. Two things `--help` does not print and the
+scraper therefore infers by name: which `--no-` spelling negates which flag, and
+the undocumented `LLAMA_ARG_NO_*` overrides. Check the negations after a
+regeneration; llama.cpp spells them rather than deriving them, and a guessed one
+is an argument the binary rejects.
+
+The vLLM generator runs the image twice — once to introspect argparse for
+structure, once to
 scrape `vllm serve --help=all` for the prose, because vLLM builds its help text
 lazily and the parser objects carry empty help strings — and prints how many
 flags it found and how many it could describe. Against the image above it takes
@@ -508,6 +592,8 @@ Picking a model reads the files that came with it — `config.json`,
 form used to make you answer from memory:
 
 * the server name and served name, from the model's own name;
+* which engine can serve it at all, and the dropdown set accordingly: GGUF is
+  llama.cpp's and safetensors is vLLM's, and neither reads the other's;
 * what the model is: architecture, context length, quantisation, whether it has
   a chat template and where it came from, and whether vLLM will run it as a
   generator or an embedder — which is not a flag anyone can override;
@@ -530,8 +616,23 @@ left alone, with the reason. What it does set is
 left after it has profiled the weights. Tool and reasoning parsers are added
 when the chat template's own tokens name them unambiguously.
 
-What no flag rescues is said plainly: a LoRA adapter, GGUF-only weights, weights
-larger than free memory, a checkpoint whose quantisation this build cannot load.
+What no flag rescues is said plainly: a LoRA adapter, weights larger than free
+memory, a checkpoint whose quantisation this build cannot load. GGUF-only
+weights used to be on that list and no longer are — they are a refusal *for
+vLLM* and a button that switches the engine, because the configuration that
+works is one field away.
+
+For llama.cpp the advice is different in kind, because the arithmetic vLLM's
+advisor works hard to avoid is here unavoidable. `--max-model-len auto` lets
+vLLM fit the context to whatever cache is left after it has profiled the model;
+`--ctx-size` is a number that has to be right, and left unset llama.cpp takes
+the model's *trained* length — 128k on a modern checkpoint, several times the
+weights in KV cache for a context nobody asked for. So the recommendation reads
+the .gguf's own header and computes: every layer on the accelerator if it fits,
+then a shorter context, then layers on the CPU, in that order — because a layer
+left behind costs speed on every token while a shorter context costs only what
+it costs. It is priced with the same function the launch guard prices with, so a
+recommendation the guard would then refuse is not expressible.
 
 One worked example of why the environment matters. An FP8 checkpoint whose
 scales are per *block* — `Qwen/Qwen3.8-27B-FP8`, `RedHatAI/gemma-4-31B-it-FP8-block`
@@ -566,9 +667,13 @@ arithmetic, not retrying: check the budget panel, lower
 `--gpu-memory-utilization`, lower `--max-num-seqs`, or stop something. Killed
 containers deliberately do not restart themselves.
 
-**A server sits in "loading" forever.** vLLM does not bind its port until the
-weights are read and the CUDA graphs are captured, so a refused connection means
-"still loading", not "broken" — on a 27B model that is minutes, and the
+**A server sits in "loading" forever.** The two engines look opposite here, and
+the dashboard asks each one its own question. vLLM does not bind its port until
+the weights are read and the CUDA graphs are captured, so a refused connection
+means "still loading", not "broken". llama-server binds its socket first and
+answers `/health` with a 503 until the weights are in, so for it a *reachable*
+port that is not yet healthy is what loading looks like. Either way — on a large
+model that is minutes, and the
 dashboard shows `loading` rather than `running` for exactly that window. Open
 its logs. Three things look like a hang and are not: a multi-gigabyte download
 into the cache (the log shows the fetch), a torch.compile phase that produces no

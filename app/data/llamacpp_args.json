@@ -1,0 +1,2418 @@
+{
+ "image": "llmd/llamacpp:latest",
+ "llamacpp_version": "b10566",
+ "source": "Authored from `llama-server --help` of ggml-org/llama.cpp build b10566 (v0.2.0-dev). Regenerate against your own image with tools/gen_llamacpp_schema.py, which scrapes the same output.",
+ "sections": {
+  "common params": "Flags every llama.cpp tool shares: model loading, GPU offload, context, batching and the KV cache.",
+  "sampling params": "Server-wide sampling defaults. Every one of these is also overridable per request, so these are the values a client gets when it says nothing.",
+  "speculative params": "Draft-model speculative decoding. A second, smaller model proposes tokens the main model verifies in one pass.",
+  "example-specific params": "Flags that exist only for llama-server: the HTTP frontend, slots, chat templating and the endpoints it exposes."
+ },
+ "args": [
+  {
+   "dest": "batch_size",
+   "flags": [
+    "-b",
+    "--batch-size"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 2048,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--batch-size",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_BATCH",
+   "help": "Logical batch: how many prompt tokens are submitted at once before being split into physical batches."
+  },
+  {
+   "dest": "cache_type_k",
+   "flags": [
+    "-ctk",
+    "--cache-type-k"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "f16",
+   "choices": [
+    "f32",
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "iq4_nl",
+    "q5_0",
+    "q5_1"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--cache-type-k",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CACHE_TYPE_K",
+   "help": "Element type of the K half of the KV cache. q8_0 halves it against f16 for very little quality; q4_0 halves it again and is noticeable."
+  },
+  {
+   "dest": "cache_type_v",
+   "flags": [
+    "-ctv",
+    "--cache-type-v"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "f16",
+   "choices": [
+    "f32",
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "iq4_nl",
+    "q5_0",
+    "q5_1"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--cache-type-v",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CACHE_TYPE_V",
+   "help": "Element type of the V half. Anything other than f32/f16 needs flash attention; llama.cpp turns it on for you unless you turned it off."
+  },
+  {
+   "dest": "cpu_moe",
+   "flags": [
+    "-cmoe",
+    "--cpu-moe"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "common params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--cpu-moe",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CPU_MOE",
+   "help": "Keep all mixture-of-experts weights on the CPU. On a sparse model this frees most of the file's bytes for a small speed cost, because only a few experts run per token."
+  },
+  {
+   "dest": "ctx_size",
+   "flags": [
+    "-c",
+    "--ctx-size"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--ctx-size",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CTX_SIZE",
+   "help": "Context length in tokens; 0 takes the model's own trained length. This is the single largest memory decision after --n-gpu-layers: the KV cache is linear in it."
+  },
+  {
+   "dest": "device",
+   "flags": [
+    "-dev",
+    "--device"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--device",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_DEVICE",
+   "help": "Devices to use, comma separated, as named by --list-devices. 'none' offloads nothing."
+  },
+  {
+   "dest": "fit",
+   "flags": [
+    "-fit",
+    "--fit"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "on",
+   "choices": [
+    "on",
+    "off"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--fit",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_FIT",
+   "help": "Measure the real buffer sizes before loading and reduce --n-gpu-layers (and --ctx-size, if it was left at 0) until they fit. Only touches parameters still at their defaults, so an explicit -ngl opts out."
+  },
+  {
+   "dest": "fit_ctx",
+   "flags": [
+    "-fitc",
+    "--fit-ctx"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 4096,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--fit-ctx",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_FIT_CTX",
+   "help": "The smallest context --fit is allowed to settle on. It is a floor the fitting pass interpolates upward from, not a target."
+  },
+  {
+   "dest": "fit_target",
+   "flags": [
+    "-fitt",
+    "--fit-target"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 1024,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--fit-target",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_FIT_TARGET",
+   "help": "MiB per device to leave free when --fit is on."
+  },
+  {
+   "dest": "flash_attn",
+   "flags": [
+    "-fa",
+    "--flash-attn"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "auto",
+   "choices": [
+    "on",
+    "off",
+    "auto"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--flash-attn",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_FLASH_ATTN",
+   "help": "Fused attention. It does not change the KV cache's size, but it avoids materialising the attention-score matrix, which is what makes the compute buffer grow with context. Required for a quantised V cache."
+  },
+  {
+   "dest": "hf_file",
+   "flags": [
+    "-hff",
+    "--hf-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--hf-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_HF_FILE",
+   "help": "Which file inside --hf-repo to use, overriding the quant chosen from the repo suffix."
+  },
+  {
+   "dest": "hf_repo",
+   "flags": [
+    "-hf",
+    "-hfr",
+    "--hf-repo"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--hf-repo",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_HF_REPO",
+   "help": "A Hub repo as <user>/<model>[:quant] to download and serve. The quant suffix is case-insensitive and defaults to Q4_K_M, or the first GGUF in the repo. Set by the dashboard when the Model field names a repo."
+  },
+  {
+   "dest": "keep",
+   "flags": [
+    "--keep"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--keep",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_KEEP",
+   "help": "Tokens from the start of the prompt to keep when the context shifts."
+  },
+  {
+   "dest": "load_mode",
+   "flags": [
+    "-lm",
+    "--load-mode"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "auto",
+   "choices": [
+    "auto",
+    "none",
+    "mmap",
+    "mlock",
+    "mmap+mlock",
+    "dio"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--load-mode",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_LOAD_MODE",
+   "help": "How the weights are read. Replaces --mmap/--mlock/--direct-io, which are kept only as deprecated aliases."
+  },
+  {
+   "dest": "lora",
+   "flags": [
+    "--lora"
+   ],
+   "type": "str",
+   "nargs": "+",
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "list",
+   "flag": "--lora",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "GGUF LoRA adapters to apply. These are converted adapters, not the PEFT directories the Fine-tune tab writes."
+  },
+  {
+   "dest": "lora_scaled",
+   "flags": [
+    "--lora-scaled"
+   ],
+   "type": "str",
+   "nargs": "+",
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "list",
+   "flag": "--lora-scaled",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Adapters with a scale each, as FILE:SCALE."
+  },
+  {
+   "dest": "main_gpu",
+   "flags": [
+    "-mg",
+    "--main-gpu"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--main-gpu",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MAIN_GPU",
+   "help": "Which device holds the small tensors and, under --split-mode none, the whole model."
+  },
+  {
+   "dest": "mlock",
+   "flags": [
+    "--mlock"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "common params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--mlock",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MLOCK",
+   "help": "Deprecated in favour of --load-mode. Lock the weights in RAM so they are never paged out."
+  },
+  {
+   "dest": "mmap",
+   "flags": [
+    "--mmap"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "common params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--mmap",
+   "negatable": true,
+   "negative_flag": "--no-mmap",
+   "accepts": [],
+   "env": "LLAMA_ARG_MMAP",
+   "help": "Deprecated in favour of --load-mode. Memory-map the weights instead of reading them into RAM."
+  },
+  {
+   "dest": "model",
+   "flags": [
+    "-m",
+    "--model"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--model",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MODEL",
+   "help": "Path to the .gguf file to serve. Set by the dashboard from the Model field."
+  },
+  {
+   "dest": "model_url",
+   "flags": [
+    "-mu",
+    "--model-url"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--model-url",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MODEL_URL",
+   "help": "Download the model from this URL instead of a path or a Hub repo."
+  },
+  {
+   "dest": "n_cpu_moe",
+   "flags": [
+    "-ncmoe",
+    "--n-cpu-moe"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--n-cpu-moe",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_N_CPU_MOE",
+   "help": "Keep the expert weights of this many layers on the CPU."
+  },
+  {
+   "dest": "n_gpu_layers",
+   "flags": [
+    "-ngl",
+    "--gpu-layers",
+    "--n-gpu-layers"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": "auto",
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "size",
+   "flag": "--n-gpu-layers",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [
+    "auto",
+    "all"
+   ],
+   "env": "LLAMA_ARG_N_GPU_LAYERS",
+   "help": "How many layers to hold in accelerator memory: a number, 'auto', or 'all'. llama.cpp offloads the LAST N of the model's layers plus one standing for the output head, so N counts down from the output rather than up from the embedding. 'auto' lets llama.cpp measure and fit; an explicit number disables that fitting and is attempted exactly."
+  },
+  {
+   "dest": "n_predict",
+   "flags": [
+    "-n",
+    "--predict",
+    "--n-predict"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--n-predict",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_N_PREDICT",
+   "help": "Server-wide cap on generated tokens; -1 is unlimited."
+  },
+  {
+   "dest": "numa",
+   "flags": [
+    "--numa"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": [
+    "distribute",
+    "isolate",
+    "numactl"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--numa",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_NUMA",
+   "help": "NUMA placement strategy. Only meaningful when layers stay on the CPU."
+  },
+  {
+   "dest": "override_tensor",
+   "flags": [
+    "-ot",
+    "--override-tensor"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--override-tensor",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_OVERRIDE_TENSOR",
+   "help": "Per-tensor device overrides as <regex>=<device>, comma separated."
+  },
+  {
+   "dest": "rope_freq_base",
+   "flags": [
+    "--rope-freq-base"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--rope-freq-base",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ROPE_FREQ_BASE",
+   "help": "RoPE base frequency. Unset takes the model's own."
+  },
+  {
+   "dest": "rope_freq_scale",
+   "flags": [
+    "--rope-freq-scale"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--rope-freq-scale",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ROPE_FREQ_SCALE",
+   "help": "RoPE frequency scaling, the reciprocal of --rope-scale."
+  },
+  {
+   "dest": "rope_scale",
+   "flags": [
+    "--rope-scale"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--rope-scale",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ROPE_SCALE",
+   "help": "Context scaling factor: 2 halves the frequency, doubling the reach."
+  },
+  {
+   "dest": "rope_scaling",
+   "flags": [
+    "--rope-scaling"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": [
+    "none",
+    "linear",
+    "yarn"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--rope-scaling",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ROPE_SCALING_TYPE",
+   "help": "How to stretch the model past its trained context. Unset takes whatever the GGUF header declares."
+  },
+  {
+   "dest": "split_mode",
+   "flags": [
+    "-sm",
+    "--split-mode"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "layer",
+   "choices": [
+    "none",
+    "layer",
+    "row",
+    "tensor"
+   ],
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--split-mode",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPLIT_MODE",
+   "help": "How to split the model across several accelerators. 'layer' gives each device whole layers; 'row' splits individual tensors and costs more traffic; 'none' keeps everything on --main-gpu."
+  },
+  {
+   "dest": "swa_full",
+   "flags": [
+    "--swa-full"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "common params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--swa-full",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SWA_FULL",
+   "help": "Allocate a full-size cache for sliding-window attention layers instead of the window. Costs memory; needed for some reuse paths."
+  },
+  {
+   "dest": "tensor_split",
+   "flags": [
+    "-ts",
+    "--tensor-split"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "str",
+   "flag": "--tensor-split",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_TENSOR_SPLIT",
+   "help": "Proportions to split across devices, comma separated: 3,1 puts three quarters on the first device. Defaults to the devices' free memory."
+  },
+  {
+   "dest": "threads",
+   "flags": [
+    "-t",
+    "--threads"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--threads",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_THREADS",
+   "help": "CPU threads used during generation. -1 picks a count from the machine."
+  },
+  {
+   "dest": "threads_batch",
+   "flags": [
+    "-tb",
+    "--threads-batch"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--threads-batch",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "CPU threads used during prompt processing. Defaults to --threads."
+  },
+  {
+   "dest": "ubatch_size",
+   "flags": [
+    "-ub",
+    "--ubatch-size"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 512,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--ubatch-size",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_UBATCH",
+   "help": "Physical batch: how many tokens are computed in one pass. This is what actually sizes the compute buffer, so lower it first when a launch runs out of memory during prompt processing."
+  },
+  {
+   "dest": "yarn_attn_factor",
+   "flags": [
+    "--yarn-attn-factor"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": -1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--yarn-attn-factor",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_YARN_ATTN_FACTOR",
+   "help": "YaRN magnitude scaling for attention."
+  },
+  {
+   "dest": "yarn_beta_fast",
+   "flags": [
+    "--yarn-beta-fast"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": -1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--yarn-beta-fast",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_YARN_BETA_FAST",
+   "help": "YaRN low-correction dimension."
+  },
+  {
+   "dest": "yarn_beta_slow",
+   "flags": [
+    "--yarn-beta-slow"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": -1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--yarn-beta-slow",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_YARN_BETA_SLOW",
+   "help": "YaRN high-correction dimension."
+  },
+  {
+   "dest": "yarn_ext_factor",
+   "flags": [
+    "--yarn-ext-factor"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": -1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "float",
+   "flag": "--yarn-ext-factor",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_YARN_EXT_FACTOR",
+   "help": "YaRN extrapolation mix; 0 is pure interpolation, -1 takes the model's."
+  },
+  {
+   "dest": "yarn_orig_ctx",
+   "flags": [
+    "--yarn-orig-ctx"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "common params",
+   "required": false,
+   "widget": "int",
+   "flag": "--yarn-orig-ctx",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_YARN_ORIG_CTX",
+   "help": "The context the model was actually trained on, for YaRN scaling."
+  },
+  {
+   "dest": "alias",
+   "flags": [
+    "-a",
+    "--alias"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--alias",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ALIAS",
+   "help": "What clients put in the \"model\" field, and what /v1/models reports. Set by the dashboard from Served name."
+  },
+  {
+   "dest": "api_key",
+   "flags": [
+    "--api-key"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--api-key",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_API_KEY",
+   "help": "Require this key in Authorization. Comma-separate to accept several."
+  },
+  {
+   "dest": "api_key_file",
+   "flags": [
+    "--api-key-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--api-key-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_API_KEY_FILE",
+   "help": "A file of accepted API keys, one per line."
+  },
+  {
+   "dest": "cache_prompt",
+   "flags": [
+    "--cache-prompt"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--cache-prompt",
+   "negatable": true,
+   "negative_flag": "--no-cache-prompt",
+   "accepts": [],
+   "env": "LLAMA_ARG_CACHE_PROMPT",
+   "help": "Reuse the KV cache of a prompt prefix a slot has already processed."
+  },
+  {
+   "dest": "cache_reuse",
+   "flags": [
+    "--cache-reuse"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--cache-reuse",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CACHE_REUSE",
+   "help": "Smallest chunk of a cached prompt worth reusing by shifting the KV cache. 0 disables it."
+  },
+  {
+   "dest": "chat_template",
+   "flags": [
+    "--chat-template"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--chat-template",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CHAT_TEMPLATE",
+   "help": "A built-in template name, or the template's text, overriding the model's. Only well-known names are accepted unless --jinja is on."
+  },
+  {
+   "dest": "chat_template_file",
+   "flags": [
+    "--chat-template-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--chat-template-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CHAT_TEMPLATE_FILE",
+   "help": "A file holding the Jinja chat template to use instead of the model's."
+  },
+  {
+   "dest": "chat_template_kwargs",
+   "flags": [
+    "--chat-template-kwargs"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "json",
+   "flag": "--chat-template-kwargs",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_CHAT_TEMPLATE_KWARGS",
+   "help": "A JSON object of extra variables handed to the chat template \u2014 this is where a model's own thinking switch usually lives."
+  },
+  {
+   "dest": "cont_batching",
+   "flags": [
+    "-cb",
+    "--cont-batching"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--cont-batching",
+   "negatable": true,
+   "negative_flag": "--no-cont-batching",
+   "accepts": [],
+   "env": "LLAMA_ARG_CONT_BATCHING",
+   "help": "Insert new requests into a batch already running instead of waiting for it to finish."
+  },
+  {
+   "dest": "context_shift",
+   "flags": [
+    "--context-shift"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--context-shift",
+   "negatable": true,
+   "negative_flag": "--no-context-shift",
+   "accepts": [],
+   "env": "LLAMA_ARG_CONTEXT_SHIFT",
+   "help": "When a conversation outgrows the context, drop the oldest tokens and carry on rather than failing the request."
+  },
+  {
+   "dest": "embd_normalize",
+   "flags": [
+    "--embd-normalize"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 2,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--embd-normalize",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Norm applied to embeddings: -1 none, 0 max-abs, 1 taxicab, 2 euclidean."
+  },
+  {
+   "dest": "embedding",
+   "flags": [
+    "--embedding",
+    "--embeddings"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--embedding",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_EMBEDDINGS",
+   "help": "Serve /v1/embeddings. An embedding server answers no chat endpoint."
+  },
+  {
+   "dest": "host",
+   "flags": [
+    "--host"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "127.0.0.1",
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--host",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_HOST",
+   "help": "Address to bind. Managed by the dashboard, which binds 0.0.0.0."
+  },
+  {
+   "dest": "image_max_tokens",
+   "flags": [
+    "--image-max-tokens"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--image-max-tokens",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_IMAGE_MAX_TOKENS",
+   "help": "Ceiling on the tokens one image becomes."
+  },
+  {
+   "dest": "image_min_tokens",
+   "flags": [
+    "--image-min-tokens"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--image-min-tokens",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_IMAGE_MIN_TOKENS",
+   "help": "Floor on the tokens one image becomes."
+  },
+  {
+   "dest": "jinja",
+   "flags": [
+    "--jinja"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--jinja",
+   "negatable": true,
+   "negative_flag": "--no-jinja",
+   "accepts": [],
+   "env": "LLAMA_ARG_JINJA",
+   "help": "Render chat with the model's own Jinja template. Turning it off falls back to a built-in template and loses tool calling."
+  },
+  {
+   "dest": "kv_unified",
+   "flags": [
+    "-kvu",
+    "--kv-unified"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--kv-unified",
+   "negatable": true,
+   "negative_flag": "--no-kv-unified",
+   "accepts": [],
+   "env": "LLAMA_ARG_KV_UNIFIED",
+   "help": "Share one context-sized KV pool across slots instead of giving each slot a fixed slice. On by default when the slot count is auto. The total the cache costs is the same either way."
+  },
+  {
+   "dest": "lora_init_without_apply",
+   "flags": [
+    "--lora-init-without-apply"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--lora-init-without-apply",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Load the adapters but leave them off until POST /lora-adapters turns them on."
+  },
+  {
+   "dest": "metrics",
+   "flags": [
+    "--metrics"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--metrics",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ENDPOINT_METRICS",
+   "help": "Expose Prometheus metrics on /metrics. Turned on by the dashboard, because the Metrics tab has nothing to read without it."
+  },
+  {
+   "dest": "mmproj",
+   "flags": [
+    "-mm",
+    "--mmproj"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--mmproj",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MMPROJ",
+   "help": "The multimodal projector file that lets this model take images."
+  },
+  {
+   "dest": "mmproj_auto",
+   "flags": [
+    "--mmproj-auto"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--mmproj-auto",
+   "negatable": true,
+   "negative_flag": "--no-mmproj",
+   "accepts": [],
+   "env": "LLAMA_ARG_MMPROJ_AUTO",
+   "help": "Load the projector a multimodal repo ships alongside its weights. Turning it off (--no-mmproj) serves the model as text-only."
+  },
+  {
+   "dest": "mmproj_offload",
+   "flags": [
+    "--mmproj-offload"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--mmproj-offload",
+   "negatable": true,
+   "negative_flag": "--no-mmproj-offload",
+   "accepts": [],
+   "env": "LLAMA_ARG_MMPROJ_OFFLOAD",
+   "help": "Keep the projector in accelerator memory."
+  },
+  {
+   "dest": "mmproj_url",
+   "flags": [
+    "-mmu",
+    "--mmproj-url"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--mmproj-url",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_MMPROJ_URL",
+   "help": "Download the projector from this URL."
+  },
+  {
+   "dest": "parallel",
+   "flags": [
+    "-np",
+    "--parallel"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--parallel",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_N_PARALLEL",
+   "help": "How many requests the server holds slots for. -1 is auto, which means four slots sharing one unified context. Slots divide the context rather than multiplying it, so more slots means less context each."
+  },
+  {
+   "dest": "path",
+   "flags": [
+    "--path"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--path",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_STATIC_PATH",
+   "help": "Directory of static files to serve alongside the API."
+  },
+  {
+   "dest": "pooling",
+   "flags": [
+    "--pooling"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": [
+    "none",
+    "mean",
+    "cls",
+    "last",
+    "rank"
+   ],
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--pooling",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_POOLING",
+   "help": "How token vectors become one vector. Unset takes the model's own."
+  },
+  {
+   "dest": "port",
+   "flags": [
+    "--port"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 8080,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--port",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_PORT",
+   "help": "Port to bind. Managed by the dashboard from the Port field."
+  },
+  {
+   "dest": "prefill_assistant",
+   "flags": [
+    "--prefill-assistant"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--prefill-assistant",
+   "negatable": true,
+   "negative_flag": "--no-prefill-assistant",
+   "accepts": [],
+   "env": "LLAMA_ARG_PREFILL_ASSISTANT",
+   "help": "Continue a trailing assistant message rather than starting a new turn."
+  },
+  {
+   "dest": "props",
+   "flags": [
+    "--props"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--props",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_ENDPOINT_PROPS",
+   "help": "Allow POST /props to change server properties at runtime."
+  },
+  {
+   "dest": "reasoning",
+   "flags": [
+    "-rea",
+    "--reasoning"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "auto",
+   "choices": [
+    "on",
+    "off",
+    "auto"
+   ],
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--reasoning",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_REASONING",
+   "help": "Whether the model is asked to reason at all, for models that can be told."
+  },
+  {
+   "dest": "reasoning_budget",
+   "flags": [
+    "--reasoning-budget"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--reasoning-budget",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_THINK_BUDGET",
+   "help": "Token ceiling on reasoning; -1 is unlimited, 0 disables it."
+  },
+  {
+   "dest": "reasoning_effort",
+   "flags": [
+    "--reasoning-effort"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "default",
+   "choices": [
+    "default",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--reasoning-effort",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_REASONING_EFFORT",
+   "help": "How much reasoning to ask for, on models that expose the setting."
+  },
+  {
+   "dest": "reasoning_format",
+   "flags": [
+    "--reasoning-format"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": "auto",
+   "choices": [
+    "none",
+    "auto",
+    "deepseek",
+    "deepseek-legacy"
+   ],
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "enum",
+   "flag": "--reasoning-format",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_THINK",
+   "help": "How reasoning text is returned: 'none' leaves it inline in the content, 'deepseek' splits it into a reasoning_content field."
+  },
+  {
+   "dest": "reranking",
+   "flags": [
+    "--reranking",
+    "--rerank"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": false,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--reranking",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_RERANKING",
+   "help": "Serve /reranking for a cross-encoder model."
+  },
+  {
+   "dest": "slot_save_path",
+   "flags": [
+    "--slot-save-path"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--slot-save-path",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Directory where slot KV state is saved and restored."
+  },
+  {
+   "dest": "slots",
+   "flags": [
+    "--slots"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--slots",
+   "negatable": true,
+   "negative_flag": "--no-slots",
+   "accepts": [],
+   "env": "LLAMA_ARG_ENDPOINT_SLOTS",
+   "help": "Expose /slots, which reports what each request slot is doing."
+  },
+  {
+   "dest": "sse_ping_interval",
+   "flags": [
+    "--sse-ping-interval"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 30,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--sse-ping-interval",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SSE_PING_INTERVAL",
+   "help": "Seconds between keep-alive pings on a streaming response; -1 disables."
+  },
+  {
+   "dest": "ssl_cert_file",
+   "flags": [
+    "--ssl-cert-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--ssl-cert-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SSL_CERT_FILE",
+   "help": "PEM certificate for HTTPS."
+  },
+  {
+   "dest": "ssl_key_file",
+   "flags": [
+    "--ssl-key-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "str",
+   "flag": "--ssl-key-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SSL_KEY_FILE",
+   "help": "PEM private key for HTTPS."
+  },
+  {
+   "dest": "threads_http",
+   "flags": [
+    "--threads-http"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--threads-http",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_THREADS_HTTP",
+   "help": "Threads serving HTTP. -1 derives one from the slot count."
+  },
+  {
+   "dest": "timeout",
+   "flags": [
+    "-to",
+    "--timeout"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 3600,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "int",
+   "flag": "--timeout",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_TIMEOUT",
+   "help": "Seconds before an idle HTTP connection is dropped."
+  },
+  {
+   "dest": "webui",
+   "flags": [
+    "--webui",
+    "--ui"
+   ],
+   "type": null,
+   "nargs": null,
+   "default": true,
+   "choices": null,
+   "action": "_StoreTrueAction",
+   "group": "example-specific params",
+   "required": false,
+   "widget": "bool",
+   "flag": "--webui",
+   "negatable": true,
+   "negative_flag": "--no-webui",
+   "accepts": [],
+   "env": "LLAMA_ARG_UI",
+   "help": "Serve llama.cpp's own browser UI at the root path."
+  },
+  {
+   "dest": "dry_allowed_length",
+   "flags": [
+    "--dry-allowed-length"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 2,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--dry-allowed-length",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Longest repeated sequence DRY leaves unpenalised."
+  },
+  {
+   "dest": "dry_base",
+   "flags": [
+    "--dry-base"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 1.75,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--dry-base",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "DRY penalty base."
+  },
+  {
+   "dest": "dry_multiplier",
+   "flags": [
+    "--dry-multiplier"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--dry-multiplier",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "DRY repetition penalty strength; 0 disables it."
+  },
+  {
+   "dest": "dry_penalty_last_n",
+   "flags": [
+    "--dry-penalty-last-n"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 64,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--dry-penalty-last-n",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "How far back DRY looks, in tokens; 0 disables it. Must not be negative \u2014 llama-server rejects a negative value while parsing and exits."
+  },
+  {
+   "dest": "frequency_penalty",
+   "flags": [
+    "--frequency-penalty"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--frequency-penalty",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Penalty proportional to how often a token was used."
+  },
+  {
+   "dest": "grammar",
+   "flags": [
+    "--grammar"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "str",
+   "flag": "--grammar",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "A GBNF grammar the output must satisfy."
+  },
+  {
+   "dest": "grammar_file",
+   "flags": [
+    "--grammar-file"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "str",
+   "flag": "--grammar-file",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "A file holding the GBNF grammar."
+  },
+  {
+   "dest": "json_schema",
+   "flags": [
+    "-j",
+    "--json-schema"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "json",
+   "flag": "--json-schema",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "A JSON Schema the output must satisfy, compiled to a grammar."
+  },
+  {
+   "dest": "min_p",
+   "flags": [
+    "--min-p"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.05,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--min-p",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Drop tokens below this fraction of the most likely one's probability."
+  },
+  {
+   "dest": "mirostat",
+   "flags": [
+    "--mirostat"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--mirostat",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Mirostat version: 0 off, 1 or 2 to target a perplexity."
+  },
+  {
+   "dest": "mirostat_ent",
+   "flags": [
+    "--mirostat-ent"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 5.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--mirostat-ent",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Mirostat target entropy."
+  },
+  {
+   "dest": "mirostat_lr",
+   "flags": [
+    "--mirostat-lr"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--mirostat-lr",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Mirostat learning rate."
+  },
+  {
+   "dest": "presence_penalty",
+   "flags": [
+    "--presence-penalty"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--presence-penalty",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Flat penalty on any token already used."
+  },
+  {
+   "dest": "repeat_last_n",
+   "flags": [
+    "--repeat-last-n"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 64,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--repeat-last-n",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "How far back the repetition penalty looks, in tokens; 0 disables it. Must not be negative \u2014 llama-server rejects a negative value while parsing its arguments and exits before the model is read."
+  },
+  {
+   "dest": "repeat_penalty",
+   "flags": [
+    "--repeat-penalty"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--repeat-penalty",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Penalty on repeated tokens; 1 disables."
+  },
+  {
+   "dest": "samplers",
+   "flags": [
+    "--samplers"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "str",
+   "flag": "--samplers",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "The sampler chain, semicolon separated, in the order it is applied."
+  },
+  {
+   "dest": "seed",
+   "flags": [
+    "-s",
+    "--seed"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": -1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--seed",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Sampling seed; -1 is random per request."
+  },
+  {
+   "dest": "temp",
+   "flags": [
+    "--temp",
+    "--temperature"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.8,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--temp",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Sampling temperature."
+  },
+  {
+   "dest": "top_k",
+   "flags": [
+    "--top-k"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 40,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "int",
+   "flag": "--top-k",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Keep only the k most likely tokens; 0 disables."
+  },
+  {
+   "dest": "top_n_sigma",
+   "flags": [
+    "--top-n-sigma"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": -1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--top-n-sigma",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Keep tokens within n standard deviations of the top logit."
+  },
+  {
+   "dest": "top_p",
+   "flags": [
+    "--top-p"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.95,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--top-p",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Keep the smallest set of tokens whose probability sums to p."
+  },
+  {
+   "dest": "typical_p",
+   "flags": [
+    "--typical",
+    "--typical-p"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 1.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--typical-p",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Locally typical sampling; 1 disables."
+  },
+  {
+   "dest": "xtc_probability",
+   "flags": [
+    "--xtc-probability"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--xtc-probability",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Chance of dropping a likely token, for variety; 0 disables."
+  },
+  {
+   "dest": "xtc_threshold",
+   "flags": [
+    "--xtc-threshold"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "sampling params",
+   "required": false,
+   "widget": "float",
+   "flag": "--xtc-threshold",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": null,
+   "help": "Probability above which XTC may drop a token."
+  },
+  {
+   "dest": "spec_draft_model",
+   "flags": [
+    "--spec-draft-model",
+    "-md",
+    "--model-draft"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "str",
+   "flag": "--spec-draft-model",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_DRAFT_MODEL",
+   "help": "A small model that drafts tokens for the main one to verify. It must share the main model's tokenizer."
+  },
+  {
+   "dest": "spec_draft_n_max",
+   "flags": [
+    "--spec-draft-n-max"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 3,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "int",
+   "flag": "--spec-draft-n-max",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_DRAFT_N_MAX",
+   "help": "Most tokens to draft in one step."
+  },
+  {
+   "dest": "spec_draft_n_min",
+   "flags": [
+    "--spec-draft-n-min"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": 0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "int",
+   "flag": "--spec-draft-n-min",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_DRAFT_N_MIN",
+   "help": "Fewest tokens worth drafting before it is not worth the pass."
+  },
+  {
+   "dest": "spec_draft_ngl",
+   "flags": [
+    "--spec-draft-ngl",
+    "-ngld",
+    "--n-gpu-layers-draft"
+   ],
+   "type": "int",
+   "nargs": null,
+   "default": "auto",
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "size",
+   "flag": "--spec-draft-ngl",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [
+    "auto",
+    "all"
+   ],
+   "env": "LLAMA_ARG_N_GPU_LAYERS_DRAFT",
+   "help": "Layers of the draft model to offload. Its weights come out of the same pool as the main model's."
+  },
+  {
+   "dest": "spec_draft_p_min",
+   "flags": [
+    "--spec-draft-p-min",
+    "--draft-p-min"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.0,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "float",
+   "flag": "--spec-draft-p-min",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_DRAFT_P_MIN",
+   "help": "Stop drafting when the draft model's confidence falls below this."
+  },
+  {
+   "dest": "spec_draft_p_split",
+   "flags": [
+    "--spec-draft-p-split",
+    "--draft-p-split"
+   ],
+   "type": "float",
+   "nargs": null,
+   "default": 0.1,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "float",
+   "flag": "--spec-draft-p-split",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_DRAFT_P_SPLIT",
+   "help": "Probability at which a draft splits into a tree."
+  },
+  {
+   "dest": "spec_type",
+   "flags": [
+    "--spec-type"
+   ],
+   "type": "str",
+   "nargs": null,
+   "default": null,
+   "choices": null,
+   "action": "_StoreAction",
+   "group": "speculative params",
+   "required": false,
+   "widget": "str",
+   "flag": "--spec-type",
+   "negatable": false,
+   "negative_flag": null,
+   "accepts": [],
+   "env": "LLAMA_ARG_SPEC_TYPE",
+   "help": "Which speculation strategy to use \u2014 a draft model, or one of the n-gram methods that need no second model."
+  }
+ ]
+}

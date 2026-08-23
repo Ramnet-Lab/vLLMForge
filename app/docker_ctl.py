@@ -65,6 +65,25 @@ class ContainerState:
     error: str = ""
     image: str = ""
     command: list[str] | None = None
+    entrypoint: list[str] | None = None
+
+    @property
+    def argv(self) -> list[str]:
+        """Entrypoint and command together — what the container actually runs.
+
+        Additive on purpose. `command` is `Config.Cmd` and keeps that meaning
+        exactly, because every parser in this codebase reads it and several of
+        them look at a fixed window of the first tokens; prepending the
+        entrypoint there would shift that window silently.
+
+        This exists because an image is free to put the program in its
+        ENTRYPOINT and leave only flags in Cmd — which the upstream llama.cpp
+        server images do — and a container whose argv starts with `-m` is
+        recognisable as nothing at all. `engines.recognise` asks about `command`
+        first and falls back here, so the fallback can only ever add a container
+        to the picture, never move one that was already in it.
+        """
+        return list(self.entrypoint or []) + list(self.command or [])
 
     @property
     def ui_status(self) -> str:
@@ -227,6 +246,7 @@ async def state(name: str, host: str | None = None) -> ContainerState:
         error=st.get("Error", "") or "",
         image=(info.get("Config", {}) or {}).get("Image", ""),
         command=(info.get("Config", {}) or {}).get("Cmd"),
+        entrypoint=(info.get("Config", {}) or {}).get("Entrypoint"),
     )
 
 

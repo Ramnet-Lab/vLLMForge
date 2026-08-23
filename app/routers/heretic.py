@@ -111,6 +111,10 @@ async def serve(job_id: str) -> dict:
         "model": servers.container_path(out),
         "served_name": f"heretic-{job_id}",
         "port": await asyncio.to_thread(servers.suggest_port),
+        # Stated rather than defaulted: a Heretic export is safetensors, so vLLM
+        # is genuinely the right engine here and not an accident of what the
+        # default happened to be on the day this was written.
+        "engine": "vllm",
         "image": settings.vllm_image,
         "args": {"gpu_memory_utilization": util, "max_model_len": 4096},
         "notes": (

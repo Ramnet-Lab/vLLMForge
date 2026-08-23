@@ -130,6 +130,12 @@ class Recommendation:
     findings: list[Finding] = field(default_factory=list)
     left_alone: list[dict[str, str]] = field(default_factory=list)
     profile: dict[str, Any] = field(default_factory=dict)
+    engine: str = "vllm"
+    engine_hint: str = ""
+    """Which engine this model actually wants, when it is not the one asked
+    about. Set only where the answer is unambiguous from the files on disk —
+    GGUF weights and nothing else — so the form can offer the switch rather than
+    leaving the operator with a refusal and no next step."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -137,6 +143,8 @@ class Recommendation:
             "node": self.node,
             "ok": self.ok,
             "level": self.level,
+            "engine": self.engine,
+            "engine_hint": self.engine_hint,
             "headline": self.headline,
             "args": {s.dest: s.value for s in self.suggestions},
             "suggestions": [{"dest": s.dest, "value": s.value, "why": s.why}
@@ -257,7 +265,15 @@ async def build(model: str, node: str = "", args: dict[str, Any] | None = None,
     if server_id is not None:
         from app import servers as server_service
 
-        replacing = server_service.container_name({"id": server_id})
+        # The real row, not a stub carrying only the id. The container's name is
+        # derived from the engine as well as the id, so a synthesised dict would
+        # name `llmd-vllm-<id>` for a llama.cpp server — which matches nothing
+        # running, leaves excluded_bytes at zero, and computes the whole
+        # recommendation with that server's own memory charged against its own
+        # reconfiguration. That is exactly what the exclusion exists to prevent.
+        existing = await asyncio.to_thread(server_service.get_server, server_id)
+        if existing is not None:
+            replacing = server_service.container_name(existing)
 
     budget = await safety.current_budget(exclude=replacing, node=target)
     # Both figures come from the budget, which got them from the one probe that
@@ -320,11 +336,19 @@ def _blockers(rec: Recommendation, profile: Profile, available: int, shards: int
         return
 
     if profile.has_gguf and not profile.has_safetensors:
+        # Still a block, because this module recommends vLLM flags and vLLM
+        # genuinely cannot read GGUF — but it stopped being a dead end when a
+        # second engine arrived. What used to say "nothing serves this" now
+        # says which engine does, because the operator is one dropdown away
+        # from a configuration that works.
         rec.ok = False
         rec.level = "block"
-        rec.headline = "GGUF weights only."
+        rec.headline = "GGUF weights — this is a llama.cpp model."
         rec.findings.append(Finding("block", (
-            "This image loads safetensors. There is no flag that makes it read GGUF.")))
+            "vLLM loads safetensors and there is no flag that makes it read GGUF. Switch the "
+            "Engine field to llama.cpp and pick the .gguf file you want; the form below will "
+            "be rebuilt from llama-server's own flags.")))
+        rec.engine_hint = "llamacpp"
         return
 
     # A pooled engine splits the layers, so each machine holds its own share.

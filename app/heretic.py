@@ -565,7 +565,10 @@ async def preflight(cfg: HereticSettings) -> dict[str, Any]:
     billions = info["params"] / 1e9
     headroom = budget.available_bytes - peak
     util = peak / budget.total_bytes if budget.total_bytes else 0.0
-    tenants = ", ".join(f"{t.name}={t.util:g}" for t in budget.tenants) or "none"
+    # `label` rather than the fraction: a tenant whose engine declares no
+    # utilisation has util=None, and formatting that with :g raises. For one
+    # that does declare it the label is the identical string.
+    tenants = ", ".join(t.label for t in budget.tenants) or "none"
     sized = (
         f"{cfg.model} is ~{billions:.1f}B parameters, so expect ~{_gib(estimate['load_bytes'])} "
         f"resident during the search and ~{_gib(peak)} at merge time"

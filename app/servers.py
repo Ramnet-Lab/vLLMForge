@@ -1,9 +1,25 @@
-"""vLLM server lifecycle.
+"""Inference server lifecycle.
 
-A "server" is a saved parameter set plus a container. The dashboard also
-discovers vLLM containers it did not start — the hand-launched ones from
-a `vllm serve` started from a shell shows up alongside managed servers so the memory picture on the
-Overview page is the truth about the host, not just about this app.
+A "server" is a saved parameter set, an engine, and a container. The dashboard
+also discovers engine containers it did not start — a `vllm serve` or a
+`llama-server` launched from a shell shows up alongside managed servers so the
+memory picture on the Overview page is the truth about the host, not just about
+this app.
+
+The engine is a column on the row, and everything that differs because of it is
+asked of an object rather than branched on here: `engine_for(server)` returns an
+`app.engines.Engine`, and it answers the argv, the image, the container kind,
+the environment, the metric names and what "still loading" looks like. Two of
+those are less obvious than they sound:
+
+* The engine name IS the container kind, so an existing vLLM row keeps the
+  `llmd-vllm-<id>` name it has always had. Changing a saved row's engine while
+  its container runs would rename that container out from under a live process,
+  which is why `update_server` refuses it.
+* "Loading" is an inverted test between the two. vLLM binds no port until the
+  weights are read and the graphs captured; llama-server binds first and answers
+  /health with 503 while it loads. Sharing one rule would leave one of them
+  looking broken for the several minutes a large model takes.
 
 Managed containers deliberately get restart policy "no": on a unified-memory
 host, a crash-looping engine that keeps re-reserving 60 GiB is worse than a
@@ -15,16 +31,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from app import cluster, db, docker_ctl, events, hf, jobs, nodes, safety, vllm_spec
+from app import cluster, db, docker_ctl, engines, events, hf, jobs, nodes, safety, vllm_spec
 from app.config import settings
 
-JSON_FIELDS = ("args", "env", "pool_nodes")
+JSON_FIELDS = ("args", "env", "pool_nodes", "args_by_engine")
 
 # Measuring the budget and creating the container have to happen together.
 # Two starts that each measure before the other has launched will both be
@@ -33,21 +50,10 @@ LAUNCH_LOCK = asyncio.Lock()
 HEALTH_TIMEOUT = 2.0
 DEFAULT_PORT_RANGE = range(8010, 8100)
 
-# vLLM's own metrics, cherry-picked for the UI. Everything else stays in the
-# raw /metrics passthrough.
-INTERESTING_METRICS = (
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-    "vllm:gpu_cache_usage_perc",
-    "vllm:kv_cache_usage_perc",
-    "vllm:gpu_prefix_cache_hit_rate",
-    "vllm:prefix_cache_hits_total",
-    "vllm:prefix_cache_queries_total",
-    "vllm:prompt_tokens_total",
-    "vllm:generation_tokens_total",
-    "vllm:request_success_total",
-    "vllm:num_preemptions_total",
-)
+# Each engine's own metrics, cherry-picked for the UI; everything else stays in
+# the raw /metrics passthrough. The list moved onto the engine objects, and this
+# name survives as vLLM's because it is what the existing readers mean.
+INTERESTING_METRICS = engines.get("vllm").interesting_metrics
 
 _METRIC_LINE = re.compile(r"^(?P<name>[a-zA-Z_:][\w:]*)(?P<labels>\{[^}]*\})?\s+(?P<value>[^\s]+)$")
 
@@ -66,24 +72,42 @@ def get_by_name(name: str) -> dict | None:
     return db.hydrate(db.query_one("SELECT * FROM servers WHERE name = ?", (name,)), JSON_FIELDS)
 
 
+def _stash(args_by_engine: Any, engine: str, args: dict) -> dict:
+    """The per-engine argument stash, with this engine's set written into it.
+
+    `args` is authoritative and always holds the ACTIVE engine's arguments;
+    this column is the editor's memory of the sets belonging to the others, so
+    switching a definition to llama.cpp and back does not throw either away.
+    Nothing may read it to make a decision — if the two ever disagree, `args`
+    wins. A row never edited keeps `{}`, which correctly says "nothing is
+    remembered for any other engine".
+    """
+    existing = args_by_engine if isinstance(args_by_engine, dict) else {}
+    return {**existing, engine: dict(args or {})}
+
+
 def create_server(payload: dict) -> dict:
     now = db.now()
+    engine = engines.get(payload.get("engine"))
+    args = payload.get("args") or {}
     cursor = db.execute(
         "INSERT INTO servers (name, model, served_name, port, image, args, env, notes, autostart,"
-        " node, pool_nodes, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " node, pool_nodes, engine, args_by_engine, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             payload["name"],
             payload["model"],
             payload.get("served_name") or "",
             int(payload["port"]),
-            payload.get("image") or settings.vllm_image,
-            db.dumps(payload.get("args") or {}),
+            payload.get("image") or engine.default_image,
+            db.dumps(args),
             db.dumps(payload.get("env") or {}),
             payload.get("notes", ""),
             1 if payload.get("autostart") else 0,
             payload.get("node") or nodes.LOCAL,
             db.dumps(payload.get("pool_nodes") or []),
+            engine.name,
+            db.dumps(_stash(payload.get("args_by_engine"), engine.name, args)),
             now,
             now,
         ),
@@ -96,21 +120,55 @@ def update_server(server_id: int, payload: dict) -> dict | None:
     if existing is None:
         return None
     merged = {**existing, **{k: v for k, v in payload.items() if v is not None}}
+    engine = engines.get(merged.get("engine"))
+    was = engines.of(existing)
+    args = merged.get("args") or {}
+    stash = merged.get("args_by_engine")
+    stash = dict(stash) if isinstance(stash, dict) else {}
+
+    if engine.name != was.name:
+        # The outgoing engine's arguments are put away FIRST, whatever the caller
+        # sent. The editor posts a full stash, but an API client patching only
+        # {engine, args} would otherwise drop the set it is switching away from —
+        # and for a row that predates the stash column, whose stash is `{}`, that
+        # set exists nowhere else.
+        stash.setdefault(was.name, dict(existing.get("args") or {}))
+        if "args" not in payload:
+            # The caller said nothing about the arguments. Carrying the old
+            # engine's forward would produce a row whose args are flags the new
+            # engine has never heard of, so the stash answers instead — and an
+            # empty entry correctly means "start from this engine's defaults".
+            #
+            # Validated on the way out, because the stash is not validated on
+            # the way in: `ServerIn` checks `args` against the engine, and a
+            # client that put nonsense under another engine's key would
+            # otherwise have it promoted into the authoritative column by a
+            # later switch, bypassing the check entirely.
+            candidate = dict(stash.get(engine.name) or {})
+            if engine.validate(candidate):
+                logging.getLogger("llmd.servers").warning(
+                    "discarding the stashed %s arguments of server %s: %s",
+                    engine.name, server_id, "; ".join(engine.validate(candidate)))
+                candidate = {}
+            args = candidate
     db.execute(
         "UPDATE servers SET name = ?, model = ?, served_name = ?, port = ?, image = ?, args = ?,"
-        " env = ?, notes = ?, autostart = ?, node = ?, pool_nodes = ?, updated_at = ? WHERE id = ?",
+        " env = ?, notes = ?, autostart = ?, node = ?, pool_nodes = ?, engine = ?,"
+        " args_by_engine = ?, updated_at = ? WHERE id = ?",
         (
             merged["name"],
             merged["model"],
             merged.get("served_name") or "",
             int(merged["port"]),
-            merged.get("image") or settings.vllm_image,
-            db.dumps(merged.get("args") or {}),
+            merged.get("image") or engine.default_image,
+            db.dumps(args),
             db.dumps(merged.get("env") or {}),
             merged.get("notes", ""),
             1 if merged.get("autostart") else 0,
             merged.get("node") or nodes.LOCAL,
             db.dumps(merged.get("pool_nodes") or []),
+            engine.name,
+            db.dumps(_stash(stash, engine.name, args)),
             db.now(),
             server_id,
         ),
@@ -118,12 +176,58 @@ def update_server(server_id: int, payload: dict) -> dict | None:
     return get_server(server_id)
 
 
+async def container_running(server: dict) -> bool | None:
+    """Whether this definition owns a RUNNING container. None if it cannot be told.
+
+    Running, not merely existing: an exited container holds no memory, and
+    `start()` removes one by name before it launches, so it is not the hazard
+    the engine-change refusal exists for. Gating on existence instead meant a
+    server that had ever been started could never change engine again — and the
+    refusal told the operator to stop something they already had.
+
+    None means the question could not be answered. `docker inspect` reports a
+    missing container and an unreachable daemon identically (both exit non-zero,
+    both become `exists=False`), so a peer that is rebooting would otherwise read
+    as "no container" and permit a switch that orphans a live engine. The caller
+    treats None as a refusal, which is the safe direction: the cost is a
+    temporary inability to edit, against a permanently unstoppable container.
+    """
+    unknown = False
+    for name, host in await _rank_locations(server):
+        try:
+            if host is not None and not await docker_ctl.available(host):
+                unknown = True
+                continue
+        except Exception:
+            unknown = True
+            continue
+        if (await docker_ctl.state(name, host)).running:
+            return True
+    return None if unknown else False
+
+
 def delete_server(server_id: int) -> None:
     db.execute("DELETE FROM servers WHERE id = ?", (server_id,))
 
 
+def engine_for(server: dict) -> engines.Engine:
+    """Which engine this row runs. The one way anything here asks.
+
+    Not `engine_of` — that name is taken further down by the reverse lookup,
+    which answers "which server definition owns this container".
+    """
+    return engines.of(server)
+
+
 def container_name(server: dict) -> str:
-    return settings.container_name("vllm", server["id"])
+    """This definition's container.
+
+    The kind is the engine's name, so a row that predates the engine column —
+    every existing one, defaulted to 'vllm' by the migration — yields exactly the
+    `llmd-vllm-<id>` name it already has, and its running container is still
+    found, still counted as managed, and still stoppable after the upgrade.
+    """
+    return settings.container_name(engine_for(server).name, server["id"])
 
 
 def pool_of(server: dict) -> list[str]:
@@ -143,9 +247,12 @@ def node_of(server: dict) -> nodes.Node:
 def host_of(server: dict) -> str | None:
     """Where this server's vLLM container runs. For a pooled engine that is the
     Ray head — the other nodes hold shards, not the HTTP frontend."""
-    pool = pool_of(server)
-    if pool:
-        return nodes.by_name(pool[0]).docker_host
+    # `is_pooled` rather than a truthiness test on the list: a one-entry
+    # pool_nodes is not a pool, and `start()` launches such a row on `node`.
+    # Answering with pool[0] here made autostart inspect the wrong machine, read
+    # "absent", and force-relaunch a healthy container on every dashboard boot.
+    if is_pooled(server):
+        return nodes.by_name(pool_of(server)[0]).docker_host
     return node_of(server).docker_host
 
 
@@ -164,10 +271,28 @@ def suggest_port() -> int:
 # --- command assembly ---------------------------------------------------
 
 def build_command(server: dict) -> list[str]:
+    engine = engine_for(server)
     args = dict(server.get("args") or {})
-    if server.get("served_name") and not args.get("served_model_name"):
-        args["served_model_name"] = server["served_name"]
-    return vllm_spec.build_argv(server["model"], args, port=int(server["port"]))
+    # What clients put in the "model" field. vLLM spells it --served-model-name
+    # and llama.cpp spells it --alias; the row stores the value once and the
+    # engine says which flag it becomes.
+    dest = engine.served_name_dest
+    if server.get("served_name") and not args.get(dest):
+        args[dest] = server["served_name"]
+    return engine.build_argv(server["model"], args, port=int(server["port"]))
+
+
+def sizing_params(server: dict) -> dict[str, Any]:
+    """The arguments as the memory guard needs to see them: with the model.
+
+    `model` is a managed flag — it has its own column and the API refuses it
+    inside `args` — so the stored dict alone describes a configuration with no
+    weights in it. vLLM does not notice, because its footprint is a fraction of
+    the machine and says nothing about the model. llama.cpp is priced FROM the
+    model, so handing it `args` alone made every launch unsizeable, worth zero
+    bytes, and admitted.
+    """
+    return {**(server.get("args") or {}), "model": server.get("model") or ""}
 
 
 def build_env(server: dict) -> dict[str, str]:
@@ -176,24 +301,34 @@ def build_env(server: dict) -> dict[str, str]:
     # such an engine an NCCL_SOCKET_IFNAME breaks it outright if the name is not
     # a device on that box, and buys nothing when it is. A pooled rank gets its
     # own node's detected interface from cluster.rank_env() instead.
+    #
+    # HF_HOME and HF_TOKEN are shared rather than per-engine: both engines read
+    # the same mounted cache and both read the token under that exact name.
     env = {"HF_HOME": "/hf"}
     hf_token = hf.token()
     if hf_token:
         env["HF_TOKEN"] = hf_token
+    env.update(engine_for(server).env_overlay(server.get("args") or {}))
+    # The operator's own variables last, so they can override anything above.
     env.update({str(k): str(v) for k, v in (server.get("env") or {}).items()})
-    if (server.get("args") or {}).get("enable_lora"):
-        env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
     return env
 
 
+def image_of(server: dict) -> str:
+    return server.get("image") or engine_for(server).default_image
+
+
 def launch_preview(server: dict) -> str:
+    engine = engine_for(server)
     return docker_ctl.preview(
         docker_ctl.build_run_argv(
             name=container_name(server),
-            image=server.get("image") or settings.vllm_image,
+            image=image_of(server),
             command=build_command(server),
             env=build_env(server),
             mounts=_mounts(),
+            gpu=engine.gpu,
+            entrypoint=engine.entrypoint,
         )
     )
 
@@ -209,21 +344,56 @@ def _mounts() -> list[docker_ctl.Mount]:
     ]
 
 
+def _relative_to(path: Path, root: Path) -> Path | None:
+    """`path` expressed under `root`, without dereferencing its final component.
+
+    The leaf is left alone on purpose. A HuggingFace snapshot directory is a tree
+    of symlinks into `blobs/`, so resolving the last component turns
+    `snapshots/<sha>/Qwen3-8B-Q4_K_M.gguf` into `blobs/<sha256>` — still inside
+    the mount and still openable, but no longer nameable, and the operator picks
+    a quantisation by its filename.
+
+    The parent chain IS resolved, and the root is tried both ways, because either
+    may legitimately run through a symlink — a home directory on another volume
+    is the ordinary case.
+    """
+    leaf = path.parent.resolve() / path.name if path.name else path.resolve()
+    for base in (root, root.resolve()):
+        for candidate in (path, leaf):
+            try:
+                return candidate.relative_to(base)
+            except (ValueError, OSError):
+                continue
+    return None
+
+
 def container_path(host_path: str | Path) -> str:
-    """Where a vLLM container sees a path that a job produced on the host.
+    """Where an engine container sees a path that exists on the host.
 
     Models built by the Heretic and fine-tuning tabs live under the output
-    directory, which is bind-mounted into every server container. Handing vLLM
-    the host path instead would fail at load with a missing-directory error, and
-    only after the container had already started.
+    directory, and the HuggingFace cache holds everything that was pulled; both
+    are bind-mounted into every server container. Handing an engine the host
+    path instead would fail at load with a missing file, and only after the
+    container had already started.
+
+    The cache is folded as well as the outputs directory, and that is not
+    symmetry for its own sake: a vLLM server names a repo and lets the engine
+    resolve it through the mounted cache, but llama.cpp is pointed at one .gguf
+    FILE inside a snapshot — so a cache path became a legal model reference the
+    moment there were two engines, and returning the host path for it produced a
+    container that could not find its weights.
     """
-    resolved = Path(host_path).resolve()
-    root = settings.output_dir.resolve()
-    try:
-        relative = resolved.relative_to(root)
-    except ValueError:
-        return str(resolved)
-    return f"{OUTPUTS_MOUNT}/{relative}" if str(relative) != "." else OUTPUTS_MOUNT
+    absolute = Path(host_path)
+    if not absolute.is_absolute():
+        absolute = Path.cwd() / absolute
+    absolute = Path(os.path.normpath(absolute))
+
+    for root, mount in ((settings.output_dir, OUTPUTS_MOUNT), (settings.hf_cache, CACHE_MOUNT)):
+        relative = _relative_to(absolute, Path(root))
+        if relative is None:
+            continue
+        return f"{mount}/{relative}" if str(relative) != "." else mount
+    return str(absolute)
 
 
 # --- lifecycle ----------------------------------------------------------
@@ -277,7 +447,7 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         # entirely, which is how a definition asking for 0.95 of a box with 0.88
         # free reached vLLM and died four minutes in.
         plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {},
-                                  replacing=base)
+                                  replacing=base, image=image_of(server))
         if not plan["ok"] and not force:
             safety_block = _pool_safety(plan)
             # A plan refused because the memory would not fit is the same kind of
@@ -334,7 +504,7 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
             for rank, w in enumerate(wirings):
                 await docker_ctl.run_detached(
                     name=names[rank],
-                    image=server.get("image") or settings.vllm_image,
+                    image=image_of(server),
                     command=cluster.rank_argv(serve_argv, rank, len(wirings), head, master_port),
                     env=cluster.rank_env(w, head, build_env(server)),
                     mounts=_mounts(),
@@ -371,16 +541,32 @@ async def start(server_id: int, *, force: bool = False) -> dict:
     if server is None:
         raise KeyError(server_id)
 
+    engine = engine_for(server)
     if is_pooled(server):
+        if not engine.supports_pooling:
+            # A value check, above the lock, measuring nothing — refusing here
+            # rather than inside start_pooled keeps the launch path to exactly
+            # one `async with LAUNCH_LOCK`, which is what the lock's whole
+            # discipline depends on. Both engines spend the same pool, so a
+            # second entry point that measured outside it would over-commit vLLM
+            # as readily as llama.cpp.
+            return {"started": False, "error": (
+                f"{engine.label} cannot be pooled across machines. Pooling here is vLLM's "
+                "pipeline-parallel path; llama.cpp distributes over --rpc instead, which is "
+                "a different topology with different failure modes and is not wired up.")}
         return await start_pooled(server, force=force)
 
     name = container_name(server)
     args = server.get("args") or {}
-    util = vllm_spec.gpu_memory_utilization(args)
 
     node = node_of(server)
     async with LAUNCH_LOCK:
-        verdict = await safety.check_launch(util, replacing=name, params=args, node=node)
+        # Everything the verdict needs happens inside the lock, the engine's own
+        # file reads included: measuring before another launch has created its
+        # container is exactly the race the lock exists to close.
+        verdict = await safety.check_launch(
+            engine.declared_util(args), replacing=name, params=sizing_params(server),
+            node=node, engine=engine.name)
         if not verdict.ok and not force:
             return {"started": False, "safety": verdict.as_dict()}
 
@@ -389,11 +575,12 @@ async def start(server_id: int, *, force: bool = False) -> dict:
         try:
             await docker_ctl.run_detached(
                 name=name,
-                image=server.get("image") or settings.vllm_image,
+                image=image_of(server),
                 command=build_command(server),
                 env=build_env(server),
                 mounts=_mounts(),
-                gpu=True,
+                gpu=engine.gpu,
+                entrypoint=engine.entrypoint,
                 network="host",
                 host=node.docker_host,
             )
@@ -468,8 +655,14 @@ async def probe(port: int, *, host: str = "127.0.0.1") -> dict:
     return result
 
 
-def parse_metrics(text: str) -> dict[str, Any]:
-    """Minimal Prometheus text parse: last value wins per metric name."""
+def parse_metrics(text: str, *, engine: str = "vllm") -> dict[str, Any]:
+    """Minimal Prometheus text parse: last value wins per metric name.
+
+    The parse is generic; only which series are promoted into `selected` is the
+    engine's, and `engine` defaults to vLLM so every existing caller keeps its
+    exact answer. Note that vLLM's own series carry a label literally named
+    `engine` — a data-parallel rank — which is unrelated to this parameter.
+    """
     gauges: dict[str, float] = {}
     counters: dict[str, float] = {}
     for line in text.splitlines():
@@ -487,21 +680,27 @@ def parse_metrics(text: str) -> dict[str, Any]:
         target = counters if name.endswith("_total") else gauges
         target[name] = target.get(name, 0.0) + value if name.endswith("_total") else value
     merged = {**gauges, **counters}
+    wanted = engines.get(engine).interesting_metrics
     return {
-        "selected": {k: merged[k] for k in INTERESTING_METRICS if k in merged},
+        "selected": {k: merged[k] for k in wanted if k in merged},
         "all": merged,
+        "engine": engines.get(engine).name,
     }
 
 
-async def metrics(port: int, *, host: str = "127.0.0.1") -> dict:
+async def metrics(port: int, *, host: str = "127.0.0.1", engine: str = "vllm") -> dict:
     try:
         async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
             response = await client.get(f"http://{host}:{port}/metrics")
         if response.status_code != 200:
-            return {"selected": {}, "all": {}}
-        return parse_metrics(response.text)
+            # llama-server serves /metrics only when it was started with
+            # --metrics, and answers 501 otherwise. The launcher always passes
+            # it, so anything but a 200 here means a container somebody else
+            # started.
+            return {"selected": {}, "all": {}, "engine": engine}
+        return parse_metrics(response.text, engine=engine)
     except (httpx.HTTPError, OSError):
-        return {"selected": {}, "all": {}}
+        return {"selected": {}, "all": {}, "engine": engine}
 
 
 # --- discovery of containers we did not start ---------------------------
@@ -525,14 +724,14 @@ def _port_from_command(command: list[str] | None) -> int | None:
     return None
 
 
-def _model_from_command(command: list[str] | None) -> str:
-    if not command:
-        return ""
-    for index, token in enumerate(command):
-        if token == "serve" and index + 1 < len(command):
-            candidate = command[index + 1]
-            return "" if candidate.startswith("-") else candidate
-    return ""
+def _model_from_command(command: list[str] | None, *, engine: Any = None) -> str:
+    """What a container is serving, read the way its own engine spells it.
+
+    `vllm serve <model>` puts it in a positional; `llama-server` puts it behind
+    -m, --model or -hf. Defaults to vLLM so the existing callers and their tests
+    keep their exact answer.
+    """
+    return (engine or engines.get("vllm")).model_from_argv(command)
 
 
 def engine_of(container: str) -> dict | None:
@@ -564,37 +763,63 @@ async def engine_containers(container: str) -> list[tuple[str, str | None]]:
 
 
 async def discover_foreign() -> list[dict]:
-    """vLLM containers on this host that the dashboard does not manage.
+    """Engine containers on this host that the dashboard does not manage.
 
     A pooled server owns a container per rank, and its far ranks can land on
     this machine. Counting only rank 0 as managed listed them here as somebody
     else's hand-launched engines, complete with a Stop button — one click on
     which aborts a healthy multi-machine engine and leaves its other ranks
     resident, holding their memory for a world size that can never re-form.
+
+    Both engines are recognised here, and for llama.cpp that is the cheapest
+    large win in the whole change. A hand-launched llama-server holding 40 GiB
+    was never invisible to the *arithmetic* — nvidia-smi's per-process figure
+    folds it into occupied memory — but it was invisible to the operator: it was
+    named nowhere, listed nowhere, and could not be stopped from here. The
+    budget refused launches for a reason nothing on the page could show.
     """
+    from app import accel
+
     managed = set()
     for definition in list_servers():
         base = container_name(definition)
         managed.update(cluster.rank_names(base, len(pool_of(definition)) or 1))
+
+    # Read lazily. This runs on every five-second status poll, and
+    # `accel.pool_for` is two uncached nvidia-smi round trips — paid for nothing
+    # on the ordinary box where no foreign engine is running.
+    total: int | None = None
     found: list[dict] = []
     for row in await docker_ctl.ps(all_containers=False):
         name = str(row.get("Names", ""))
         if not name or name in managed:
             continue
         state = await docker_ctl.state(name)
-        if not safety.is_vllm_command(state.command):
+        # The argv the engine actually matched — for an image that puts the
+        # binary in its ENTRYPOINT that is not what docker calls the command.
+        engine, argv = engines.identify(state)
+        if engine is None:
             continue
-        port = _port_from_command(state.command)
+        params = await engine.resolve(engine.command_params(argv))
+        if total is None:
+            total = (await accel.pool_for(None)).total_bytes or 1
+        port = _port_from_command(argv)
         found.append(
             {
                 "name": name,
                 "image": state.image,
-                "model": _model_from_command(state.command),
+                "engine": engine.name,
+                "engine_label": engine.label,
+                "model": _model_from_command(argv, engine=engine),
                 "port": port,
-                "util": safety.parse_util(state.command),
+                # None for an engine that declares no fraction. Deliberately not
+                # bytes/total: two engines' Util columns must not look summable,
+                # because an operator will add them.
+                "util": engine.declared_util(params),
+                "footprint_bytes": engine.footprint_bytes(params, total),
                 "status": state.ui_status,
                 "started_at": state.started_at,
-                "command": state.command,
+                "command": argv,
             }
         )
     return found
@@ -614,7 +839,9 @@ async def status_all() -> dict:
 
     async def decorate(server: dict) -> dict:
         node = node_of(server)
+        engine = engine_for(server)
         state = states.get(container_name(server))
+        args = server.get("args") or {}
         # A server on a peer answers on that peer's address, not on loopback.
         base_host = "127.0.0.1" if node.is_local else (node.address or node.name)
         entry = {
@@ -622,19 +849,25 @@ async def status_all() -> dict:
             "container": container_name(server),
             "node": node.name,
             "node_local": node.is_local,
+            "engine": engine.name,
+            "engine_label": engine.label,
+            "supports_pooling": engine.supports_pooling,
             "status": state.ui_status if state else "absent",
             "exit_code": state.exit_code if state else None,
             "oom_killed": state.oom_killed if state else False,
             "started_at": state.started_at if state else None,
-            "util": vllm_spec.gpu_memory_utilization(server.get("args") or {}),
+            "util": engine.declared_util(args),
             "url": f"http://{base_host}:{server['port']}",
         }
         if entry["status"] in ("running", "starting", "unhealthy"):
             entry["health"] = await probe(int(server["port"]), host=base_host)
-            # vLLM does not bind its port until the weights are loaded and the
-            # CUDA graphs captured, so a refused connection means "still
-            # loading", not "broken".
-            if entry["status"] == "running" and not entry["health"]["reachable"]:
+            # What "still loading" looks like is an inverted test between the
+            # two engines, so the engine decides. vLLM binds no port until the
+            # weights are loaded and the CUDA graphs captured, so a refused
+            # connection means loading; llama-server binds first and answers
+            # /health with 503 until the weights are in, so for it a reachable
+            # port that is not yet healthy is what loading looks like.
+            if entry["status"] == "running" and engine.is_loading(**entry["health"]):
                 entry["status"] = "loading"
         else:
             entry["health"] = {"reachable": False, "healthy": False, "models": []}
@@ -789,7 +1022,12 @@ async def autostart() -> None:
     for server in list_servers():
         if not server.get("autostart"):
             continue
-        state = await docker_ctl.state(container_name(server))
+        # Asked of the machine the server actually runs on. Without the host this
+        # always read "absent" for a peer's server, so every dashboard restart
+        # force-removed and relaunched a healthy remote engine — and with two
+        # engines it would also mean launching a second container beside one
+        # whose name no longer matches the row.
+        state = await docker_ctl.state(container_name(server), host_of(server))
         if state.running:
             continue
         try:

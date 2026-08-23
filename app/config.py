@@ -74,6 +74,27 @@ class Settings:
     finetune_image: str = field(
         default_factory=lambda: _env("LLMD_FINETUNE_IMAGE", "llmd/finetune:latest")
     )
+    # The second serving engine. Built from docker/llamacpp.Dockerfile rather
+    # than pulled, for the same reason the vLLM image is: the upstream server
+    # image puts the binary in its ENTRYPOINT, which would swallow the argv the
+    # dashboard passes as the container command.
+    llamacpp_image: str = field(
+        default_factory=lambda: _env("LLMD_LLAMACPP_IMAGE", "llmd/llamacpp:latest")
+    )
+    # What docker/llamacpp.Dockerfile builds on. Separate from vllm_base_image
+    # because it is a different upstream entirely — a llama.cpp server build, not
+    # an NGC vLLM image — and choosing it by accelerator kind would be wrong.
+    llamacpp_base_image: str = field(
+        default_factory=lambda: _env("LLMD_LLAMACPP_BASE_IMAGE",
+                                     "ghcr.io/ggml-org/llama.cpp:server-cuda")
+    )
+    # A container to run root filesystem work in: deleting a repo out of the
+    # root-owned cache, and running the HuggingFace download worker. The vLLM
+    # image has always been doing this second job, which quietly makes a
+    # multi-gigabyte serving image a prerequisite for downloading anything — on
+    # every node. Empty keeps exactly that behaviour; set it to something small
+    # on a box that does not serve with vLLM.
+    utility_image: str = field(default_factory=lambda: _env("LLMD_UTILITY_IMAGE", ""))
     container_prefix: str = field(default_factory=lambda: _env("LLMD_CONTAINER_PREFIX", "llmd-"))
 
     # --- credentials ------------------------------------------------------

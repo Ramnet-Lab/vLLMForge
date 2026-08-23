@@ -384,8 +384,13 @@ function detailBody(detail) {
       ? (quant.quant_method || quant.format || JSON.stringify(quant).slice(0, 120))
       : 'none'],
     ['Parameters', parameters || 'unknown'],
-    ['Weights', detail.has_safetensors ? 'safetensors'
-      : detail.has_gguf ? 'GGUF only' : 'no safetensors'],
+    // Which engine reads this, rather than what it is missing. "GGUF only"
+    // read as a limitation for as long as there was one engine; it is now the
+    // native case for the other one, and the operator's next decision.
+    ['Weights', detail.has_safetensors && detail.has_gguf ? 'safetensors and GGUF — either engine'
+      : detail.has_safetensors ? 'safetensors — serve with vLLM'
+        : detail.has_gguf ? 'GGUF — serve with llama.cpp'
+          : 'neither safetensors nor GGUF'],
     ['Kind', detail.is_adapter
       ? `LoRA adapter (${detail.peft_type || 'peft'}) on ${detail.base_model || 'unknown base'}`
       : 'full model'],

@@ -88,21 +88,39 @@ and it counts containers it did not start.
 
 ```
 total      = MemTotal                                    (121.69 GiB)
-committed  = Σ util of every RUNNING vLLM container × total
+committed  = Σ estimated bytes of every RUNNING engine container
 measured   = Σ per-process bytes from --query-compute-apps
 occupied   = max(committed, measured)
 reserve    = LLMD_MEM_RESERVE_GIB                        (32 GiB by default)
 ceiling    = 1 − reserve/total                           (0.737)
 ```
 
-`committed` comes from parsing `--gpu-memory-utilization` out of each running
-container's recorded command line, which is why a `vllm serve` you launched by
-hand from a shell script counts exactly like a server the dashboard created. A
-serve command with **no** utilisation flag is not free: vLLM applies its own
-default, read from the generated schema and currently 0.92, and the budget
-charges it that.
+`committed` is a sum of **bytes**, not of fractions, and that mattered before
+there were two engines: `--kv-cache-memory` and `--cpu-offload-gb` both take
+memory a vLLM container's utilisation fraction never mentions. It matters more
+now, because only one of the two engines has a fraction at all.
 
-`measured` exists because the util sum only knows about vLLM. A Heretic run, a
+Each container is priced by its own engine, read out of its recorded command
+line — which is why an engine you launched by hand from a shell script counts
+exactly like a server the dashboard created:
+
+* **vLLM** declares its appetite. `util × total`, plus `--kv-cache-memory` and
+  `--cpu-offload-gb` where they are set. A serve command with **no** utilisation
+  flag is not free: vLLM applies its own default, read from the generated schema
+  and currently 0.92, and the budget charges it that.
+* **llama.cpp** declares nothing, so it is computed. The weights term is the
+  .gguf's own size times the fraction of its layers `--n-gpu-layers` offloads;
+  the cache term is `--ctx-size` × layers × KV-head geometry × the `-ctk`/`-ctv`
+  element sizes; the rest is a compute buffer sized mostly by `--ubatch-size`.
+  Everything but the flags comes from the file's own metadata header. An unset
+  `--n-gpu-layers` is priced as the **whole** model: recent llama.cpp would fit
+  itself to a 1 GiB margin, which is far smaller than this host's reserve, so
+  the guard has to run first and cannot assume the engine will be modest.
+  A model whose header cannot be read at all — a `-hf` reference not yet pulled,
+  a half-finished download — is priced at zero and the verdict says so, warning
+  that the guard cannot vouch for the launch rather than blessing it.
+
+`measured` exists because the estimate only knows about engines. A Heretic run, a
 fine-tuning job or anything else holding GPU memory shows up in the per-process
 figures and nowhere else, so whichever number is larger is the one used.
 
@@ -186,8 +204,14 @@ restart policy to `no` so it cannot come back and re-reserve the same memory.
 Then it waits 15 seconds before considering another victim, because freed memory
 takes a moment to show up in MemAvailable.
 
-It only ever kills a container whose command line is a vLLM `serve`. It will not
-touch the dashboard, a fine-tuning run, or a container it cannot identify. Kills
+It only ever kills a container it can identify as an engine — either engine. It
+will not touch the dashboard, a fine-tuning run, or anything whose command line
+names nothing it knows. The invariant is *kill only what we understand well
+enough to know what dies with it*, and the widening was not a relaxation of it:
+before the watchdog recognised the second engine, a hand-launched `llama-server`
+holding tens of gigabytes was not a candidate, so crossing the threshold killed
+the largest *vLLM* engine instead — freeing memory the machine was not short of
+and leaving the actual offender untouched. Kills
 are recorded (the last 50) and pushed to the Overview page, so a server that
 vanished has a visible reason.
 
