@@ -293,9 +293,12 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         head = wirings[0]
         names = cluster.rank_names(base, len(wirings))
 
+        # Every registered node, not just this pool's: a rank stranded on a node
+        # that has since been dropped from the pool is still running, still on
+        # its port, and would otherwise look free to the next launch.
         # This engine's own ranks must not make it look like the port is taken.
         master_port = await cluster.allocate_master_port(
-            [w.node for w in wirings], exclude=set(names))
+            nodes.registered(), exclude=set(names))
 
         args = dict(server.get("args") or {})
         args.setdefault("tensor_parallel_size", 1)
