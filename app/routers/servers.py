@@ -70,20 +70,36 @@ async def endpoints() -> dict:
 
 @router.post("/pool/plan")
 async def pool_plan(payload: dict) -> dict:
-    """What pooling across these nodes would give, and what stands in the way."""
+    """What pooling across these nodes would give, and what stands in the way.
+
+    `server_id` names the definition being edited, so its own ranks come off the
+    budget. It matters more than it looks: this plan gates the Save & start
+    button, and a far rank is an ordinary tenant of the machine it runs on, so
+    without it every existing pooled server is judged with its own memory
+    counted against itself on every node it spans.
+    """
     from app import cluster
 
+    server_id = payload.get("server_id")
+    replacing = None
+    if isinstance(server_id, int):
+        server = await asyncio.to_thread(svc.get_server, server_id)
+        if server is not None:
+            replacing = svc.container_name(server)
     return await cluster.plan(
         payload.get("nodes") or [],
         payload.get("model") or "",
         payload.get("args") if isinstance(payload.get("args"), dict) else None,
+        replacing=replacing,
     )
 
 
 @router.get("/pool/status")
 async def pool_status(nodes: str = "", server_id: int | None = None) -> dict:
-    """Pool health. Pass server_id to ask the engine itself — it is the Ray head,
-    so its `ray status` is the authoritative view of who joined."""
+    """Pool health: the state of every rank of the engine.
+
+    Pass server_id and the ranks are resolved from the definition, which is the
+    only way to know what the far ranks are called."""
     from app import cluster
 
     container = ""

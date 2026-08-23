@@ -14,6 +14,7 @@ have it stay dead.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -250,77 +251,86 @@ def _pool_safety(plan: dict) -> dict:
 
 
 async def start_pooled(server: dict, *, force: bool = False) -> dict:
-    """One engine across several machines: bring up Ray, then vLLM on the head.
+    """One engine across several machines, as K containers that meet over the fabric.
 
-    The engine has a fixed world size — if a node drops, vLLM aborts and has to
-    be relaunched — so the cluster is formed and confirmed complete before the
-    engine is told how many stages to split into.
+    Rank 0 serves HTTP and every other rank runs `--headless`; they rendezvous
+    at rank 0's fabric address on a port belonging to this engine alone. That
+    per-engine port is what allows more than one pooled engine to exist — the
+    Ray shape this replaced had a fixed head port and a fixed worker container
+    name, so a second pooled launch killed the first and then failed itself.
+
+    The whole thing runs under LAUNCH_LOCK, plan included. The plan reads every
+    node's free memory and picks a rendezvous port, and both answers are only
+    true until somebody else launches; deciding outside the lock is how two
+    launches seconds apart both pass a budget only one of them fits in.
     """
     pool = pool_of(server)
-    # The arguments go with it: a pooled launch used to skip the memory guard
-    # entirely, which is how a definition asking for 0.95 of a box with 0.88
-    # free reached vLLM and died four minutes in.
-    plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {},
-                              replacing=container_name(server))
-    if not plan["ok"] and not force:
-        safety_block = _pool_safety(plan)
-        # A plan refused because the memory would not fit is the same kind of
-        # answer the single-node path gives — the request was well-formed and
-        # the machines cannot take it. Anything else (a missing image, no
-        # cluster interface) is an environment fault and reads as an error.
-        refused_for_memory = safety_block["level"] == "block"
-        return {
-            "started": False,
-            "error": "" if refused_for_memory
-                     else plan.get("reason", "cannot pool across these nodes"),
-            "safety": safety_block,
-            "plan": plan,
-        }
-
-
-    prefix = cluster._subnet_prefix()
-    wirings = [await cluster.wiring(nodes.by_name(name), prefix) for name in pool]
-    head = wirings[0]
-    name = container_name(server)
-
-    args = dict(server.get("args") or {})
-    args["distributed_executor_backend"] = "ray"
-    args["pipeline_parallel_size"] = len(pool)
-    args.setdefault("tensor_parallel_size", 1)
-
-    env = build_env(server)
-    env["NCCL_SOCKET_IFNAME"] = head.interface
-    env["GLOO_SOCKET_IFNAME"] = head.interface
-    env["NCCL_IB_DISABLE"] = "1"
-
-    serve_argv = vllm_spec.build_argv(server["model"], args, port=int(server["port"]))
+    base = container_name(server)
 
     async with LAUNCH_LOCK:
-        await docker_ctl.remove(name, force=True, host=head.node.docker_host)
-        await cluster.stop_workers(wirings)
+        # The arguments go with it: a pooled launch used to skip the memory guard
+        # entirely, which is how a definition asking for 0.95 of a box with 0.88
+        # free reached vLLM and died four minutes in.
+        plan = await cluster.plan(pool, server.get("model") or "", server.get("args") or {},
+                                  replacing=base)
+        if not plan["ok"] and not force:
+            safety_block = _pool_safety(plan)
+            # A plan refused because the memory would not fit is the same kind of
+            # answer the single-node path gives — the request was well-formed and
+            # the machines cannot take it. Anything else (a missing image, no
+            # cluster interface) is an environment fault and reads as an error.
+            refused_for_memory = safety_block["level"] == "block"
+            return {
+                "started": False,
+                "error": "" if refused_for_memory
+                         else plan.get("reason", "cannot pool across these nodes"),
+                "safety": safety_block,
+                "plan": plan,
+            }
+
+        prefix = cluster._subnet_prefix()
+        wirings = [await cluster.wiring(nodes.by_name(name), prefix) for name in pool]
+        head = wirings[0]
+        names = cluster.rank_names(base, len(wirings))
+
+        # This engine's own ranks must not make it look like the port is taken.
+        master_port = await cluster.allocate_master_port(
+            [w.node for w in wirings], exclude=set(names))
+
+        args = dict(server.get("args") or {})
+        args.setdefault("tensor_parallel_size", 1)
+        # Distributed wiring is appended by rank_argv, not routed through the
+        # schema: build_argv drops any value equal to the flag's default, which
+        # would silently swallow --node-rank 0.
+        args.pop("pipeline_parallel_size", None)
+        args.pop("distributed_executor_backend", None)
+        if server.get("served_name") and not args.get("served_model_name"):
+            args["served_model_name"] = server["served_name"]
+
+        serve_argv = vllm_spec.build_argv(server["model"], args, port=int(server["port"]))
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Every rank name, on every node, before anything is started: a rank left
+        # over from a previous launch takes its name and fails the new one with
+        # "container name already in use".
+        await cluster.stop_ranks(base, wirings, remove=True)
         try:
-            # The engine container starts the Ray head and then becomes the
-            # engine, because a Ray driver needs the raylet session directory
-            # that lives inside whichever container ran `ray start`.
-            await docker_ctl.run_detached(
-                name=name,
-                image=settings.ray_image,
-                entrypoint="bash",
-                command=cluster.head_command(head, serve_argv),
-                env=env,
-                mounts=_mounts(),
-                gpu=True,
-                network="host",
-                host=head.node.docker_host,
-            )
-            # Workers can only join once the head is listening; the engine then
-            # completes its placement group as they arrive.
-            await asyncio.sleep(8)
-            await cluster.start_workers(wirings)
-            ray_status = await cluster.await_cluster(head, len(pool), name)
+            for rank, w in enumerate(wirings):
+                await docker_ctl.run_detached(
+                    name=names[rank],
+                    image=server.get("image") or settings.vllm_image,
+                    command=cluster.rank_argv(serve_argv, rank, len(wirings), head, master_port),
+                    env=cluster.rank_env(w, head, build_env(server)),
+                    mounts=_mounts(),
+                    gpu=True,
+                    network="host",
+                    host=w.node.docker_host,
+                )
         except Exception as exc:
-            await cluster.stop_workers(wirings)
-            await docker_ctl.remove(name, force=True, host=head.node.docker_host)
+            # A half-started engine is worse than none: the ranks that did come
+            # up hold their full share of their machines for a world size that
+            # will never be reached.
+            await cluster.stop_ranks(base, wirings, remove=True)
             return {"started": False, "error": str(exc)[-800:],
                     "safety": _pool_safety(plan), "plan": plan}
 
@@ -330,11 +340,12 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
         "started": True,
         "pooled": True,
         "safety": _pool_safety(plan),
-        "container": name,
+        "container": base,
+        "containers": names,
         "head": head.node.name,
-        "pipeline_parallel_size": len(pool),
+        "master_port": master_port,
+        "pipeline_parallel_size": len(wirings),
         "pooled_bytes": plan["pooled_bytes"],
-        "ray": ray_status[-800:],
         "plan": plan,
     }
 
@@ -381,23 +392,33 @@ async def start(server_id: int, *, force: bool = False) -> dict:
     return {"started": True, "safety": verdict.as_dict(), "container": name, "node": node.name}
 
 
+async def _pool_wirings(server: dict) -> list:
+    prefix = cluster._subnet_prefix()
+    return [await cluster.wiring(nodes.by_name(n), prefix) for n in pool_of(server)]
+
+
 async def stop(server_id: int) -> None:
     server = get_server(server_id)
     if server is None:
         raise KeyError(server_id)
-    await docker_ctl.stop(container_name(server), host=host_of(server))
     if is_pooled(server):
-        # The Ray containers are this engine's world; leaving them up would hold
-        # memory on every node for an engine that is gone.
-        prefix = cluster._subnet_prefix()
-        wirings = [await cluster.wiring(nodes.by_name(n), prefix) for n in pool_of(server)]
-        await cluster.stop_workers(wirings)
+        # Every rank, on every node. A rank left running holds its full share of
+        # a machine for an engine that no longer exists, and once the row is
+        # gone nothing else knows its name.
+        await cluster.stop_ranks(container_name(server), await _pool_wirings(server))
+    else:
+        await docker_ctl.stop(container_name(server), host=host_of(server))
     await events.broker.publish(events.SERVERS, {"type": "stopped", "id": server_id})
 
 
 async def remove_container(server_id: int) -> None:
     server = get_server(server_id)
-    if server is not None:
+    if server is None:
+        return
+    if is_pooled(server):
+        await cluster.stop_ranks(container_name(server), await _pool_wirings(server),
+                                 remove=True)
+    else:
         await docker_ctl.remove(container_name(server), force=True, host=host_of(server))
 
 
@@ -495,9 +516,46 @@ def _model_from_command(command: list[str] | None) -> str:
     return ""
 
 
+def engine_of(container: str) -> dict | None:
+    """The server definition a container belongs to, rank containers included."""
+    for definition in list_servers():
+        base = container_name(definition)
+        if container in cluster.rank_names(base, len(pool_of(definition)) or 1):
+            return definition
+    return None
+
+
+async def engine_containers(container: str) -> list[tuple[str, str | None]]:
+    """Everything that has to die with this container, as (name, docker host).
+
+    For an ordinary server that is just itself. For one rank of a pooled engine
+    it is every rank, because killing one does not free what a watchdog thinks
+    it frees: the world size is fixed, so the engine aborts anyway, and every
+    other rank stays resident holding its full share of its own machine. The
+    memory comes back only if the engine goes as a unit.
+    """
+    owner = engine_of(container)
+    if owner is None or not is_pooled(owner):
+        return [(container, None)]
+    base = container_name(owner)
+    wirings = await _pool_wirings(owner)
+    return [(cluster.rank_container(base, rank), w.node.docker_host)
+            for rank, w in enumerate(wirings)]
+
+
 async def discover_foreign() -> list[dict]:
-    """vLLM containers on this host that the dashboard does not manage."""
-    managed = {container_name(s) for s in list_servers()}
+    """vLLM containers on this host that the dashboard does not manage.
+
+    A pooled server owns a container per rank, and its far ranks can land on
+    this machine. Counting only rank 0 as managed listed them here as somebody
+    else's hand-launched engines, complete with a Stop button — one click on
+    which aborts a healthy multi-machine engine and leaves its other ranks
+    resident, holding their memory for a world size that can never re-form.
+    """
+    managed = set()
+    for definition in list_servers():
+        base = container_name(definition)
+        managed.update(cluster.rank_names(base, len(pool_of(definition)) or 1))
     found: list[dict] = []
     for row in await docker_ctl.ps(all_containers=False):
         name = str(row.get("Names", ""))
@@ -613,6 +671,55 @@ async def endpoints() -> list[dict]:
                 }
             )
     return out
+
+
+async def reap_partial_pools_once() -> list[str]:
+    """Stop the surviving ranks of any engine that has already lost one.
+
+    A pooled engine has a fixed world size: when one rank dies the others do not
+    carry on shorthanded, they abort or hang. What they do keep is their memory
+    — a full utilisation share of a machine each, held for an engine that can
+    never re-form and that nothing else will name once the operator has moved
+    on. On a box where GPU memory is host memory, that is the difference between
+    a failed launch and a machine with nothing left to give.
+
+    Only partial pools are touched. An engine with every rank down was stopped
+    on purpose, and an engine with every rank up is working.
+    """
+    reaped: list[str] = []
+    for definition in list_servers():
+        if not is_pooled(definition):
+            continue
+        base = container_name(definition)
+        wirings = await _pool_wirings(definition)
+        if len(wirings) != len(pool_of(definition)):
+            continue
+        states = [
+            await docker_ctl.state(cluster.rank_container(base, rank), w.node.docker_host)
+            for rank, w in enumerate(wirings)
+        ]
+        running = [st.running for st in states]
+        if not any(running) or all(running):
+            continue
+        lost = [w.node.name for w, alive in zip(wirings, running, strict=True) if not alive]
+        logging.getLogger("llmd.servers").warning(
+            "%s lost its rank on %s; stopping the %d rank(s) still holding memory",
+            base, ", ".join(lost), sum(running))
+        await cluster.stop_ranks(base, wirings)
+        await events.broker.publish(events.SERVERS, {"type": "stopped", "id": definition["id"]})
+        reaped.append(base)
+    return reaped
+
+
+async def reap_partial_pools(interval: float = 30.0) -> None:
+    while True:
+        try:
+            await reap_partial_pools_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger("llmd.servers").exception("pool reaper failed")
+        await asyncio.sleep(interval)
 
 
 async def autostart() -> None:

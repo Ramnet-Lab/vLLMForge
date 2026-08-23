@@ -88,11 +88,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     BACKGROUND.append(asyncio.create_task(node_history_loop(), name="node-history"))
     if settings.memguard_enabled:
         BACKGROUND.append(asyncio.create_task(memguard.watch(), name="memguard"))
+    # A pooled engine that has lost one rank keeps the memory of the rest for a
+    # world size it can never re-form again. Nothing else notices.
+    BACKGROUND.append(asyncio.create_task(
+        server_service.reap_partial_pools(), name="pool-reaper"))
     # Autostart is not on the critical path to binding the socket. Starting an
-    # engine means pulling a model, forming a Ray cluster, waiting on peers over
-    # ssh — minutes, sometimes, and a definition that cannot launch takes just as
-    # long to fail. Awaiting that here made a restart look like a hang and left
-    # the operator with no dashboard to see why.
+    # engine means reading a checkpoint on every node it spans — minutes,
+    # sometimes, and a definition that cannot launch takes just as long to fail.
+    # Awaiting that here made a restart look like a hang and left the operator
+    # with no dashboard to see why.
     BACKGROUND.append(asyncio.create_task(server_service.autostart(), name="autostart"))
 
     try:

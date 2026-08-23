@@ -133,20 +133,64 @@ def test_xet_bookkeeping_is_excluded_from_the_copy():
 
 # --- pooled engines ------------------------------------------------------
 
-def test_the_engine_runs_inside_the_ray_head():
-    """A Ray driver needs the raylet session directory, which lives inside
-    whichever container ran `ray start`. Two containers on one host do not share
-    /tmp/ray, so a separate engine container fails with 'No node info found
-    matching attributes' — which is exactly what happened before this shape."""
+def test_every_rank_gets_the_same_engine_and_a_different_rank_number():
+    """Nothing verifies that the ranks agree. A model or a parallel size that
+    differs between them surfaces as a shape mismatch deep in the rendezvous, if
+    it surfaces at all — so they are built from one argv and differ only in
+    which rank they are, and whether they serve HTTP."""
     from app import cluster
 
     head = cluster.NodeWiring(node=nodes.local_node(), interface="eth0", address="10.0.0.1")
-    command = cluster.head_command(head, ["vllm", "serve", "m", "--port", "8000"])
-    assert command[0] == "-lc"
-    script = command[1]
-    assert script.startswith("ray start --head --node-ip-address=10.0.0.1")
-    # exec, so the engine becomes PID 1's child and the container dies with it.
-    assert " && exec vllm serve m --port 8000" in script
+    base = ["vllm", "serve", "org/m", "--port", "8010", "--gpu-memory-utilization", "0.3"]
+
+    rank0 = cluster.rank_argv(base, 0, 2, head, 29500)
+    rank1 = cluster.rank_argv(base, 1, 2, head, 29500)
+
+    assert rank0[:len(base)] == base and rank1[:len(base)] == base
+    assert "--headless" not in rank0, "rank 0 is the one that serves"
+    assert "--headless" in rank1
+
+    for argv in (rank0, rank1):
+        assert argv[argv.index("--nnodes") + 1] == "2"
+        assert argv[argv.index("--pipeline-parallel-size") + 1] == "2"
+        assert argv[argv.index("--master-addr") + 1] == "10.0.0.1"
+        assert argv[argv.index("--master-port") + 1] == "29500"
+    assert rank0[rank0.index("--node-rank") + 1] == "0"
+    assert rank1[rank1.index("--node-rank") + 1] == "1"
+
+
+def test_rank_zero_keeps_the_plain_container_name():
+    """Everything that looks a server up by container — logs, health, stop, the
+    budget's self-exclusion, the foreign-container scan — knows only that name,
+    and none of it should have to learn about pooling."""
+    from app import cluster
+
+    assert cluster.rank_container("llmd-vllm-7", 0) == "llmd-vllm-7"
+    assert cluster.rank_container("llmd-vllm-7", 1) == "llmd-vllm-7-r1"
+    assert cluster.rank_names("llmd-vllm-7", 3) == [
+        "llmd-vllm-7", "llmd-vllm-7-r1", "llmd-vllm-7-r2"]
+
+
+def test_a_rank_is_told_its_own_nodes_interface():
+    """The interface carrying the fabric has a different name on each box, and
+    settings.nccl_env() carries this machine's. Handing that to a peer points
+    its NCCL at a device that is not there."""
+    from app import cluster
+
+    head = cluster.NodeWiring(node=nodes.local_node(), interface="enp1s0f0np0",
+                              address="10.0.0.1")
+    peer = cluster.NodeWiring(node=nodes.Node(name="node2", address="10.0.0.2"),
+                              interface="enp1s0f1np1", address="10.0.0.2")
+
+    base = {"NCCL_SOCKET_IFNAME": "enp1s0f0np0", "GLOO_SOCKET_IFNAME": "enp1s0f0np0",
+            "NCCL_IB_DISABLE": "0", "NCCL_IB_HCA": "rocep1s0f0", "HF_TOKEN": "keep-me"}
+
+    env = cluster.rank_env(peer, head, base)
+    assert env["NCCL_SOCKET_IFNAME"] == "enp1s0f1np1"
+    assert env["GLOO_SOCKET_IFNAME"] == "enp1s0f1np1"
+    assert env["NCCL_IB_DISABLE"] == "1", "the proven recipe disables IB"
+    assert "NCCL_IB_HCA" not in env, "this machine's HCA name means nothing on a peer"
+    assert env["HF_TOKEN"] == "keep-me", "everything not node-specific survives"
 
 
 def test_a_pool_needs_more_than_one_node():
@@ -202,16 +246,12 @@ async def test_the_plan_reports_a_model_missing_from_a_node(monkeypatch):
         return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
                              reserve_bytes=32 * GIB, warn_reserve_bytes=38 * GIB)
 
-    async def nothing_pooled(targets, exclude=""):
-        return []
-
     monkeypatch.setattr(cluster, "missing_model", only_here)
     monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", fine)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
     # Otherwise this reaches a real `docker ps`, and the answer depends on what
     # happens to be running on the machine the suite is on.
-    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
 
     async def wired(node, prefix):
         return cluster.NodeWiring(node=node, interface="eth0", address="10.0.0.1")
@@ -238,25 +278,40 @@ async def test_the_plan_reports_a_model_missing_from_a_node(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pool_status_asks_the_engine_because_it_is_the_head(monkeypatch):
+async def test_pool_status_is_the_rank_containers_and_nothing_else(monkeypatch):
+    """There is no cluster daemon to interrogate any more. An engine is exactly
+    its ranks: all up means up, and one missing means dead however healthy rank
+    0 looks, because the world size is fixed."""
     from app import cluster, docker_ctl
 
-    seen = {}
+    asked = []
+    down = {"llmd-vllm-9-r1"}
+    # by_name falls back to this machine for an unknown name, which would
+    # quietly report both ranks as living on the same box.
+    known = {"local": nodes.local_node(),
+             "node2": nodes.Node(name="node2", address="10.0.0.2", docker_host="ssh://node2")}
+    monkeypatch.setattr(cluster.nodes, "by_name", lambda name: known[name])
 
     async def state(name, host=None):
-        return docker_ctl.ContainerState(name=name, exists=True, status="running", running=True)
-
-    async def run(argv, check=True):
-        seen["argv"] = argv
-        return 0, "node_aaa\nnode_bbb\n", ""
+        asked.append(name)
+        running = name not in down
+        return docker_ctl.ContainerState(
+            name=name, exists=True, running=running,
+            status="running" if running else "exited")
 
     monkeypatch.setattr(cluster.docker_ctl, "state", state)
-    monkeypatch.setattr(cluster.docker_ctl, "_run", run)
 
     result = await cluster.status(["local", "node2"], container="llmd-vllm-9")
-    # There is no standalone head container any more; the engine is the head.
-    assert "llmd-vllm-9" in seen["argv"] and "llmd-ray-head" not in seen["argv"]
-    assert result["nodes"] == 2 and result["expected"] == 2
+    assert asked == ["llmd-vllm-9", "llmd-vllm-9-r1"], "one container per rank, in rank order"
+    assert result["running"] is False, "a missing far rank is a dead engine"
+    assert result["nodes"] == 1 and result["expected"] == 2
+    # The rank that failed is named, because the failures unique to multi-node
+    # land there while rank 0 shows only a stall.
+    assert "rank 1 on node2" in result["raw"]
+
+    down.clear()
+    healthy = await cluster.status(["local", "node2"], container="llmd-vllm-9")
+    assert healthy["running"] is True and healthy["nodes"] == 2
 
 
 # --- a peer's model cache -------------------------------------------------
@@ -370,10 +425,6 @@ async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
     async def has_image(*a, **k):
         return True
 
-    async def nothing_pooled(targets, exclude=""):
-        # Otherwise this reaches a real `docker ps` and the answer depends on
-        # whatever happens to be running on the machine the suite is on.
-        return []
 
     async def budget(node=None, exclude=None):
         # max_util and free_util are derived; 12% held back leaves 0.88 free.
@@ -391,7 +442,6 @@ async def test_a_pooled_plan_judges_every_node_not_just_the_head(monkeypatch):
             budget={}, requested_util=util or 0.0)
 
     monkeypatch.setattr(cluster, "wiring", fake_wiring)
-    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
     monkeypatch.setattr(cluster.safety, "check_launch", check)
@@ -432,10 +482,6 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
     async def has_image(*a, **k):
         return True
 
-    async def nothing_pooled(targets, exclude=""):
-        # Otherwise this reaches a real `docker ps` and the answer depends on
-        # whatever happens to be running on the machine the suite is on.
-        return []
 
     async def budget(node=None, exclude=None):
         return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL, free_bytes=TOTAL,
@@ -445,7 +491,6 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
         return []
 
     monkeypatch.setattr(cluster, "wiring", fake_wiring)
-    monkeypatch.setattr(cluster, "running_pooled", nothing_pooled)
     monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
     monkeypatch.setattr(cluster.safety, "current_budget", budget)
     monkeypatch.setattr(cluster, "missing_model", no_missing)
@@ -468,66 +513,71 @@ async def test_a_pooled_plan_refuses_a_model_that_cannot_be_split(monkeypatch, p
     assert fine["ok"] is True
 
 
-def test_a_ray_head_is_recognised_from_the_argv():
-    """Read off the command, so an engine started by hand counts too."""
+@pytest.mark.asyncio
+async def test_a_pool_that_lands_two_ranks_on_one_box_is_refused(monkeypatch):
+    """nodes.by_name answers "this machine" for a name it does not know, so a
+    pool naming a peer that has since been removed silently resolves to two
+    ranks on one box. They then rendezvous with themselves and both claim the
+    full utilisation, and it surfaces as a memory problem rather than as the
+    configuration error it is."""
     from app import cluster
 
-    pooled = ["-lc", "ray start --head --node-ip-address=10.0.0.1 --port=6379 "
-                     "&& exec vllm serve org/m --port 8010"]
-    assert cluster.is_pooled_command(pooled)
-    assert not cluster.is_pooled_command(["vllm", "serve", "org/m", "--port", "8010"])
-    # A worker is not a head; only the head takes the port.
-    assert not cluster.is_pooled_command(["start", "--block", "--address=10.0.0.1:6379"])
-    assert not cluster.is_pooled_command(None)
+    monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
+
+    refused = await cluster.plan(["local", "a-peer-that-was-removed"])
+    assert not refused["ok"]
+    assert "more than one rank on local" in refused["reason"]
+    assert "a-peer-that-was-removed is not a registered node" in refused["reason"]
+
+    # The same name twice is the same mistake without the removed peer.
+    twice = await cluster.plan(["local", "local"])
+    assert not twice["ok"] and "more than one rank on local" in twice["reason"]
 
 
 @pytest.mark.asyncio
-async def test_a_second_pooled_engine_is_refused_rather_than_allowed_to_kill_the_first(
-        monkeypatch):
-    """The failure this prevents, both halves of it: starting a second pooled
-    engine force-removes the worker container the first one's far rank lives in
-    — aborting an engine that was serving — and then dies itself on a Ray head
-    that cannot have port 6379, with "Session name ... does not match persisted
-    value". The innocent party is the one that looks like the failure."""
-    from app import cluster, db
+async def test_a_pooled_restart_excludes_its_own_rank_on_every_node(monkeypatch):
+    """The name to exclude is different on every machine: rank r runs as
+    <base>-r<r> there. Under Ray the peer container ran `ray start`, which the
+    guard does not recognise as an engine, so passing one name for the whole
+    pool was harmless. A far rank runs `vllm serve --headless` and is a tenant
+    like any other, so rank 0's name on every node would count each peer's own
+    container against its own restart — commit f3622ff's bug, once per peer."""
+    from app import cluster, safety
 
-    async def fine(*a, **k):
-        return True
+    excluded = {}
+
+    async def check_launch(util, *, replacing=None, params=None, node=None):
+        excluded[node.name] = replacing
+        return safety.Verdict(ok=True, level="ok", message="", budget={})
 
     async def budget(node=None, exclude=None):
-        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL,
-                             reserve_bytes=32 * GIB, warn_reserve_bytes=38 * GIB)
+        return safety.Budget(total_bytes=TOTAL, available_bytes=TOTAL, free_bytes=TOTAL,
+                             reserve_bytes=int(TOTAL * 0.12))
 
-    async def wired(node, prefix):
-        return cluster.NodeWiring(node=node, interface="eth0", address="10.0.0.1")
+    async def fake_wiring(node, prefix):
+        return cluster.NodeWiring(node=node, interface="enp1s0", address=f"{prefix}.1")
+
+    async def has_image(*a, **k):
+        return True
 
     async def none_missing(model, node_names):
         return []
 
-    occupied = [("local", "llmd-vllm-44")]
-
-    async def already_pooled(targets, exclude=""):
-        return [row for row in occupied if row[1] != exclude]
-
+    known = {"local": nodes.local_node(),
+             "node2": nodes.Node(name="node2", address="10.0.0.2", docker_host="ssh://node2")}
+    monkeypatch.setattr(cluster.nodes, "by_name", lambda name: known[name])
     monkeypatch.setattr(cluster, "_subnet_prefix", lambda: "10.0.0")
-    monkeypatch.setattr(cluster.docker_ctl, "image_exists", fine)
-    monkeypatch.setattr(cluster.safety, "current_budget", budget)
-    monkeypatch.setattr(cluster, "wiring", wired)
+    monkeypatch.setattr(cluster, "wiring", fake_wiring)
     monkeypatch.setattr(cluster, "missing_model", none_missing)
-    monkeypatch.setattr(cluster, "running_pooled", already_pooled)
+    monkeypatch.setattr(cluster.docker_ctl, "image_exists", has_image)
+    monkeypatch.setattr(cluster.safety, "current_budget", budget)
+    monkeypatch.setattr(cluster.safety, "check_launch", check_launch)
 
-    previous = db.get_setting("nodes", [])
-    try:
-        nodes.add("peer-z", address="10.0.0.2")
-        refused = await cluster.plan(["local", "peer-z"], "org/model")
-        assert not refused["ok"]
-        assert "already running" in refused["reason"]
-        assert "llmd-vllm-44" in refused["reason"], "name the engine that would be killed"
+    await cluster.plan(["local", "node2"], "org/m", {"gpu_memory_utilization": 0.3},
+                       replacing="llmd-vllm-12")
+    assert excluded == {"local": "llmd-vllm-12", "node2": "llmd-vllm-12-r1"}
 
-        # Restarting that very engine is not a conflict with itself — the same
-        # reason the memory guard excludes a server from its own budget.
-        itself = await cluster.plan(["local", "peer-z"], "org/model",
-                                    replacing="llmd-vllm-44")
-        assert itself["ok"], "a pooled restart must not be blocked by its own container"
-    finally:
-        db.set_setting("nodes", previous)
+    # A fresh launch excludes nothing anywhere.
+    excluded.clear()
+    await cluster.plan(["local", "node2"], "org/m", {"gpu_memory_utilization": 0.3})
+    assert excluded == {"local": None, "node2": None}

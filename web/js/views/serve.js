@@ -302,7 +302,7 @@ const poolLabel = (pool) => pool.join(' + ');
 const stagesPhrase = (pool) => `${pool.slice(1).join(', ')} `
   + `hold${pool.length === 2 ? 's' : ''} the later pipeline stages`;
 
-const poolTitle = (pool) => `pooled engine · ${pool[0]} is the Ray head and serves the HTTP `
+const poolTitle = (pool) => `pooled engine · ${pool[0]} is rank 0 and serves the HTTP `
   + `frontend · ${stagesPhrase(pool)}`;
 
 /* --- status -------------------------------------------------------------- */
@@ -724,18 +724,18 @@ function pooledDetailNotice(server, pool) {
 
   return notice(short ? 'warn' : 'info',
     h('strong', null, `Pooled across ${poolLabel(pool)}. `),
-    `${pool[0]} runs the Ray head and the HTTP frontend, so ${server.url} is the only address `
+    `${pool[0]} runs rank 0 and the HTTP frontend, so ${server.url} is the only address `
     + `clients use. ${stagesPhrase(pool)} — no client talks to them directly.`,
     h('div', { style: { marginTop: '4px' } },
       status
         ? (live
-          ? `Ray: ${status.running ? 'up' : 'short of nodes'}`
-            + `${joined === null ? '' : ` · ${joined} of ${expected} node(s) joined`}`
+          ? `Ranks: ${status.running ? 'all up' : 'incomplete — the engine is down'}`
+            + `${joined === null ? '' : ` · ${joined} of ${expected} running`}`
             + (workers.length
               ? ` · ${workers.map((w) => `${w.node} ${w.status}`).join(', ')}`
               : '')
-          : `Not running: no Ray cluster for this engine yet. Starting it brings the head up on ${
-            pool[0]} and a worker on ${pool.slice(1).join(', ')}.`)
+          : `Not running. Starting it brings rank 0 up on ${pool[0]} and a headless rank on ${
+            pool.slice(1).join(', ')}; they meet over the cluster link.`)
         : 'Reading pool status…'),
     plan?.ok === false && plan.reason
       ? h('div', { class: 'faint', style: { marginTop: '4px' } },
@@ -774,7 +774,8 @@ async function loadPoolDetail() {
     get(`/servers/pool/status?${query}`).catch((error) => ({ error: error.message })),
     // The plan is what this pool could hold and whether it could start again;
     // it walks every node, so it is read once per selection, not on the poll.
-    post('/servers/pool/plan', { nodes: pool, model: server.model, args: server.args || {} })
+    post('/servers/pool/plan', { nodes: pool, model: server.model, args: server.args || {},
+      server_id: server.id })
       .catch((error) => ({ ok: false, reason: error.message })),
   ]);
   if (state.pool.forServer !== server.id) return;
@@ -2142,9 +2143,9 @@ function renderPoolBox() {
     h('h3', null, 'Pooled across machines'),
     h('p', { class: 'blurb' },
       'One engine, split by layer — pipeline parallel, not tensor parallel, because each Spark '
-      + 'has a single GPU. The order below is the pipeline order: the first machine runs the Ray '
-      + 'head and the HTTP frontend, so its address is the one clients use, and the rest hold '
-      + 'later stages and serve nothing directly.'),
+      + 'has a single GPU. The order below is the pipeline order: the first machine runs rank 0 '
+      + 'and the HTTP frontend, so its address is the one clients use, and the rest run headless, '
+      + 'holding later stages and serving nothing directly.'),
     h('div', { class: 'serve-pool' },
       h('div', { class: 'serve-pool-list' }, pool.map(poolItem)),
       h('div', { class: 'serve-pool-add' },
@@ -2224,7 +2225,10 @@ async function runPlan() {
   mountPoolSafety();
   let plan;
   try {
-    plan = await post('/servers/pool/plan', { nodes: pool, model, args });
+    // server_id so an existing pooled engine's own ranks come off the budget
+    // rather than being counted against its own restart on every node.
+    plan = await post('/servers/pool/plan', { nodes: pool, model, args,
+      server_id: state.editor.id });
   } catch (error) {
     plan = { ok: false, reason: error.message };
   }
@@ -2340,16 +2344,15 @@ async function checkSync(name) {
   renderPlan();
 }
 
-/* Nothing here can fix this one: there is no build endpoint for the ray image,
-   so the honest answer is the command that builds it. */
+/* Nothing here can fix this one: there is no pull endpoint for a peer's daemon,
+   so the honest answer is the command that pulls it. */
 function missingImageNotice(names) {
   return notice('danger',
-    h('strong', null, `The Ray image is missing on ${names.join(', ')}. `),
-    'The NGC vLLM image has no ray in it at all, so a pooled launch needs the derived image '
-    + 'built from docker/vllm-ray.Dockerfile on every machine in the pool. There is no build '
-    + 'endpoint for it — build it on each of those machines and re-plan:',
+    h('strong', null, `The vLLM image is missing on ${names.join(', ')}. `),
+    'Every rank loads the model itself, so each machine in the pool needs the image locally. '
+    + 'Pull it on each of those machines and re-plan:',
     h('div', { class: 'cmdbox', style: { marginTop: '6px' } },
-      'docker build -f docker/vllm-ray.Dockerfile -t llmd-vllm-ray .'));
+      `docker pull ${state.schema?.image || 'nvcr.io/nvidia/vllm:26.07-py3'}`));
 }
 
 function syncModelTo(name, button) {
@@ -2541,8 +2544,8 @@ function renderFootActions() {
   const editor = state.editor;
   const pooled = Boolean(editor?.form.pooled);
   // Forcing past the memory guard is a judgement call an operator is allowed to
-  // make. A plan that says no is not: the ray image or the weights are missing,
-  // and starting anyway just fails slowly on another machine.
+  // make. A plan that says no is not: the image or the weights are missing on
+  // a node, and starting anyway just fails slowly on another machine.
   const planBlocked = pooled && (editor.planning || editor.plan?.ok !== true);
   const blocked = pooled ? planBlocked : editor?.verdict?.level === 'block';
   const why = pooled

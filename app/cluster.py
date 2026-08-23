@@ -10,13 +10,21 @@ The engine has a fixed world size. If a node leaves, vLLM aborts and has to be
 relaunched at the new size — that is inherent to the executor, not a choice
 made here, and the UI says so rather than pretending the pool is elastic.
 
-Three things the hand-written cluster scripts got wrong and this does not:
+Ray is not involved, and that is the point. vLLM's own multi-node path is
+torch.distributed: rank 0 serves HTTP and every other rank runs `--headless`,
+and they meet at `--master-addr:--master-port`. That port is per engine, so N
+pooled engines coexist. The Ray shape could only ever run one — its head bound
+a fixed port on the host network and every peer ran its worker under one fixed
+container name, so a second pooled launch took the first engine's far rank away
+and then died on the port it could not have.
 
-  * ray is not in the NGC image at all, so `ray start` fails. A derived image
-    (docker/vllm-ray.Dockerfile) adds it.
+Two things the hand-written cluster scripts got wrong and this does not:
+
   * NCCL_SOCKET_IFNAME cannot be shared between nodes. The interface carrying
     the cluster subnet has a different name on each box here, and pointing a
-    node's NCCL at an interface that is down on that node fails obscurely.
+    node's NCCL at an interface that is down on that node fails obscurely. It
+    matters more now than it did under Ray: every rank is its own `vllm serve`
+    and has to be told its own interface.
   * the model has to be in every node's cache, or each node tries to fetch it
     on its own at load time.
 """
@@ -31,10 +39,14 @@ from typing import Any
 from app import docker_ctl, nodes, safety, vllm_spec
 from app.config import settings
 
-RAY_PORT = 6379
-HEAD = "llmd-ray-head"
-WORKER = "llmd-ray-worker"
-READY_TIMEOUT = 120
+# Where the ranks of one engine meet. Unique per engine and only per master
+# node, which is the whole reason several pooled engines can run at once.
+MASTER_PORT_RANGE = range(29500, 29600)
+MASTER_PORT_FLAG = re.compile(r"--master[-_]port(?:=(\S+))?")
+
+# How long rank 0 gets to answer /health before a launch is called failed.
+# Sized for reading a checkpoint on every node, not for a handshake.
+READY_TIMEOUT = 600
 
 
 @dataclass
@@ -116,6 +128,18 @@ async def plan(node_names: list[str], model: str = "",
     if len(resolved) < 2:
         return {"ok": False, "reason": "pooling needs at least two nodes"}
 
+    # by_name answers "this machine" for a name it does not know, so a pool
+    # naming a peer that has since been removed resolves to two ranks on one
+    # box — which then rendezvous with themselves, both claim the utilisation,
+    # and fail as a memory problem rather than as the configuration error it is.
+    seen = [n.name for n in resolved]
+    if len(set(seen)) != len(seen):
+        duplicated = ", ".join(sorted({n for n in seen if seen.count(n) > 1}))
+        unknown = [name for name in node_names if nodes.by_name(name).name != name]
+        detail = (f" — {', '.join(unknown)} is not a registered node" if unknown else "")
+        return {"ok": False,
+                "reason": f"this pool puts more than one rank on {duplicated}{detail}"}
+
     wirings = await asyncio.gather(*(wiring(n, prefix) for n in resolved))
     problems = [w.node.name for w in wirings if not w.ok]
     if problems:
@@ -123,7 +147,7 @@ async def plan(node_names: list[str], model: str = "",
                                        f"{', '.join(problems)}"}
 
     images = await asyncio.gather(*(
-        docker_ctl.image_exists(settings.ray_image, host=w.node.docker_host) for w in wirings
+        docker_ctl.image_exists(settings.vllm_image, host=w.node.docker_host) for w in wirings
     ))
     missing_image = [w.node.name for w, has in zip(wirings, images, strict=True) if not has]
 
@@ -134,11 +158,17 @@ async def plan(node_names: list[str], model: str = "",
 
     # The same fraction, judged against each machine's own free memory.
     util = vllm_spec.gpu_memory_utilization(args or {})
-    # `replacing` matters: restarting a pooled server must not count its own
-    # running containers against itself, on any of the machines it spans.
+    # `replacing` matters, and it is a DIFFERENT name on every node: rank r runs
+    # as `<base>-r<r>` there. Under Ray the peer container ran `ray start`, which
+    # the guard does not recognise as an engine, so one name for the whole pool
+    # was harmless. A far rank runs `vllm serve --headless` and is a tenant like
+    # any other, so passing rank 0's name to every node would count each peer's
+    # own container against its own restart — the bug f3622ff fixed for a single
+    # machine, re-introduced once per peer.
     verdicts = await asyncio.gather(*(
-        safety.check_launch(util, replacing=replacing, params=args, node=w.node)
-        for w in wirings
+        safety.check_launch(util, replacing=rank_container(replacing, rank) if replacing else None,
+                            params=args, node=w.node)
+        for rank, w in enumerate(wirings)
     )) if args is not None else [None] * len(wirings)
     refused = [(w.node.name, v) for w, v in zip(wirings, verdicts, strict=True)
                if v is not None and not v.ok]
@@ -148,17 +178,7 @@ async def plan(node_names: list[str], model: str = "",
     # before starting the engine, so it is work to be done, not a refusal.
     reasons = []
     if missing_image:
-        reasons.append(f"{settings.ray_image} is not built on: {', '.join(missing_image)}")
-    # Checked before anything is torn down, because starting this would take the
-    # running engine's Ray worker away and kill it on the way to failing itself.
-    occupied = await running_pooled([w.node for w in wirings], exclude=replacing or "")
-    if occupied:
-        where = ", ".join(f"{container} on {node}" for node, container in occupied)
-        reasons.append(
-            f"a pooled engine is already running ({where}) and there can only be one: it holds "
-            f"Ray's port {RAY_PORT} on the host network, and every peer runs its worker under "
-            f"the single name {WORKER}. Starting this one would abort that engine and then fail "
-            "itself. Stop it first, or run one of the two on a single machine")
+        reasons.append(f"{settings.vllm_image} is not pulled on: {', '.join(missing_image)}")
     incompatible = _pipeline_incompatible(model)
     if incompatible:
         reasons.append(incompatible)
@@ -198,57 +218,6 @@ async def plan(node_names: list[str], model: str = "",
     }
 
 
-_RAY_HEAD = re.compile(r"ray\s+start\s+--head")
-
-
-def is_pooled_command(command: list[str] | None) -> bool:
-    """Whether a running container is a pooled engine — its own Ray head.
-
-    Read off the argv rather than the database, so an engine somebody started
-    by hand counts exactly like one this dashboard started. The same reason
-    safety.argv_of looks inside the shell wrapper.
-    """
-    return any(_RAY_HEAD.search(str(token)) for token in (command or []))
-
-
-async def running_pooled(targets: list[nodes.Node], exclude: str = "") -> list[tuple[str, str]]:
-    """Pooled engines already up, as (node name, container name).
-
-    There can be exactly one per cluster, and nothing in Ray or vLLM says so
-    politely. A pooled engine *is* a Ray head: it binds RAY_PORT on the host
-    network, and every peer runs its worker under the one name WORKER. So a
-    second pooled launch does two destructive things before it fails — it force
-    removes the worker the first engine's far rank is running in, which aborts
-    that engine on a world size it can no longer make, and then it dies itself
-    on a head that cannot have the port:
-
-        AssertionError: Session name session_...96 does not match persisted
-        value b'session_...94'
-
-    Two crashes for one mistake, and the one that reads as the failure is the
-    innocent party. Hence a blocker rather than a warning.
-
-    Only the machines this launch would touch are scanned: those are exactly the
-    ones whose port and worker name it would take.
-    """
-    found: list[tuple[str, str]] = []
-    for node in targets:
-        try:
-            rows = await docker_ctl.ps(all_containers=False, host=node.docker_host)
-        except Exception:
-            # An unreachable peer is the wiring check's business to report, not
-            # this one's. Staying quiet here beats blocking a launch on a probe.
-            continue
-        for row in rows:
-            name = str(row.get("Names", ""))
-            if not name or name == exclude:
-                continue
-            info = await docker_ctl.state(name, node.docker_host)
-            if is_pooled_command(info.command):
-                found.append((node.name, name))
-    return found
-
-
 def _pipeline_incompatible(model: str) -> str:
     """Why this model cannot be split by layer, when it cannot.
 
@@ -270,14 +239,6 @@ def _pipeline_incompatible(model: str) -> str:
         "split across them")
 
 
-def _ray_env(w: NodeWiring) -> dict[str, str]:
-    return {
-        "NCCL_SOCKET_IFNAME": w.interface,
-        "GLOO_SOCKET_IFNAME": w.interface,
-        "NCCL_IB_DISABLE": "1",
-        "HF_HOME": "/hf",
-    }
-
 
 def _mounts() -> list[docker_ctl.Mount]:
     return [
@@ -286,109 +247,185 @@ def _mounts() -> list[docker_ctl.Mount]:
     ]
 
 
-def head_command(head: NodeWiring, serve_argv: list[str]) -> list[str]:
-    """Start the Ray head and then become the engine, in one container.
+def rank_container(base: str, rank: int) -> str:
+    """What one rank's container is called.
 
-    The engine cannot be a separate container. A Ray driver needs the raylet's
-    session directory and sockets, which live inside whichever container ran
-    `ray start` — two containers on one host do not share /tmp/ray, so a
-    separate driver fails with "No node info found matching attributes".
-    Running the engine inside the head container is also what vLLM's own
-    multi-node recipe does.
+    Rank 0 keeps the server's plain name, so everything that already looks a
+    server up by container — logs, health, stop, the memory guard's exclusion,
+    the foreign-container scan — keeps working without knowing pooling exists.
+    The far ranks hang off it, which also makes them recognisable as belonging
+    to this engine rather than to nobody.
     """
-    ray_start = (
-        f"ray start --head --node-ip-address={head.address} --port={RAY_PORT} "
-        "--dashboard-host=0.0.0.0"
-    )
-    quoted = " ".join(__import__("shlex").quote(part) for part in serve_argv)
-    return ["-lc", f"{ray_start} && exec {quoted}"]
+    return base if rank == 0 else f"{base}-r{rank}"
 
 
-async def start_workers(wirings: list[NodeWiring]) -> None:
-    """Join every other node to the head. The head must already be listening."""
-    head, *workers = wirings
-    for worker in workers:
-        await docker_ctl.remove(WORKER, force=True, host=worker.node.docker_host)
-        await docker_ctl.run_detached(
-            name=WORKER,
-            image=settings.ray_image,
-            entrypoint="ray",
-            command=["start", "--block", f"--address={head.address}:{RAY_PORT}",
-                     f"--node-ip-address={worker.address}"],
-            env=_ray_env(worker),
-            mounts=_mounts(),
-            gpu=True,
-            network="host",
-            host=worker.node.docker_host,
-        )
+def rank_names(base: str, count: int) -> list[str]:
+    return [rank_container(base, rank) for rank in range(max(1, count))]
 
 
-async def await_cluster(head: NodeWiring, expected: int, container: str) -> str:
-    """Wait for every node to register, so vLLM does not start against half a
-    cluster and then size itself wrong."""
-    deadline = asyncio.get_running_loop().time() + READY_TIMEOUT
-    last = ""
-    while asyncio.get_running_loop().time() < deadline:
-        code, out, _ = await docker_ctl._run(
-            docker_ctl.docker_argv(head.node.docker_host, "exec", container, "ray", "status"),
-            check=False,
-        )
-        last = out
-        if code == 0 and out.count("node_") >= expected:
-            return out
-        await asyncio.sleep(3)
-    raise RuntimeError(f"only {last.count('node_')} of {expected} nodes joined within "
-                       f"{READY_TIMEOUT}s:\n{last[-600:]}")
+def rank_env(w: NodeWiring, master: NodeWiring, base: dict[str, str] | None = None
+             ) -> dict[str, str]:
+    """One rank's environment, with THIS node's interface in it.
+
+    settings.nccl_env() cannot be used unmodified: it carries the dashboard
+    host's own interface name and NCCL_IB_DISABLE=0, and handing either to a
+    peer points its NCCL at a device that is not there. Every value that
+    depends on which machine the rank runs on is overwritten here.
+    """
+    env = dict(base or {})
+    env.update({
+        "NCCL_SOCKET_IFNAME": w.interface,
+        "GLOO_SOCKET_IFNAME": w.interface,
+        "NCCL_IB_DISABLE": "1",
+        "HF_HOME": "/hf",
+    })
+    env.pop("NCCL_IB_HCA", None)
+    env.pop("NCCL_IB_GID_INDEX", None)
+    return env
 
 
-async def stop_workers(wirings: list[NodeWiring]) -> None:
-    """The head goes away with the engine container; the workers are ours."""
-    for worker in wirings[1:]:
-        await docker_ctl.remove(WORKER, force=True, host=worker.node.docker_host)
+def rank_argv(serve_argv: list[str], rank: int, nnodes: int, master: NodeWiring,
+              master_port: int) -> list[str]:
+    """One rank's `vllm serve` command.
+
+    Every rank is handed the *same* engine arguments and differs only in which
+    rank it is, because nothing verifies that the ranks agree — a model or a
+    parallel size that differs between them surfaces as a shape mismatch deep
+    in the rendezvous, if it surfaces at all.
+
+    Appended literally rather than routed through vllm_spec.build_argv, which
+    drops any value equal to the schema default: --node-rank 0 and whichever
+    master port matches the build's own default would silently not be emitted,
+    and then nothing could read the engine's own wiring back out of its argv.
+    """
+    argv = list(serve_argv)
+    if rank:
+        # Ranks above zero run no API server. vLLM returns from the headless
+        # branch before it binds anything, so they need no port of their own.
+        argv.append("--headless")
+    argv += [
+        "--pipeline-parallel-size", str(nnodes),
+        "--nnodes", str(nnodes),
+        "--node-rank", str(rank),
+        "--master-addr", master.address,
+        "--master-port", str(master_port),
+    ]
+    return argv
+
+
+def parse_master_port(command: list[str] | None) -> int | None:
+    """The rendezvous port a running container is using, read off its argv."""
+    raw = safety.flag_value(command, MASTER_PORT_FLAG)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+async def used_master_ports(targets: list[nodes.Node], exclude: set[str] | None = None
+                            ) -> set[int]:
+    """Rendezvous ports already spoken for on the machines a launch would touch.
+
+    Read off running containers rather than out of the database, so an engine
+    somebody started by hand is counted too. Two engines sharing a port do not
+    fail cleanly — they rendezvous into each other, and the damage lands on
+    whichever one was already serving.
+    """
+    exclude = exclude or set()
+    ports: set[int] = set()
+    for node in targets:
+        try:
+            rows = await docker_ctl.ps(all_containers=False, host=node.docker_host)
+        except Exception:
+            # An unreachable peer is the wiring check's business to report. What
+            # matters here is that an unread node must not look empty, so its
+            # whole range is treated as spoken for by returning what we have and
+            # letting the caller's wiring check refuse the launch first.
+            continue
+        for row in rows:
+            name = str(row.get("Names", ""))
+            if not name or name in exclude:
+                continue
+            info = await docker_ctl.state(name, node.docker_host)
+            port = parse_master_port(info.command)
+            if port is not None:
+                ports.add(port)
+    return ports
+
+
+async def allocate_master_port(targets: list[nodes.Node], exclude: set[str] | None = None
+                               ) -> int:
+    """The lowest rendezvous port free on every machine this engine will span.
+
+    Callers must hold the launch lock: the answer is only true until somebody
+    else takes it.
+    """
+    taken = await used_master_ports(targets, exclude)
+    for candidate in MASTER_PORT_RANGE:
+        if candidate not in taken:
+            return candidate
+    raise RuntimeError(
+        f"no free rendezvous port in {MASTER_PORT_RANGE.start}-{MASTER_PORT_RANGE.stop - 1}; "
+        f"{len(taken)} pooled engines are already running")
+
+
+async def stop_ranks(base: str, wirings: list[NodeWiring], *, remove: bool = False) -> None:
+    """Take down every rank of one engine, on the machines that hold them.
+
+    All of them, always. A surviving rank is a process holding its full share
+    of a machine for an engine that no longer exists, and nothing else will
+    ever name it.
+    """
+    for rank, w in enumerate(wirings):
+        name = rank_container(base, rank)
+        if remove:
+            await docker_ctl.remove(name, force=True, host=w.node.docker_host)
+        else:
+            await docker_ctl.stop(name, host=w.node.docker_host)
 
 
 async def status(node_names: list[str], container: str = "") -> dict:
-    """Is this pool's Ray cluster up, and does it have everyone?
+    """Is every rank of this engine up, and where is the one that is not?
 
-    The engine container IS the Ray head, so the head's health is the engine's:
-    there is no separate head container to ask any more. Without a container
-    name all that can be reported is which peers are carrying a worker.
+    There is no cluster daemon to interrogate any more, and nothing to ask
+    `ray status`. An mp engine is exactly its rank containers: if they are all
+    running it is up, and if one is missing the engine is dead however healthy
+    rank 0 looks — the world size is fixed, so a lost rank aborts the rest
+    rather than degrading them.
+
+    That makes the per-rank table the whole answer, and worth rendering: the
+    failures unique to multi-node land in the rank that hit them, while rank 0
+    shows a stall.
     """
     if not node_names:
-        return {"running": False, "nodes": 0, "expected": 0, "raw": ""}
+        return {"running": False, "nodes": 0, "expected": 0, "raw": "", "ranks": []}
 
     head = nodes.by_name(node_names[0])
-    workers = []
-    for name in node_names[1:]:
+    ranks = []
+    for rank, name in enumerate(node_names):
         peer = nodes.by_name(name)
-        state = await docker_ctl.state(WORKER, peer.docker_host)
-        workers.append({"node": peer.name, "running": state.running, "status": state.ui_status})
+        state = (await docker_ctl.state(rank_container(container, rank), peer.docker_host)
+                 if container else None)
+        ranks.append({
+            "rank": rank,
+            "node": peer.name,
+            "container": rank_container(container, rank) if container else "",
+            "running": bool(state and state.running),
+            "status": state.ui_status if state else "not started",
+        })
 
-    if not container:
-        return {
-            "running": all(w["running"] for w in workers) and bool(workers),
-            "head": head.name,
-            "nodes": sum(1 for w in workers if w["running"]) + 1,
-            "expected": len(node_names),
-            "workers": workers,
-            "raw": "",
-        }
-
-    state = await docker_ctl.state(container, head.docker_host)
-    if not state.running:
-        return {"running": False, "head": head.name, "nodes": 0,
-                "expected": len(node_names), "workers": workers, "raw": ""}
-
-    code, out, _ = await docker_ctl._run(
-        docker_ctl.docker_argv(head.docker_host, "exec", container, "ray", "status"), check=False
-    )
+    up = sum(1 for r in ranks if r["running"])
     return {
-        "running": True,
+        "running": bool(container) and up == len(ranks),
         "head": head.name,
-        "nodes": out.count("node_") if code == 0 else 0,
+        "nodes": up,
         "expected": len(node_names),
-        "workers": workers,
-        "raw": out[-2000:],
+        # Kept under the old key so the pool panel keeps rendering something
+        # useful; it is a rank table now rather than a dump of `ray status`.
+        "workers": [r for r in ranks if r["rank"]],
+        "ranks": ranks,
+        "raw": "\n".join(
+            f"rank {r['rank']} on {r['node']}: {r['status']}" for r in ranks),
     }
 
 

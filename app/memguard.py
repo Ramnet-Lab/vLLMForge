@@ -88,11 +88,21 @@ async def watch() -> None:
                     # — but it is the operator's setting, not ours, so record
                     # what it was for whoever restarts the container.
                     previous = await _restart_policy(name)
-                    await docker_ctl.kill(name)
-                    await docker_ctl.set_restart_policy(name, "no")
+                    # A pooled engine dies as a unit or not at all. Killing one
+                    # rank aborts it on its fixed world size while every other
+                    # rank stays resident holding a full share of its machine —
+                    # so the watchdog would free one node's worth of memory and
+                    # strand the rest, having achieved the outage anyway.
+                    from app import servers as server_service
+
+                    casualties = await server_service.engine_containers(name)
+                    for victim, host in casualties:
+                        await docker_ctl.kill(victim, host=host)
+                        await docker_ctl.set_restart_policy(victim, "no", host=host)
                     entry = {
                         "ts": time.time(),
                         "container": name,
+                        "containers": [victim for victim, _host in casualties],
                         "util": util,
                         "previous_restart_policy": previous,
                         "reason": reason,

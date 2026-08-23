@@ -7,6 +7,10 @@ import pytest
 from app import db, servers, vllm_spec
 
 
+async def _noop_publish(*a, **k):
+    return None
+
+
 @pytest.fixture
 def a_server():
     row = servers.create_server(
@@ -206,3 +210,50 @@ def test_an_environment_failure_stays_a_502(monkeypatch):
         assert "not built on" in response.json()["detail"]["message"]
     finally:
         servers.delete_server(int(row["id"]))
+
+
+@pytest.mark.anyio
+async def test_a_pool_that_lost_a_rank_stops_the_ranks_still_holding_memory(monkeypatch):
+    """A pooled engine has a fixed world size: one rank down and the others do
+    not carry on shorthanded — they abort or hang, and keep a full utilisation
+    share of their machine each, for an engine that can never re-form. On a box
+    where GPU memory is host memory that is the difference between a failed
+    launch and a machine with nothing left to give."""
+    from app import cluster, docker_ctl, servers
+
+    stopped = []
+    alive = {"llmd-vllm-77": True, "llmd-vllm-77-r1": False}
+
+    async def state(name, host=None):
+        running = alive.get(name, False)
+        return docker_ctl.ContainerState(name=name, exists=True, running=running,
+                                         status="running" if running else "exited")
+
+    async def stop_ranks(base, wirings, remove=False):
+        stopped.append(base)
+
+    async def wirings(server):
+        from app import nodes as node_registry
+        return [cluster.NodeWiring(node=node_registry.local_node(), interface="e", address="a"),
+                cluster.NodeWiring(node=node_registry.Node(name="node2", address="10.0.0.2",
+                                                           docker_host="ssh://node2"),
+                                   interface="e", address="b")]
+
+    monkeypatch.setattr(servers, "list_servers",
+                        lambda: [{"id": 77, "pool_nodes": ["local", "node2"], "node": "local"}])
+    monkeypatch.setattr(servers, "_pool_wirings", wirings)
+    monkeypatch.setattr(servers.docker_ctl, "state", state)
+    monkeypatch.setattr(servers.cluster, "stop_ranks", stop_ranks)
+    monkeypatch.setattr(servers.events.broker, "publish", _noop_publish)
+
+    assert await servers.reap_partial_pools_once() == ["llmd-vllm-77"]
+    assert stopped == ["llmd-vllm-77"], "the survivors must go"
+
+    # A pool that is entirely down was stopped on purpose; one entirely up works.
+    stopped.clear()
+    alive["llmd-vllm-77"] = False
+    assert await servers.reap_partial_pools_once() == []
+
+    alive.update({"llmd-vllm-77": True, "llmd-vllm-77-r1": True})
+    assert await servers.reap_partial_pools_once() == []
+    assert stopped == []

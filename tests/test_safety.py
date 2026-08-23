@@ -260,12 +260,26 @@ def test_tenants_are_summed_in_bytes_not_fractions():
     assert b.committed_util > 0.8
 
 
+def test_a_headless_far_rank_weighs_what_it_holds():
+    """A pooled engine is K containers now, and the ones above rank 0 run
+    `vllm serve --headless`. They are ordinary tenants of the machines they land
+    on and have to be counted there — under Ray the peer ran `ray start`, which
+    this does not recognise as an engine, so a peer's share used to weigh
+    nothing at all."""
+    rank = ["vllm", "serve", "org/model", "--headless",
+            "--gpu-memory-utilization", "0.34", "--pipeline-parallel-size", "2",
+            "--nnodes", "2", "--node-rank", "1",
+            "--master-addr", "10.0.0.1", "--master-port", "29500"]
+    assert safety.is_vllm_command(rank)
+    assert safety.parse_util(rank) == 0.34
+    assert safety.command_params(rank)["gpu_memory_utilization"] == 0.34
+
+
 def test_a_shell_wrapped_engine_still_weighs_something():
-    """A pooled engine is launched as `bash -lc "ray start ... && exec vllm serve
-    ..."` — one element, because the Ray head and the engine have to share a
-    container. Treating that as opaque made the dashboard's own pooled servers
-    weigh nothing in the budget, so a second launch could be admitted on top of
-    memory that was already spoken for."""
+    """Kept for the engines somebody launched by hand: a shell-wrapped
+    `bash -lc "... && exec vllm serve ..."` is one argv element, and treating it
+    as opaque made those weigh nothing in the budget, so a launch could be
+    admitted on top of memory that was already spoken for."""
     pooled = ["-lc", "ray start --head --node-ip-address=10.0.0.1 --port=6379 "
                      "&& exec vllm serve org/model --host 0.0.0.0 --port 8011 "
                      "--gpu-memory-utilization 0.62 --pipeline-parallel-size 2"]

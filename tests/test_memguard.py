@@ -31,10 +31,10 @@ class FakeDocker:
             command=self.containers.get(name),
         )
 
-    async def kill(self, name):
+    async def kill(self, name, host=None):
         self.killed.append(name)
 
-    async def set_restart_policy(self, name, policy):
+    async def set_restart_policy(self, name, policy, host=None):
         self.restart_policies[name] = policy
 
     async def inspect(self, name):
