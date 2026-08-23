@@ -50,10 +50,12 @@ Bottom to top; each layer only calls downwards.
 | `app/config.py` | every tunable, all overridable through `LLMD_*` environment variables. Nothing else in the host process reads the environment. |
 | `app/db.py` | SQLite. The schema is one `executescript` of `CREATE TABLE IF NOT EXISTS`, run at startup. Synchronous by design; callers push it onto a thread. |
 | `app/docker_ctl.py` | the only place that shells out to `docker`. Argv is built as a list and never goes through a shell. Returns typed `ContainerState`, streams logs and builds. |
-| `app/telemetry.py` | `/proc/meminfo`, `/proc/loadavg`, `nvidia-smi`. Knows which GB10 fields report `[N/A]` and omits them rather than showing zeros. |
+| `app/telemetry.py` | `/proc/meminfo`, `/proc/loadavg`, `nvidia-smi`. Knows which fields a unified part reports as `[N/A]` and omits them rather than showing zeros. |
+| `app/accel.py` | which memory `--gpu-memory-utilization` is a fraction of on a given machine: host RAM on a unified part, the framebuffer on a discrete GPU. Detects it per node and fails toward unified, because guessing discrete on a unified box is what freezes it. |
 | `app/events.py` | in-process pub/sub with bounded queues, one topic per stream. Slow browser tabs drop old frames instead of growing the producer. |
 | `app/safety.py` | the launch budget. Surveys every running vLLM container — managed or not — and returns a `Verdict` the API and UI both render. |
-| `app/memguard.py` | the runtime watchdog. Polls MemAvailable, kills the largest vLLM container below the threshold. |
+| `app/memguard.py` | the runtime watchdog. Polls MemAvailable and kills the largest vLLM engine below the threshold — the whole engine, across nodes, since killing one rank of a pooled one aborts it while the rest keep their memory. Warns instead of killing where host pressure is not the engines' doing. |
+| `app/nodes.py`, `app/cluster.py`, `app/sync.py` | the cluster: registering peers reached over `docker -H ssh://…`, detecting each node's fabric interface and memory, copying a model to a node that lacks it, and building the per-rank commands for one engine split across machines. |
 | `app/jobs.py` | one job = one detached container + a log file + a progress dict. Per-kind line parsers, reattach on restart, cancel. |
 | `app/vllm_spec.py`, `app/sampling_spec.py` | turn generated JSON schemas into a form model and back into argv or a request body. |
 | `app/servers.py`, `app/hf.py`, `app/finetune.py`, `app/heretic.py` | the four features. Each owns its configuration model, its job assembly and its log parser. |

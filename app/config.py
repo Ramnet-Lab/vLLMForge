@@ -110,6 +110,20 @@ class Settings:
     # machine wrongly called discrete can be talked into claiming memory the OS
     # is living in.
     accel_mode: str = field(default_factory=lambda: _env("LLMD_ACCEL_MODE", ""))
+
+    # --- what the Playground may connect to -------------------------------
+    # The dashboard will proxy a chat request to a URL the operator types, so
+    # something has to stop it being pointed at the public internet. Private
+    # address space is the honest expression of "engines on my own network":
+    # it covers any LAN and any cluster fabric without naming one, where a list
+    # of this operator's own subnets both leaked their layout and silently
+    # blocked the feature for everybody else. Comma-separated CIDRs to override.
+    allowed_networks: tuple[str, ...] = field(default_factory=lambda: tuple(
+        n.strip() for n in _env(
+            "LLMD_ALLOWED_NETWORKS",
+            "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16",
+        ).split(",") if n.strip()
+    ))
     # What to hold back on a machine whose GPU has its own memory. Small,
     # because the OS is not a tenant of a framebuffer — this is the driver's
     # own overhead and allocator slack, not room for a desktop.

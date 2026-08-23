@@ -1,12 +1,21 @@
 # The memory hazard
 
-Read this before you start a model. On this machine an over-committed vLLM
-server does not run slowly and it does not get killed — it takes the whole box
-down, and getting it back may mean walking over to the power button.
+Read this before you start a model on a unified-memory machine. There, an
+over-committed vLLM server does not run slowly and it does not get killed — it
+takes the whole box down, and getting it back may mean walking over to the power
+button.
+
+Everything below was measured on the reference platform: an NVIDIA DGX Spark,
+GB10 Grace-Blackwell, 121.69 GiB of unified memory, 16 GiB of swap. The
+mechanism generalises to any unified-memory part; the numbers are that machine's
+and yours will differ. On a discrete GPU the hazard is different and milder —
+the framebuffer is not where your desktop lives — and the dashboard detects
+which kind it is on rather than assuming (see `app/accel.py`).
 
 ## GPU memory is host memory
 
-The GB10 in a DGX Spark has no separate framebuffer. CPU and GPU address one
+The GB10 in a DGX Spark has no separate framebuffer, and the same is true of
+any unified-memory part. CPU and GPU address one
 pool of memory, and the numbers agree exactly:
 
 ```
@@ -47,13 +56,13 @@ fraction of 121.69 GiB, so two servers configured at 0.6 each will both start,
 both succeed, and meet somewhere in the middle of a machine that has no memory
 left.
 
-## Measured values on this box
+## Measured values on the reference platform
 
-Three data points, all from this hardware:
+Three data points, all from one DGX Spark:
 
 | configuration | sum of utils | what happened |
 |---|---|---|
-| 27B NVFP4 at 0.52 beside an 8B embedder at 0.16 | 0.68 | stable; what this box runs |
+| 27B NVFP4 at 0.52 beside an 8B embedder at 0.16 | 0.68 | stable |
 | the 27B alone at 0.57 | 0.57 | stable |
 | a single engine at 0.80 | 0.80 | hard-locked the machine |
 
@@ -62,7 +71,7 @@ insists on. It did not get OOM-killed. This host has 16 GiB of swap, so when
 allocation outruns physical memory the kernel starts swapping rather than
 invoking the OOM killer, and a machine whose page cache and anonymous memory are
 both on swap stops responding to anything, including the thing that would have
-saved it.
+saved it. A machine with no swap fails differently, and faster.
 
 The 0.68 configuration also shows why a smaller reserve is not enough. During
 the 27B's weight load, with only 0.68 committed, vLLM logged

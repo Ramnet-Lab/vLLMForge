@@ -28,12 +28,23 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 # Long generations are normal; only the connect phase should be impatient.
 TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 
-ALLOWED_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/24"),   # RoCE fabric
-    ipaddress.ip_network("10.0.1.0/24"),
-    ipaddress.ip_network("192.168.99.0/24"),   # LAN
-]
+def allowed_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Where the Playground may be pointed.
+
+    Private address space by default, which is what "engines on my own network"
+    actually means. Listing one operator's own subnets instead both published
+    their network layout and silently broke the feature on every other install,
+    whose LAN is a different /24.
+    """
+    from app.config import settings
+
+    networks = []
+    for raw in settings.allowed_networks:
+        try:
+            networks.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            continue
+    return networks
 
 
 def _url_allowed(url: str) -> bool:
@@ -46,7 +57,7 @@ def _url_allowed(url: str) -> bool:
         address = ipaddress.ip_address(parsed.hostname)
     except ValueError:
         return False
-    return any(address in network for network in ALLOWED_NETWORKS)
+    return any(address in network for network in allowed_networks())
 
 
 async def resolve(endpoint_id: str | None, url: str | None) -> str:

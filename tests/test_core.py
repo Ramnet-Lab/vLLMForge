@@ -169,3 +169,22 @@ def test_the_spa_catch_all_cannot_read_outside_web():
 
         served = client.get("/css/app.css")
         assert served.status_code == 200 and served.text.lstrip().startswith("/*")
+
+
+def test_the_playground_may_reach_private_networks_and_nothing_else():
+    """This guard exists because the dashboard will proxy a chat request to a
+    URL somebody types. It used to list one operator's own subnets, which both
+    published their network layout in a public repo and silently blocked the
+    feature on every other install, whose LAN is a different /24. Private
+    address space is what "engines on my own network" actually means."""
+    from app.routers.chat import _url_allowed
+
+    for allowed in ("http://127.0.0.1:8010/v1", "http://localhost:8010",
+                    "http://10.0.0.2:8010/v1", "http://192.168.1.50:8000/v1",
+                    "http://172.16.4.4:8000"):
+        assert _url_allowed(allowed), allowed
+
+    for blocked in ("http://8.8.8.8:80", "https://api.openai.com/v1",
+                    "ftp://10.0.0.1/x", "http://[2001:4860:4860::8888]:80",
+                    "not-a-url"):
+        assert not _url_allowed(blocked), blocked

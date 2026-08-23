@@ -1,4 +1,4 @@
-# llm-dashboard
+# vLLMForge
 
 A single web UI for running large language models on one machine, or on a small
 cluster of them. It was built on a DGX Spark and one assumption is still tied to
@@ -250,6 +250,11 @@ so a `.env` value will not reach a process you launch by hand with
 | `LLMD_MEMGUARD_ENABLED` | `1` | `0` stops the dashboard from running the watchdog. |
 | `LLMD_ROCE_IF` | empty — detected | The interface reaching your peers, used only by the ranks of a pooled engine, and worked out per node by matching a registered peer's address against that node's interfaces. Set it only to override the detection. A single-machine server is handed no interface setting at all. |
 | `LLMD_ROCE_HCA` | empty — off | RDMA HCA. Opt-in: naming a device the machine does not have breaks NCCL rather than degrading. |
+| `LLMD_ACCEL_MODE` | empty — detected | `unified`, `discrete` or `none`, to override what kind of memory the utilisation fraction multiplies. Detection fails toward unified on purpose. |
+| `LLMD_GPU_RESERVE_GIB` | `2` | Framebuffer held back on a discrete GPU. Small because no desktop lives there. |
+| `LLMD_HOST_RESERVE_GIB` | `8` | Host RAM held back on a discrete machine, where it is a separate pool. |
+| `LLMD_MEMGUARD_HOST_ACTION` | `auto` | `auto` warns instead of killing where host pressure is not the engines' doing; `kill` is the old behaviour. |
+| `LLMD_ALLOWED_NETWORKS` | private address space | Comma-separated CIDRs the Playground may be pointed at. Stops the dashboard being used to reach the public internet. |
 | `LLMD_TELEMETRY_INTERVAL` | `2.0` | Seconds between telemetry samples pushed to browsers. |
 
 ## How servers are launched
@@ -261,14 +266,21 @@ detached `docker run` that the dashboard shows you in full before it happens:
 docker run --name llmd-vllm-3 -d --runtime nvidia --gpus all \
   --network host --ipc host --ulimit memlock=-1 --ulimit stack=67108864 \
   -v ~/models/hf-cache:/hf -v ~/models/outputs:/outputs \
-  -e HF_HOME=/hf -e NCCL_SOCKET_IFNAME=enp1s0f0np0 ... \
-  nvcr.io/nvidia/vllm:26.07-py3 \
+  -e HF_HOME=/hf \
+  llmd/vllm:latest \
   vllm serve unsloth/Qwen3.8-27B-NVFP4 --host 0.0.0.0 --port 8010 \
     --gpu-memory-utilization 0.52 --max-model-len 262144 \
     --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name qwen3
 ```
 
 Three things about that are load-bearing.
+
+**No fabric settings.** A single-machine engine is handed no
+`NCCL_SOCKET_IFNAME` and no `NCCL_IB_HCA`, because it has no peer to reach and
+those names differ on every box — NCCL refuses to initialise on an interface
+that is not a device, even at world size 1, so a wrong name is worse than none.
+The ranks of a pooled engine do get them, detected on the node each rank runs
+on. See [Serving across several machines](#serving-across-several-machines).
 
 **Host networking.** vLLM binds the port directly on the host; there is no port
 mapping to get wrong, and the port you choose in the form is the port you curl.
@@ -294,10 +306,102 @@ can be stopped from the UI, its endpoint is offered to the Playground, and its
 the reason the feature exists — a memory picture that is true about this app and
 false about the machine is worse than none.
 
+## Serving across several machines
+
+A model that does not fit on one box can be split across several: the layers are
+divided between them and each machine holds a stage. Pipeline parallel, not
+tensor parallel — every Spark-class node here has a single GPU, so tensor
+parallelism would all-reduce across the network on every layer, while pipeline
+parallelism hands activations over once per token per stage boundary.
+
+**When not to.** Pooling is not free and it is not merely slower. It costs a
+network hop per token per boundary, so it does nothing for the latency of a
+single request — measured here, a 27B split over two boxes answers at about
+6 tokens/second. It fixes the world size, so losing a node aborts the engine
+rather than degrading it. And it runs code paths a single-machine launch never
+touches. A model that fits on one machine should stay there, and the Serve page
+says so when it sees you pooling one that would.
+
+### How it works
+
+No Ray, no cluster daemon, nothing to keep running between launches. vLLM's own
+multi-node path is `torch.distributed`: rank 0 serves HTTP and every other rank
+runs `--headless`, and they meet at an address and port belonging to that one
+engine.
+
+```
+node A   vllm serve MODEL --host 0.0.0.0 --port 8010 <your args>
+           --pipeline-parallel-size 2 --nnodes 2 --node-rank 0
+           --master-addr <node A on the fabric> --master-port 29500
+
+node B   vllm serve MODEL --headless <the same args>
+           --pipeline-parallel-size 2 --nnodes 2 --node-rank 1
+           --master-addr <node A on the fabric> --master-port 29500
+```
+
+Every rank is handed identical engine arguments and differs only in which rank
+it is, because nothing verifies that they agree — a model or a parallel size
+that differs between them surfaces as a shape mismatch deep in the rendezvous,
+if it surfaces at all.
+
+**Rank 0 keeps the server's plain container name** (`llmd-vllm-7`) and the far
+ranks hang off it (`llmd-vllm-7-r1`). So everything that looks a server up by
+container — logs, health, stop, the budget's self-exclusion, the scan for
+containers the dashboard did not start — keeps working without knowing pooling
+exists, and a stray rank is still recognisably part of an engine rather than
+nobody's.
+
+**The rendezvous port belongs to the engine, which is why you can run several.**
+It is allocated from 29500 upward by reading the ports off whatever is already
+running, so an engine somebody started by hand is counted too. Nothing else is
+shared between pooled engines.
+
+**Interfaces are detected per node.** The NIC carrying the cluster subnet is
+called something different on each machine, so each rank is told the name found
+on the machine it will run on, by matching a registered peer's address against
+that node's interfaces. `LLMD_ROCE_IF` overrides the detection; leave it empty
+unless it guesses wrong.
+
+**Memory is judged on every machine.** A pooled engine declares the same
+utilisation fraction on each node it spans, and each node has its own budget,
+its own tenants and — since a cluster can mix a unified-memory box with a
+discrete-GPU one — possibly its own kind of memory entirely. Asking only the
+head is how a configuration that cannot start anywhere gets accepted.
+
+### What has to be true before one starts
+
+The plan checks all of it before anything is created, because each of these
+otherwise surfaces minutes in, after every shard has been read:
+
+* every node is on the cluster subnet and reports an interface for it;
+* the vLLM image exists on every node — nothing can build it on a peer;
+* the model is in every node's cache, or will be copied there over the cluster
+  link first, because each rank loads its own layers from its own disk;
+* the memory fits on every node, not just the head;
+* the pool names distinct machines — an unregistered name resolves to "this
+  machine", which would put two ranks on one box;
+* the model can actually be split. A model that brings its own sampler cannot:
+  vLLM's pipeline-parallel broadcast assumes the standard one's shape and dtype,
+  and the far rank dies on an assertion during warmup.
+
+### When a rank dies
+
+The world size is fixed, so the survivors do not carry on shorthanded — they
+abort or hang. What they keep is their memory, a full utilisation share of a
+machine each, for an engine that can never re-form. A reaper stops the rest of
+any pool that has lost one. It is deliberately slow to act: it holds the launch
+lock, asks each node whether it is answering at all before believing what it
+says about a container, finds ranks by scanning rather than trusting a stored
+node list, and requires the same pool to look broken on two consecutive passes.
+A launch in progress and a peer with a brief ssh hiccup both look exactly like a
+dead rank for a moment, and stopping a healthy engine would be the outage it
+exists to prevent.
+
 ## The memory hazard
 
-The GB10 has no separate framebuffer. `/proc/meminfo` MemTotal and torch's
-"total GPU memory" are the same 121.69 GiB, so `--gpu-memory-utilization 0.8` is
+On a unified-memory part there is no separate framebuffer. On the reference
+platform — a DGX Spark, GB10 — `/proc/meminfo` MemTotal and torch's "total GPU
+memory" are the same 121.69 GiB, so `--gpu-memory-utilization 0.8` is
 a claim on 97 GiB of the host's RAM, and the fractions of co-resident engines
 add up with nothing enforcing the sum. Getting it wrong does not slow the
 machine down; it freezes it hard enough to need the power button.
