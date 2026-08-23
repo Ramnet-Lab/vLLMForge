@@ -17,7 +17,8 @@ usage() {
 Usage: scripts/setup.sh [options]
 
   --with-images   build the Heretic and fine-tuning images without asking
-  --no-images     never build them (the default when stdin is not a terminal)
+  --no-images     skip the OPTIONAL images (default with no terminal). The vLLM
+                  image is built regardless; nothing can be served without it.
   --dev           also install pytest and ruff
   -h, --help      this text
 
@@ -127,8 +128,8 @@ print(json.loads(p.read_text())["image"] if p.exists() else "")')"
     if [ "$SCHEMA_IMAGE" = "$WANT_IMAGE" ] && [ "$ARCH_IMAGE" = "$WANT_IMAGE" ]; then
         note "app/data/vllm_args.json already describes $WANT_IMAGE"
     elif ! docker image inspect "$WANT_IMAGE" >/dev/null 2>&1; then
-        note "$WANT_IMAGE is not pulled; keeping the checked-in schema for $SCHEMA_IMAGE."
-        note "Pull it and re-run this script to regenerate the form."
+        note "$WANT_IMAGE does not exist yet; keeping the checked-in schema for $SCHEMA_IMAGE."
+        note "It is built a few steps below; re-run this script afterwards to regenerate the form."
     else
         note "schema describes '${SCHEMA_IMAGE:-nothing}', but the configured image is $WANT_IMAGE"
         if confirm "Regenerate them from $WANT_IMAGE now? (three container runs, ~30 seconds)"; then
@@ -150,16 +151,29 @@ if ! command -v docker >/dev/null; then
     note "docker not on PATH — the Heretic and fine-tuning tabs will not work."
 else
     build_image() {
-        local role="$1" tag="$2" dockerfile="$3"
+        local role="$1" tag="$2" dockerfile="$3" required="${4:-no}"
         if docker image inspect "$tag" >/dev/null 2>&1; then
             note "$tag is already built"
             return
         fi
         note "$tag is missing (adds ~0.5 GB on top of the vLLM base image)"
-        if [ "$IMAGES" = yes ] || { [ "$IMAGES" = ask ] && confirm "Build $role now?"; }; then
-            docker build -t "$tag" -f "$REPO/docker/$dockerfile" "$REPO/docker"
+        # A required image is not a question. Skipping it leaves an install that
+        # looks finished and cannot start a single container, and `confirm` says
+        # no to everything when stdin is not a terminal — so CI, a piped run and
+        # anyone pressing Enter all used to end up there.
+        if [ "$required" = yes ] || [ "$IMAGES" = yes ] \
+           || { [ "$IMAGES" = ask ] && confirm "Build $role now?"; }; then
+            docker build -t "$tag" -f "$REPO/docker/$dockerfile" "$REPO/docker" || {
+                if [ "$required" = yes ]; then
+                    fail "could not build $tag, and nothing can be served without it. Retry with:
+    docker build -t $tag -f docker/$dockerfile docker/"
+                fi
+                note "could not build $tag; the $role tab can retry it"
+                return 1
+            }
         else
-            note "skipped; the $role tab offers a build button that does the same thing"
+            note "skipped; build it later with:"
+            note "  docker build -t $tag -f docker/$dockerfile docker/"
         fi
     }
     eval "$(cd "$REPO" && "$VENV/bin/python" -c \
@@ -168,10 +182,11 @@ print(f"HERETIC_TAG={settings.heretic_image!r}")
 print(f"FINETUNE_TAG={settings.finetune_image!r}")
 print(f"VLLM_TAG={settings.vllm_image!r}")
 print(f"VLLM_BASE={settings.vllm_base_image!r}")')"
-    # Not optional the way the other two are: without it every managed server
-    # 500s on any request carrying tools. Build it on every node in the cluster,
-    # because each rank of a pooled engine runs it on its own machine.
-    build_image "the vLLM image" "$VLLM_TAG" vllm.Dockerfile
+    # Not optional the way the other two are, so it is not asked about: it is
+    # the image every server runs, and without it the NGC base 500s on any
+    # request carrying tools. Build it on every node in the cluster — each rank
+    # of a pooled engine runs it on its own machine.
+    build_image "the vLLM image" "$VLLM_TAG" vllm.Dockerfile yes
     build_image Heretic "$HERETIC_TAG" heretic.Dockerfile
     build_image fine-tuning "$FINETUNE_TAG" finetune.Dockerfile
 fi

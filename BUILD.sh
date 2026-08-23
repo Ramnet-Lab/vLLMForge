@@ -44,10 +44,12 @@ usage() {
 
 Options:
   -y, --yes         assume yes; never prompt (required when there is no terminal)
-      --with-images build the Heretic and fine-tuning images now. They sit on a
-                    ~22 GB base image, so this is opt-in even under --yes.
+      --with-images also build the optional Heretic and fine-tuning images.
+                    The vLLM image is built either way: nothing can be served
+                    without it. All three sit on a ~22 GB base image.
       --no-service  do not install the systemd user service
-      --no-images   never offer to build the worker images
+      --no-images   skip the optional worker images (the vLLM image is still
+                    built; without it no server can start)
       --no-gpu      skip the NVIDIA container toolkit even if a GPU is present
       --no-sudoers  do not write the passwordless-docker sudoers rule
       --dev         also install the test and lint dependencies

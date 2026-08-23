@@ -68,7 +68,7 @@ def _subnet_prefix() -> str:
 
     try:
         raw = subprocess.run(
-            ["ip", "-4", "-o", "addr", "show", settings.roce_interface],
+            ["ip", "-4", "-o", "addr", "show", nodes.cluster_interface()],
             capture_output=True, text=True, timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -120,13 +120,18 @@ async def plan(node_names: list[str], model: str = "",
     "does this fit" has to be asked of all of them; asking only the head is how
     a config that cannot start anywhere gets accepted.
     """
-    prefix = _subnet_prefix()
-    if not prefix:
-        return {"ok": False, "reason": f"no cluster subnet on {settings.roce_interface}"}
-
     resolved = [nodes.by_name(name) for name in node_names]
     if len(resolved) < 2:
         return {"ok": False, "reason": "pooling needs at least two nodes"}
+
+    prefix = _subnet_prefix()
+    if not prefix:
+        iface = nodes.cluster_interface()
+        return {"ok": False, "reason": (
+            f"no cluster subnet on {iface}" if iface else
+            "no interface on this machine shares a subnet with a registered peer, so there is "
+            "no fabric to pool over — register the peer on the Nodes tab, or set LLMD_ROCE_IF "
+            "if the right interface cannot be worked out")}
 
     # by_name answers "this machine" for a name it does not know, so a pool
     # naming a peer that has since been removed resolves to two ranks on one
@@ -265,22 +270,28 @@ def rank_names(base: str, count: int) -> list[str]:
 
 def rank_env(w: NodeWiring, master: NodeWiring, base: dict[str, str] | None = None
              ) -> dict[str, str]:
-    """One rank's environment, with THIS node's interface in it.
+    """One rank's environment, with THIS node's own interface in it.
 
-    settings.nccl_env() cannot be used unmodified: it carries the dashboard
-    host's own interface name and NCCL_IB_DISABLE=0, and handing either to a
-    peer points its NCCL at a device that is not there. Every value that
-    depends on which machine the rank runs on is overwritten here.
+    The only place a fabric setting is ever applied, and every value in it was
+    measured on the machine the rank will run on: wiring() asked that node which
+    of its interfaces carries the cluster subnet. Nothing is inherited from the
+    dashboard host, because the NIC is called something different on every box
+    and a name that is not present there fails NCCL initialisation rather than
+    degrading — so a wrong name is worse than none.
     """
     env = dict(base or {})
+    # Nothing node-specific survives from the caller's environment: a value that
+    # was right for the dashboard host names a device the peer does not have.
+    for stale in ("NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME",
+                  "NCCL_IB_HCA", "NCCL_IB_GID_INDEX"):
+        env.pop(stale, None)
+    env.update(settings.fabric_env())
     env.update({
         "NCCL_SOCKET_IFNAME": w.interface,
         "GLOO_SOCKET_IFNAME": w.interface,
-        "NCCL_IB_DISABLE": "1",
+        "NCCL_IB_DISABLE": "0" if settings.roce_hca else "1",
         "HF_HOME": "/hf",
     })
-    env.pop("NCCL_IB_HCA", None)
-    env.pop("NCCL_IB_GID_INDEX", None)
     return env
 
 

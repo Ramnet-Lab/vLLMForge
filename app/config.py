@@ -96,9 +96,17 @@ class Settings:
         default_factory=lambda: _env("LLMD_MEMGUARD_ENABLED", "1") not in ("0", "false", "no")
     )
 
-    # --- cluster fabric (NCCL over RoCE) ----------------------------------
-    roce_interface: str = field(default_factory=lambda: _env("LLMD_ROCE_IF", "enp1s0f0np0"))
-    roce_hca: str = field(default_factory=lambda: _env("LLMD_ROCE_HCA", "rocep1s0f0"))
+    # --- cluster fabric ---------------------------------------------------
+    # Both default to empty, and empty means "work it out from this machine".
+    # A NIC name that does not exist on the box is worse than no name at all:
+    # NCCL refuses to initialise on an unknown NCCL_SOCKET_IFNAME even at world
+    # size 1 (DistBackendError, invalid usage), so naming one machine's NIC here
+    # made every launch fail on every other machine. nodes.cluster_interface()
+    # finds the real one; set this only to override that.
+    roce_interface: str = field(default_factory=lambda: _env("LLMD_ROCE_IF", ""))
+    # RDMA is opt-in for the same reason — NCCL_IB_HCA naming an absent device
+    # is the same mistake, and the pooled path disables IB anyway.
+    roce_hca: str = field(default_factory=lambda: _env("LLMD_ROCE_HCA", ""))
 
     # --- polling ----------------------------------------------------------
     telemetry_interval: float = field(
@@ -132,15 +140,20 @@ class Settings:
     def container_name(self, kind: str, ident: str | int) -> str:
         return f"{self.container_prefix}{kind}-{ident}"
 
-    def nccl_env(self) -> dict[str, str]:
-        """NCCL/Gloo settings matching this cluster's RoCE fabric."""
-        return {
-            "NCCL_SOCKET_IFNAME": self.roce_interface,
-            "GLOO_SOCKET_IFNAME": self.roce_interface,
-            "NCCL_IB_HCA": self.roce_hca,
-            "NCCL_IB_DISABLE": "0",
-            "NCCL_IB_GID_INDEX": "3",
-        }
+    def fabric_env(self) -> dict[str, str]:
+        """RDMA settings, for a container that talks to another machine.
+
+        Only what the operator has explicitly configured. The interface names
+        are NOT here: they are per-node and detected at launch, because the NIC
+        carrying the cluster subnet has a different name on each box — and a
+        single-machine engine gets none of this at all, since it has no peer to
+        reach and an absent interface name breaks NCCL outright.
+        """
+        env: dict[str, str] = {}
+        if self.roce_hca:
+            env["NCCL_IB_HCA"] = self.roce_hca
+            env["NCCL_IB_GID_INDEX"] = "3"
+        return env
 
     def ensure_dirs(self) -> None:
         for path in (

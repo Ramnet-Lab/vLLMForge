@@ -293,13 +293,62 @@ async def status_all() -> list[dict]:
 
 # --- discovery -----------------------------------------------------------
 
+def cluster_interface() -> str:
+    """The NIC this machine reaches its peers on.
+
+    Configured name wins. Otherwise it is detected, because the interface
+    carrying the cluster subnet is called something different on every box —
+    enp1s0f0np0 on one of these, enp1s0f1np1 on the next — and a name that is
+    not present fails NCCL initialisation rather than falling back to anything.
+
+    Detection prefers the interface on the same subnet as a registered peer,
+    which is the definition of "the one that reaches the cluster". With no peer
+    registered there is nothing to reach and the answer is empty, which is
+    correct: a single-machine install needs no fabric setting at all.
+    """
+    if settings.roce_interface:
+        return settings.roce_interface
+    peers = [n.address for n in registered() if not n.is_local and n.address]
+    if not peers:
+        return ""
+    for device, network in _local_networks():
+        for address in peers:
+            try:
+                if ipaddress.ip_address(address) in network:
+                    return device
+            except ValueError:
+                continue
+    return ""
+
+
+def _local_networks() -> list[tuple[str, Any]]:
+    """(device, network) for every up IPv4 interface on this machine."""
+    import subprocess
+
+    try:
+        raw = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[tuple[str, Any]] = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[1] == "lo":
+            continue
+        try:
+            out.append((parts[1], ipaddress.ip_interface(parts[3]).network))
+        except ValueError:
+            continue
+    return out
+
+
 def _candidate_addresses() -> list[str]:
     """The cluster subnet, derived from the RoCE interface rather than guessed."""
     import subprocess
 
     try:
         raw = subprocess.run(
-            ["ip", "-4", "-o", "addr", "show", settings.roce_interface],
+            ["ip", "-4", "-o", "addr", "show", cluster_interface()],
             capture_output=True, text=True, timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -432,7 +481,7 @@ async def discover(scan_subnet: bool = False) -> dict:
             "registered": hit["hostname"] in known or hit["target"] in known,
         })
     return {"candidates": candidates, "scanned": len(targets),
-            "interface": settings.roce_interface, "scanned_subnet": scan_subnet}
+            "interface": cluster_interface(), "scanned_subnet": scan_subnet}
 
 
 def combine(statuses: list[dict]) -> dict[str, Any]:

@@ -553,13 +553,19 @@ function environmentSection(info, imagePayload) {
           h('span', { class: 'spacer' }),
           image.present
             ? null
-            // The vLLM base image is pulled, not built, and no view offers that.
+            // Every image this dashboard requires is BUILT from docker/, not
+            // pulled: offering `docker pull` for a local tag sent people to a
+            // registry that has never heard of it. Two of them have a tab that
+            // builds them; the vLLM one has no tab, so hand over the command.
             : IMAGE_TAB[image.role]
               ? h('button', {
                   class: 'btn-sm',
                   onClick: () => ctxRef.navigate(IMAGE_TAB[image.role]),
                 }, 'Build')
-              : copyButton(`docker pull ${image.tag}`, 'Copy pull command'))))
+              : copyButton(
+                  `docker build -t ${image.tag} -f docker/${image.dockerfile || 'vllm.Dockerfile'}`
+                  + ' docker/',
+                  'Copy build command'))))
       : null,
     imagePayload && !info.hf_token_set
       ? h('p', { class: 'ov-note' },

@@ -94,17 +94,20 @@ async def memguard_history() -> dict:
 @router.get("/images")
 async def images() -> dict:
     """Which worker images are present, so the UI can offer to build them."""
+    # Every one of these is built from docker/, not pulled — the UI needs the
+    # file name so it can hand over a command that works.
     wanted = {
-        "vllm": settings.vllm_image,
-        "heretic": settings.heretic_image,
-        "finetune": settings.finetune_image,
+        "vllm": (settings.vllm_image, "vllm.Dockerfile"),
+        "heretic": (settings.heretic_image, "heretic.Dockerfile"),
+        "finetune": (settings.finetune_image, "finetune.Dockerfile"),
     }
-    present = await asyncio.gather(*(docker_ctl.image_exists(tag) for tag in wanted.values()))
+    present = await asyncio.gather(*(
+        docker_ctl.image_exists(tag) for tag, _file in wanted.values()))
     local = await docker_ctl.ps(all_containers=True)
     return {
         "required": [
-            {"role": role, "tag": tag, "present": ok}
-            for (role, tag), ok in zip(wanted.items(), present, strict=True)
+            {"role": role, "tag": tag, "dockerfile": dockerfile, "present": ok}
+            for (role, (tag, dockerfile)), ok in zip(wanted.items(), present, strict=True)
         ],
         "containers": len(local),
     }

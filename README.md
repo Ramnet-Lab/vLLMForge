@@ -1,7 +1,11 @@
 # llm-dashboard
 
-A single web UI for running large language models on one machine — specifically
-a DGX Spark, though nothing but the defaults is tied to it. It unifies four
+A single web UI for running large language models on one machine, or on a small
+cluster of them. It was built on a DGX Spark and one assumption is still tied to
+that hardware: the memory guard treats GPU memory as host memory, which is true
+on a unified-memory part and false on a discrete GPU (see
+[Requirements](#requirements)). Everything else — paths, ports, images, network
+interfaces — is detected or configurable. It unifies four
 things that are otherwise four sets of shell scripts:
 
 * **Serving.** Define, launch and watch vLLM servers as containers, with a
@@ -92,11 +96,27 @@ reattaches to their logs when it comes back.
   container toolkit but not the driver — that is distribution-specific and
   usually wants a reboot. Everything else, including the whole UI and model
   downloads, works on a machine with no GPU at all.
-* The vLLM container image, `nvcr.io/nvidia/vllm:26.07-py3` by default. It is
-  about 22 GB; pull it before you start if you have not already.
+* The vLLM container image. `scripts/setup.sh` builds it for you as
+  `llmd/vllm:latest` from `docker/vllm.Dockerfile`, which is
+  `nvcr.io/nvidia/vllm:26.07-py3` plus the xgrammar that image's own vLLM
+  imports — without it every request carrying `tools` comes back a 500. The NGC
+  base is about 22 GB and is pulled by the build; pull it beforehand if you
+  would rather not wait. **Every node in a cluster needs this image**, because
+  each rank of a pooled engine runs it on its own machine.
 * `nvidia-smi` for GPU telemetry. Without it the dashboard still works and the
   GPU tiles simply go quiet.
 * Roughly 25 GB of disk for the images, plus whatever the models need.
+
+**On hardware unlike a DGX Spark.** The memory budget reads `/proc/meminfo` and
+treats it as the accelerator's pool, because on a GB10 that is exactly what it
+is. On a machine with a discrete GPU that identity does not hold: the guard will
+size `--gpu-memory-utilization` against host RAM rather than VRAM and give
+answers that are wrong — conservatively wrong for the guard, but wrong. Serving
+still works if you set the utilisation yourself and ignore the recommendation;
+the watchdog is worth turning off with `LLMD_MEMGUARD_ENABLED=0`, since it reacts
+to host memory pressure that has nothing to do with the GPU. Everything that is
+not memory arithmetic — the parameter form, the Hub browser, fine-tuning,
+Heretic, the cluster — is hardware-neutral.
 
 The dashboard runs as a normal host process, not in a container. It has to:
 inside a container, `nvidia-smi` sees only its own PID namespace and could not
@@ -118,12 +138,13 @@ docker, and the NVIDIA container toolkit if this machine has an NVIDIA GPU —
 puts you in the `docker` group so docker needs no sudo, and hands over to
 `scripts/setup.sh` and `scripts/install-service.sh`.
 
-It is safe to re-run: a second run reports that there is nothing to do.
+It is safe to re-run: anything already in place is reported and skipped.
 
 ```
   -y, --yes         never prompt (required when there is no terminal)
-      --with-images build the worker images now; they sit on a ~22 GB base
-                    image, so this stays opt-in even under --yes
+      --with-images also build the optional Heretic and fine-tuning images.
+                    The vLLM image is built either way — nothing can be served
+                    without it — and all three sit on a ~22 GB base.
       --no-service  do not install the systemd user service
       --no-gpu      skip the NVIDIA container toolkit
       --no-sudoers  do not write the passwordless-docker sudoers rule
@@ -217,7 +238,8 @@ so a `.env` value will not reach a process you launch by hand with
 | `LLMD_HF_CACHE` | `~/models/hf-cache` | Shared HuggingFace cache, mounted into every container at `/hf`. |
 | `LLMD_OUTPUT_DIR` | `~/models/outputs` | Job artefacts: fine-tunes, Heretic exports. Mounted into server containers at `/outputs`. |
 | `LLMD_DATASET_DIR` | `~/models/datasets` | Uploaded training data. |
-| `LLMD_VLLM_IMAGE` | `nvcr.io/nvidia/vllm:26.07-py3` | Image used for serving, downloads, and as the base for the two worker images. |
+| `LLMD_VLLM_IMAGE` | `llmd/vllm:latest` | Image used for serving and downloads. Built by `scripts/setup.sh` from `docker/vllm.Dockerfile`; not something you can pull. |
+| `LLMD_VLLM_BASE_IMAGE` | `nvcr.io/nvidia/vllm:26.07-py3` | The NGC image the three worker images are built on top of. |
 | `LLMD_HERETIC_IMAGE` | `llmd/heretic:latest` | Tag the Heretic tab builds and runs. |
 | `LLMD_FINETUNE_IMAGE` | `llmd/finetune:latest` | Tag the fine-tuning tab builds and runs. |
 | `LLMD_CONTAINER_PREFIX` | `llmd-` | Prefix for containers the dashboard creates, so it can tell its own from yours. |
@@ -226,8 +248,8 @@ so a `.env` value will not reach a process you launch by hand with
 | `LLMD_MEM_WARN_RESERVE_GIB` | `38` | Softer line: launches past it are allowed with a warning. |
 | `LLMD_MEMGUARD_THRESHOLD_MIB` | `10240` | MemAvailable below which the watchdog kills the largest vLLM container. |
 | `LLMD_MEMGUARD_ENABLED` | `1` | `0` stops the dashboard from running the watchdog. |
-| `LLMD_ROCE_IF` | `enp1s0f0np0` | NCCL/Gloo interface handed to every vLLM container. Only matters for multi-node serving. |
-| `LLMD_ROCE_HCA` | `rocep1s0f0` | NCCL IB HCA, likewise. |
+| `LLMD_ROCE_IF` | empty — detected | The interface reaching your peers, used only by the ranks of a pooled engine, and worked out per node by matching a registered peer's address against that node's interfaces. Set it only to override the detection. A single-machine server is handed no interface setting at all. |
+| `LLMD_ROCE_HCA` | empty — off | RDMA HCA. Opt-in: naming a device the machine does not have breaks NCCL rather than degrading. |
 | `LLMD_TELEMETRY_INTERVAL` | `2.0` | Seconds between telemetry samples pushed to browsers. |
 
 ## How servers are launched
@@ -293,9 +315,10 @@ document to read before using this tool.
 
 ## The worker images
 
-Heretic and Unsloth each need a container that the base vLLM image does not
-provide. Both are built from `docker/*.Dockerfile` **on top of**
-`LLMD_VLLM_IMAGE`, and that is not an implementation detail: the NGC image
+There are three, all built from `docker/*.Dockerfile` and none of them
+pullable. `llmd/vllm:latest` is the one every server runs; Heretic and Unsloth
+each add a layer the vLLM image does not provide. All three are built **on top
+of** `LLMD_VLLM_BASE_IMAGE`, and that is not an implementation detail: the NGC image
 already carries working aarch64 CUDA 13 builds of torch, xformers, triton and
 flash-attn, which is why nothing in either build compiles. Unsloth's own
 DGX Spark Dockerfile builds those from source and takes ten minutes to fail in

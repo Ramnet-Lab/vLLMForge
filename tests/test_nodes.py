@@ -581,3 +581,47 @@ async def test_a_pooled_restart_excludes_its_own_rank_on_every_node(monkeypatch)
     excluded.clear()
     await cluster.plan(["local", "node2"], "org/m", {"gpu_memory_utilization": 0.3})
     assert excluded == {"local": None, "node2": None}
+
+
+def test_a_single_machine_server_is_handed_no_interface_at_all(monkeypatch):
+    """The failure this prevents is total: NCCL refuses to initialise on an
+    NCCL_SOCKET_IFNAME naming a device the box does not have, even at world
+    size 1 — measured, `DistBackendError ... invalid usage`. This machine's NIC
+    was being injected into every container, so a clone of this dashboard could
+    not start a single model on any machine with different interface names."""
+    from app import servers
+
+    env = servers.build_env({"id": 1, "args": {}, "env": {}})
+    assert "NCCL_SOCKET_IFNAME" not in env
+    assert "GLOO_SOCKET_IFNAME" not in env
+    assert "NCCL_IB_HCA" not in env
+
+
+def test_the_cluster_interface_is_detected_from_a_peers_address(monkeypatch):
+    """It is called something different on every box, so it is found rather
+    than named: the interface whose subnet contains a registered peer is by
+    definition the one that reaches the cluster."""
+    import dataclasses
+
+    from app import nodes as node_registry
+
+    detected = dataclasses.replace(node_registry.settings, roce_interface="")
+    monkeypatch.setattr(node_registry, "settings", detected)
+    monkeypatch.setattr(node_registry, "_local_networks", lambda: [
+        ("eth0", __import__("ipaddress").ip_network("192.168.99.0/24")),
+        ("enp9s0f1", __import__("ipaddress").ip_network("10.0.0.0/24")),
+    ])
+    monkeypatch.setattr(node_registry, "registered", lambda: [
+        node_registry.local_node(),
+        node_registry.Node(name="peer", address="10.0.0.2", docker_host="ssh://peer"),
+    ])
+    assert node_registry.cluster_interface() == "enp9s0f1"
+
+    # With no peer there is nothing to reach, and no setting is the right answer.
+    monkeypatch.setattr(node_registry, "registered", lambda: [node_registry.local_node()])
+    assert node_registry.cluster_interface() == ""
+
+    # An explicit override always wins.
+    monkeypatch.setattr(node_registry, "settings",
+                        dataclasses.replace(node_registry.settings, roce_interface="ib0"))
+    assert node_registry.cluster_interface() == "ib0"

@@ -171,7 +171,12 @@ def build_command(server: dict) -> list[str]:
 
 
 def build_env(server: dict) -> dict[str, str]:
-    env = {"HF_HOME": "/hf", **settings.nccl_env()}
+    # No fabric settings here. This is the environment of ANY server, and most
+    # of them are one container on one machine with no peer to reach: handing
+    # such an engine an NCCL_SOCKET_IFNAME breaks it outright if the name is not
+    # a device on that box, and buys nothing when it is. A pooled rank gets its
+    # own node's detected interface from cluster.rank_env() instead.
+    env = {"HF_HOME": "/hf"}
     hf_token = hf.token()
     if hf_token:
         env["HF_TOKEN"] = hf_token
