@@ -30,6 +30,15 @@ ENV PIP_CONSTRAINT=""
 # made to satisfy the one they use. A no-op wherever `python` already exists.
 RUN command -v python >/dev/null || ln -sf "$(command -v python3)" /usr/local/bin/python
 
+# NGC's base carries git; the official vLLM image does not, and Heretic is
+# installed from a git URL — pip fails there with "Cannot find command 'git'",
+# which says nothing about the base image that lacks it. Installed only when
+# missing, so the Spark's build is untouched and pays no apt round trip.
+RUN command -v git >/dev/null || { \
+        apt-get update && apt-get install -y --no-install-recommends git \
+        && rm -rf /var/lib/apt/lists/*; \
+    }
+
 RUN python -m venv --system-site-packages /opt/heretic \
  && /opt/heretic/bin/pip install --no-cache-dir \
       "git+https://github.com/p-e-w/heretic@${HERETIC_REF}" \
