@@ -1,7 +1,7 @@
 """Asyncio wrapper around the docker CLI.
 
 The CLI rather than the SDK: every vLLM process on this box is already launched
-this way, the flags are identical to the hand-written scripts in the hand-written scripts this replaces,
+this way, the flags are identical to the hand-written scripts this replaces,
 and it sidesteps socket-permission differences between the dashboard user and
 the daemon. Nothing here shells out through a shell, so model ids and file paths
 containing odd characters are passed through untouched.

@@ -217,7 +217,7 @@ docker ps --format '{{.Names}}'
 docker kill <name>
 ```
 
-There is no sudo on this box, so dropping caches or changing swappiness is not
+If you have root, dropping caches or changing swappiness may buy you a shell; if you do not, that is not
 available. If the machine has stopped scheduling your shell, the reset button is
 the remaining option — which is the entire reason the launch check refuses
 instead of asking.

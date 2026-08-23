@@ -17,7 +17,7 @@ from app.telemetry import HostMemory
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 
-# The real thing, copied from this box.
+# The shape a GB10 actually returns: every memory field declined.
 GB10_ROW = "0, GPU-00000000-0000-0000-0000-000000000000, NVIDIA GB10, [N/A], [N/A], [N/A], [N/A]"
 GB10_HOST = HostMemory(total_bytes=130_663_006_208,      # MemTotal 127600592 kB
                        available_bytes=23_591_030_784,

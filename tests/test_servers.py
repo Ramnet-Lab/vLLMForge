@@ -96,7 +96,7 @@ def test_a_job_s_output_path_is_translated_for_the_container():
     assert servers.container_path(settings.output_dir) == "/outputs"
     # A path the server container does not mount is left alone rather than
     # silently rewritten into something that does not exist.
-    assert servers.container_path(Path("/home/user/models/hf-cache")) == "/home/user/models/hf-cache"
+    assert servers.container_path(Path("/srv/elsewhere/hf-cache")) == "/srv/elsewhere/hf-cache"
 
 
 def test_a_token_stored_from_the_ui_reaches_server_containers():

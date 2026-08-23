@@ -2,7 +2,7 @@
 
 A "server" is a saved parameter set plus a container. The dashboard also
 discovers vLLM containers it did not start — the hand-launched ones from
-the hand-written scripts this replaces show up alongside managed servers so the memory picture on the
+a `vllm serve` started from a shell shows up alongside managed servers so the memory picture on the
 Overview page is the truth about the host, not just about this app.
 
 Managed containers deliberately get restart policy "no": on a unified-memory

@@ -13,7 +13,7 @@ def test_schema_loaded():
 
 
 def test_build_argv_reproduces_the_hand_written_launch():
-    # This is serve-qwen.sh from the hand-written scripts this replaces, expressed as dashboard params.
+    # A real single-GPU serve command, expressed as dashboard params.
     params = {
         "served_model_name": "qwen3",
         "max_model_len": 262144,

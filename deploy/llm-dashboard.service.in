@@ -1,9 +1,9 @@
 # Installed to ~/.config/systemd/user/ by scripts/install-service.sh.
 #
-# A *user* unit, not a system one: this box has no passwordless sudo, the
-# dashboard needs the docker group the login user already has, and it reads
-# /proc and nvidia-smi in the host PID namespace. Running it as root would buy
-# nothing and cost the containers' file ownership.
+# A *user* unit, not a system one. The dashboard needs the docker group the
+# login user already has, and it reads /proc and nvidia-smi in the host PID
+# namespace; running it as root would buy nothing and cost the containers'
+# file ownership.
 #
 # Lingering (loginctl enable-linger) is what makes a user unit start at boot
 # without someone logging in; the installer checks for it.
