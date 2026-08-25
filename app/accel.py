@@ -83,6 +83,12 @@ class Pool:
     reserve_bytes: int = 0
     warn_reserve_bytes: int = 0
 
+    device_total_bytes: int = 0
+    """One card's framebuffer — the smallest, when they differ. `total_bytes` is
+    every card added up, which is what the box has to spend; this is what a
+    per-device fraction like --gpu-memory-utilization multiplies. On a unified
+    pool the two are the same number, because there is only one pool."""
+
     # The host, which is a separate thing on a discrete box and the same thing
     # on a unified one. Always truthful either way.
     host: HostMemory = field(default_factory=HostMemory)
@@ -108,6 +114,7 @@ class Pool:
             "available_bytes": self.available_bytes,
             "reserve_bytes": self.reserve_bytes,
             "device_count": self.device_count,
+            "device_total_bytes": self.device_total_bytes,
             "devices": [
                 {"index": d.index, "name": d.name, "total_bytes": d.total_bytes}
                 for d in self.devices
@@ -241,17 +248,25 @@ def reserves_for(kind: str, total_bytes: int, host_total: int) -> tuple[int, int
 
     On unified the reserve is the operator's configured figure, because the OS
     is a tenant of the very pool the model is claiming — 32 GiB here, measured.
-    On discrete the OS is not in the framebuffer, so the reserve is only what
-    the driver and allocator need, and holding tens of gigabytes of a 24 GiB
-    card back would make the machine unusable.
 
-    Both are capped by a fraction of the pool so a small card is never handed a
-    reserve larger than itself. On this box the caps are inert by construction:
-    0.30 x 121.7 = 36.5 GiB, above the configured 32.
+    **On discrete the reserve is nothing, and that is deliberate.** The reserve
+    exists for exactly one failure: a pool the OS is living in, overcommitted,
+    freezing a machine that no OOM killer reacts to in time. A framebuffer is
+    not that pool. Nothing the operator sees — the desktop, the ssh session,
+    every other engine on the box — is inside it, and the way a discrete GPU
+    runs out is a CUDA OOM inside the process that asked for too much. That
+    process dies; the machine does not notice. So holding gigabytes of VRAM back
+    against a freeze that cannot happen just makes a card smaller than it is,
+    and on this host it refused a 14 GiB launch into 19 GiB of free framebuffer.
+
+    The HOST reserve is untouched and still real: llama.cpp puts every layer it
+    could not offload into host RAM, and that pool is the one the OS lives in.
+
+    The unified figures are capped by a fraction of the pool so a small part is
+    never handed a reserve larger than itself.
     """
     if kind == DISCRETE:
-        hard = min(int(settings.gpu_reserve_gib * GIB), int(0.30 * total_bytes))
-        warn = min(int(settings.gpu_reserve_gib * 1.5 * GIB), int(0.35 * total_bytes))
+        hard = warn = 0
     else:
         hard = min(int(settings.mem_reserve_gib * GIB), int(0.30 * total_bytes)) \
             if total_bytes else int(settings.mem_reserve_gib * GIB)
@@ -270,24 +285,40 @@ def build(devices: list[Device], host: HostMemory, *, smi_ok: bool,
     if kind == DISCRETE:
         totals = [d.total_bytes or 0 for d in devices]
         frees = [d.free_bytes or 0 for d in devices]
-        total = min(totals)
-        available = min(frees)
+        # The pool is every card, not the smallest one. A box with two 44 GiB
+        # cards has 88 GiB of video memory, and an engine given `--gpus all` —
+        # llama.cpp splitting layers, vLLM sharding a tensor-parallel rank per
+        # device — spends across all of them. Sizing that box at 44 GiB while
+        # ALSO counting what every card already holds is not conservative, it is
+        # incoherent: it refused a 14 GiB launch into 19 GiB of free framebuffer
+        # and printed "-9.8 GiB" doing it.
+        #
+        # `device_total_bytes` keeps the per-device figure, because vLLM's
+        # --gpu-memory-utilization is a fraction of ONE card and its footprint
+        # is that fraction times however many cards the rank spans. That is what
+        # `devices=` on the pricers is for.
+        total = sum(totals)
+        available = sum(frees)
         # memory.used, not the compute-apps sum: that sum misses graphics
         # contexts and other users' processes, and under-reporting occupancy is
         # the permissive direction.
-        measured = max((d.used_bytes or 0) for d in devices)
+        measured = sum(d.used_bytes or 0 for d in devices)
         free = available
+        device_total = min(totals) if totals else 0
     else:
         total = host.total_bytes
         available = host.available_bytes
         free = host.free_bytes
         measured = measured_bytes
+        # One pool, and every engine on it spends the same bytes. A fraction
+        # here multiplies the whole machine, which is what it always did.
+        device_total = total
 
     hard, warn, host_reserve = reserves_for(kind, total, host.total_bytes)
     return Pool(
         kind=kind, confidence=confidence,
         total_bytes=total, available_bytes=available, free_bytes=free,
-        measured_bytes=measured,
+        measured_bytes=measured, device_total_bytes=device_total,
         reserve_bytes=hard, warn_reserve_bytes=warn,
         host=host, host_reserve_bytes=host_reserve,
         devices=tuple(devices),

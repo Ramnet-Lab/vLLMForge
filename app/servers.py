@@ -326,7 +326,7 @@ def launch_preview(server: dict) -> str:
             image=image_of(server),
             command=build_command(server),
             env=build_env(server),
-            mounts=_mounts(),
+            mounts=_mounts(engine),
             gpu=engine.gpu,
             entrypoint=engine.entrypoint,
         )
@@ -337,11 +337,28 @@ OUTPUTS_MOUNT = "/outputs"
 CACHE_MOUNT = "/hf"
 
 
-def _mounts() -> list[docker_ctl.Mount]:
-    return [
+def _mounts(engine: Any = None) -> list[docker_ctl.Mount]:
+    """The model cache, the output directory, and the engine's compiled kernels.
+
+    The third is not a convenience. `start` removes the container before every
+    launch, so anything an engine wrote into its own filesystem is gone by the
+    next one — including torch.compile output and, expensively, Inductor's
+    autotune timings, which are re-measured on the GPU from scratch. Backing
+    each declared path with a directory on the host is what makes the second
+    start of a model faster than the first instead of identical to it.
+
+    One directory per container path, named after it, because the three are
+    separate trees inside the container and flattening them into one would let
+    Triton's cache collide with Inductor's.
+    """
+    mounts = [
         docker_ctl.Mount(settings.hf_cache, CACHE_MOUNT),
         docker_ctl.Mount(settings.output_dir, OUTPUTS_MOUNT),
     ]
+    for path in getattr(engine, "compile_cache_paths", ()) or ():
+        slug = path.strip("/").replace("/", "-")
+        mounts.append(docker_ctl.Mount(settings.compile_cache / slug, path))
+    return mounts
 
 
 def _relative_to(path: Path, root: Path) -> Path | None:
@@ -507,7 +524,7 @@ async def start_pooled(server: dict, *, force: bool = False) -> dict:
                     image=image_of(server),
                     command=cluster.rank_argv(serve_argv, rank, len(wirings), head, master_port),
                     env=cluster.rank_env(w, head, build_env(server)),
-                    mounts=_mounts(),
+                    mounts=_mounts(engine_for(server)),
                     gpu=True,
                     network="host",
                     host=w.node.docker_host,
@@ -570,15 +587,34 @@ async def start(server_id: int, *, force: bool = False) -> dict:
         if not verdict.ok and not force:
             return {"started": False, "safety": verdict.as_dict()}
 
+        # Before anything is torn down. Every image here is built from docker/
+        # and none is pullable, so `docker run` on an absent tag does not fail
+        # with "you have not built this": it tries the registry and comes back
+        # with "pull access denied for llmd/llamacpp, repository does not exist
+        # or may require 'docker login'", which sends the operator to log in to
+        # a registry that has never heard of the tag. Saying it here costs one
+        # `image inspect` and answers with the command that fixes it.
+        #
+        # And it is above the remove() on purpose: a start that cannot possibly
+        # work should not first delete the container it was going to replace.
+        image = image_of(server)
+        if not await docker_ctl.image_exists(image, host=node.docker_host):
+            where = "" if node.docker_host is None else f" on {node.name}"
+            return {"started": False, "safety": verdict.as_dict(), "error": (
+                f"The {engine.label} image '{image}' is not built{where}. It is built from "
+                f"this repo, not pulled from a registry, so nothing will fetch it: run "
+                f"`docker build -t {image} -f docker/{engine.dockerfile} docker/` "
+                f"and start this again.")}
+
         await docker_ctl.remove(name, force=True, host=node.docker_host)
         settings.output_dir.mkdir(parents=True, exist_ok=True)
         try:
             await docker_ctl.run_detached(
                 name=name,
-                image=image_of(server),
+                image=image,
                 command=build_command(server),
                 env=build_env(server),
-                mounts=_mounts(),
+                mounts=_mounts(engine),
                 gpu=engine.gpu,
                 entrypoint=engine.entrypoint,
                 network="host",

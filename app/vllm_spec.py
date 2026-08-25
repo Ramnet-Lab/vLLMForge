@@ -410,17 +410,49 @@ def parse_size(value: Any) -> int | None:
         return None
 
 
-def footprint_bytes(params: dict[str, Any], total_bytes: int, *, default_util: float) -> int:
-    """A floor on the host memory a launch with these parameters will take.
+def parallel_devices(params: dict[str, Any]) -> int:
+    """How many cards one engine's ranks cover: tensor x pipeline parallel.
+
+    vLLM shards a model over `tensor_parallel_size` devices and stages it over
+    `pipeline_parallel_size` groups of them, and every one of those devices gets
+    its own allocation of `--gpu-memory-utilization x that card`. So the number
+    of cards spent is the product, and the fraction is charged once per card.
+
+    Data parallelism is deliberately absent: `--data-parallel-size` replicates
+    the engine into separate processes that vLLM launches itself, which the
+    budget sees as they appear rather than predicting here.
+    """
+    total = 1
+    for dest in ("tensor_parallel_size", "pipeline_parallel_size"):
+        try:
+            value = int((params or {}).get(dest) or 1)
+        except (TypeError, ValueError):
+            value = 1
+        total *= max(1, value)
+    return total
+
+
+def footprint_bytes(params: dict[str, Any], total_bytes: int, *, default_util: float,
+                    devices: int = 1) -> int:
+    """A floor on the accelerator memory a launch with these parameters will take.
 
     The utilisation fraction is not the whole story. --kv-cache-memory sizes the
     KV cache explicitly and *overrides* the fraction, so a config can pair a
     tiny util with a huge cache and look free. --cpu-offload-gb moves weights to
     system RAM, which on a unified-memory part is the same pool. Both are added
     here so the guard cannot be walked past.
+
+    `total_bytes` is the whole pool and `devices` is how many cards it spans, so
+    `total_bytes / devices` is one card — which is what the fraction actually
+    multiplies. The engine then pays it once per card its ranks cover.
+
+    On a unified box devices is 1 and this is `util x total_bytes`, unchanged
+    and byte-for-byte what it has always returned.
     """
     util = gpu_memory_utilization(params)
-    engine = int((default_util if util is None else util) * total_bytes)
+    per_device = total_bytes / max(1, devices)
+    spanned = parallel_devices(params) if devices > 1 else 1
+    engine = int((default_util if util is None else util) * per_device * spanned)
 
     kv = parse_size(params.get("kv_cache_memory_bytes") or params.get("kv_cache_memory"))
     if kv is not None:

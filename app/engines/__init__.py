@@ -130,6 +130,20 @@ class Engine(Protocol):
     interesting_metrics: tuple[str, ...]
     """The Prometheus series the UI promotes out of a /metrics scrape."""
 
+    compile_cache_paths: tuple[str, ...]
+    """Directories inside the container holding compiled kernels, which are
+    worth keeping across launches. Empty for an engine that compiles nothing.
+    servers._mounts backs each one with a directory on the host, because the
+    launcher removes the container before every start and everything written
+    into its own filesystem goes with it."""
+
+    dockerfile: str
+    """The file under docker/ that builds `default_image`. Every image here is
+    BUILT from this repo and never pulled, so a tag that is absent is absent
+    until someone runs the build — and both the caller that reports that
+    (servers.start) and the one that offers it (GET /api/system/images) need to
+    name the file rather than guess it from the engine's name."""
+
     # --- schema and command assembly ---
     def ui_model(self) -> dict[str, Any]:
         """The form model. GET /api/servers/schema?engine=…"""
@@ -164,8 +178,17 @@ class Engine(Protocol):
     async def resolve(self, params: dict[str, Any]) -> dict[str, Any]:
         """Whatever pricing needs that costs I/O, folded into the params dict."""
 
-    def footprint_bytes(self, params: dict[str, Any], total_bytes: int) -> int:
-        """A floor on the accelerator memory these params will take."""
+    def footprint_bytes(self, params: dict[str, Any], total_bytes: int,
+                        *, devices: int = 1) -> int:
+        """A floor on the accelerator memory these params will take.
+
+        `total_bytes` is the whole pool — every card on the box added up.
+        `devices` is how many cards that is, and it exists because vLLM's
+        --gpu-memory-utilization is a fraction of ONE card: a rank spanning two
+        of them spends the fraction twice. Defaulting to 1 keeps every caller
+        that has no pool in hand — and every unified box, which has exactly one
+        pool — answering exactly as it did.
+        """
 
     def declared_util(self, params: dict[str, Any]) -> float | None:
         """The utilisation fraction the operator actually wrote, or None when the

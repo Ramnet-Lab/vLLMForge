@@ -57,22 +57,44 @@ def test_a_discrete_card_is_sized_against_its_framebuffer():
     assert pool.total_bytes == 24564 * MIB
     assert pool.available_bytes == 24052 * MIB
     assert pool.measured_bytes == 512 * MIB
-    assert pool.reserve_bytes == 2 * GIB, "the OS does not live in a framebuffer"
+    assert pool.reserve_bytes == 0, "the OS does not live in a framebuffer, so nothing is held back"
+    assert pool.warn_reserve_bytes == 0
+    assert pool.host_reserve_bytes > 0, "host RAM is still guarded — CPU layers land there"
     assert not pool.describes_host, "offloading to host RAM really does free VRAM here"
     assert pool.host.total_bytes == 128 * GIB, "host memory is still reported, separately"
 
 
-def test_the_smallest_card_sets_the_ceiling():
-    """The fraction applies per device, so a machine can only promise what its
-    smallest one can hold."""
+def test_the_pool_is_every_card_and_the_ceiling_is_the_smallest():
+    """Two numbers, because two different questions are asked of them.
+
+    What the box has to spend is every framebuffer added up: an engine given
+    `--gpus all` splits across all of them. This used to report the smallest
+    card as the whole pool while still counting what every card held, which is
+    not conservative but incoherent — it refused a 14 GiB launch into 19 GiB of
+    free video memory and printed a negative headroom doing it.
+
+    The smallest card survives as `device_total_bytes`, because a per-device
+    fraction like --gpu-memory-utilization multiplies one card and a machine can
+    only promise what its smallest can hold.
+    """
     rows = ("0, GPU-a, NVIDIA A, 24564, 100, 24000, [N/A]\n"
             "1, GPU-b, NVIDIA B, 49152, 200, 48000, [N/A]")
     host = HostMemory(total_bytes=256 * GIB, available_bytes=200 * GIB)
     pool = _pool(rows, host, "0, None\n1, None")
     assert pool.kind == accel.DISCRETE
     assert pool.device_count == 2
-    assert pool.total_bytes == 24564 * MIB
-    assert pool.available_bytes == 24000 * MIB
+    assert pool.total_bytes == (24564 + 49152) * MIB
+    assert pool.available_bytes == (24000 + 48000) * MIB
+    assert pool.measured_bytes == (100 + 200) * MIB, "occupancy adds up too"
+    assert pool.device_total_bytes == 24564 * MIB
+
+
+def test_a_unified_pool_is_one_card_by_definition():
+    """device_total_bytes is not a discrete-only concept with a hole in it: on a
+    unified part there is one pool and the fraction multiplies all of it."""
+    pool = _pool(GB10_ROW, GB10_HOST, "0, ATS")
+    assert pool.kind == accel.UNIFIED
+    assert pool.device_total_bytes == pool.total_bytes == GB10_HOST.total_bytes
 
 
 def test_a_part_that_addresses_host_memory_is_never_called_discrete():
@@ -142,11 +164,29 @@ def test_an_override_wins_and_says_so():
     assert pool.kind == accel.DISCRETE and pool.confidence == "configured"
 
 
-def test_a_reserve_is_never_larger_than_the_pool_it_guards():
-    """A 8 GiB card must not be handed a 32 GiB reserve, which would leave a
-    negative ceiling and refuse every launch with an unreadable number."""
+def test_a_small_card_keeps_all_of_itself():
+    """An 8 GiB card must not be handed a reserve at all, let alone a 32 GiB one.
+
+    This used to assert a small-but-nonzero figure and a cap that kept it below
+    the pool. Both are gone for the same reason: the reserve exists to stop an
+    overcommit freezing a machine whose OS is in the pool being claimed, and on
+    a discrete card it is not. Holding any of a small card back only makes it
+    smaller.
+    """
     row = "0, GPU-x, Small Card, 8192, 0, 8000, [N/A]"
     host = HostMemory(total_bytes=64 * GIB, available_bytes=50 * GIB)
     pool = _pool(row, host, "0, None")
-    assert pool.reserve_bytes < pool.total_bytes
-    assert 0 < pool.reserve_bytes <= 2 * GIB
+    assert pool.kind == accel.DISCRETE
+    assert pool.reserve_bytes == 0
+    assert pool.warn_reserve_bytes == 0
+
+
+def test_a_unified_pool_still_caps_its_reserve_below_itself():
+    """The cap that discrete no longer needs still matters where the reserve is
+    real: a 24 GiB unified part must not be handed the configured 32 GiB and
+    left with a negative ceiling that refuses every launch."""
+    small = HostMemory(total_bytes=24 * GIB, available_bytes=20 * GIB, free_bytes=18 * GIB)
+    hard, warn, _host = accel.reserves_for(accel.UNIFIED, small.total_bytes, small.total_bytes)
+    assert 0 < hard < small.total_bytes
+    assert hard <= int(0.30 * small.total_bytes)
+    assert warn <= int(0.35 * small.total_bytes)

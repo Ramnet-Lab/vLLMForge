@@ -48,7 +48,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app import docker_ctl, engines, vllm_spec
+from app import accel, docker_ctl, engines, vllm_spec
 from app.config import settings
 from app.engines.vllm import KV_BYTES_FLAG, OFFLOAD_FLAG, UTIL_FLAG
 
@@ -97,7 +97,8 @@ def command_params(command: list[str] | None) -> dict[str, Any]:
     return _VLLM.command_params(command)
 
 
-def footprint(params: dict[str, Any], total_bytes: int, *, engine: str = "vllm") -> int:
+def footprint(params: dict[str, Any], total_bytes: int, *, engine: str = "vllm",
+              devices: int = 1) -> int:
     """A floor on the memory these params will take, priced by their own engine.
 
     The chokepoint: every byte figure in this module and in the watchdog flows
@@ -110,7 +111,7 @@ def footprint(params: dict[str, Any], total_bytes: int, *, engine: str = "vllm")
     An engine whose price needs a file read does that read in `Engine.resolve()`,
     which the async callers await before they get here.
     """
-    return engines.get(engine).footprint_bytes(params, total_bytes)
+    return engines.get(engine).footprint_bytes(params, total_bytes, devices=devices)
 
 
 def argv_of(command: list[str] | None) -> list[str]:
@@ -172,6 +173,10 @@ class Budget:
     that is about to change."""
     reserve_bytes: int = 0
     warn_reserve_bytes: int = 0
+    devices: int = 1
+    """How many cards `total_bytes` spans. 1 on a unified box and on any pool
+    that could not be read, which is what keeps a per-device fraction meaning
+    the whole pool exactly as it always did."""
     tenants: list[Tenant] = field(default_factory=list)
     pool: Any = None
     """The accel.Pool these figures came from: which memory they describe, how
@@ -237,6 +242,26 @@ class Budget:
         return max(0, self.total_bytes - self.reserve_bytes)
 
     @property
+    def refusals_are_advice(self) -> bool:
+        """Whether exhausting this pool costs a container or costs the machine.
+
+        On a discrete GPU the framebuffer is not where the OS lives. An
+        overcommit is a CUDA out-of-memory inside the process that asked for too
+        much; that process dies and the desktop, the ssh session and every other
+        engine on the box carry on. There is nothing here for a guard to save,
+        so the capacity checks below say what they measured and let the operator
+        through.
+
+        On a unified part the same bytes ARE the OS's. An overcommit freezes the
+        machine during graph capture and no OOM killer reacts in time, which is
+        the whole reason this module exists — so there a refusal is a refusal.
+
+        `accel` fails unified on any doubt, so an unmeasured, overridden or
+        ambiguous box keeps the veto rather than inheriting this.
+        """
+        return getattr(self.pool, "kind", "") == accel.DISCRETE
+
+    @property
     def free_bytes_to_commit(self) -> int:
         """What a new engine may take. The byte twin of `free_util`, and the only
         answer available to an engine that declares no fraction."""
@@ -262,6 +287,7 @@ class Budget:
     def as_dict(self) -> dict:
         return {
             "total_bytes": self.total_bytes,
+            "devices": self.devices,
             "available_bytes": self.available_bytes,
             "free_bytes": self.free_bytes,
             "measured_gpu_bytes": self.measured_gpu_bytes,
@@ -362,6 +388,7 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
         free_bytes=pool.free_bytes,
         reserve_bytes=pool.reserve_bytes,
         warn_reserve_bytes=pool.warn_reserve_bytes,
+        devices=max(1, pool.device_count),
         pool=pool,
     )
 
@@ -396,7 +423,8 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
             # engine being restarted against its own restart.
             if engine is not None:
                 params = await engine.resolve(engine.command_params(argv))
-                credit = engine.footprint_bytes(params, pool.total_bytes)
+                credit = engine.footprint_bytes(params, pool.total_bytes,
+                                                devices=budget.devices)
                 # Capped by what the machine is actually measured to be holding.
                 # `excluded_bytes` is subtracted from occupancy AND added to
                 # available memory, so an estimate biased high — which llama.cpp's
@@ -420,7 +448,8 @@ async def current_budget(exclude: str | None = None, node: Any = None) -> Budget
         implicit = util is None and engine.implicit_util() is not None
         if implicit:
             util = engine.implicit_util()
-        committed = engine.footprint_bytes(params, budget.total_bytes)
+        committed = engine.footprint_bytes(params, budget.total_bytes,
+                                           devices=budget.devices)
 
         budget.tenants.append(
             Tenant(
@@ -495,8 +524,17 @@ async def check_launch(
         preface = ""
 
     requested_bytes = footprint({**(params or {}), "gpu_memory_utilization": util},
-                                budget.total_bytes)
-    if params and requested_bytes > int(util * budget.total_bytes):
+                                budget.total_bytes, devices=budget.devices)
+    # What the fraction ALONE would cost, priced the same way — same pool, same
+    # device count, same parallel spread — so the only difference left is the
+    # two flags below. Comparing against a bare `util x total_bytes` stopped
+    # being that baseline the moment the fraction became per-device, and would
+    # have accused every multi-card launch of setting flags it had not set.
+    bare = {k: v for k, v in (params or {}).items()
+            if k not in ("kv_cache_memory_bytes", "kv_cache_memory", "cpu_offload_gb")}
+    fraction_only = footprint({**bare, "gpu_memory_utilization": util},
+                              budget.total_bytes, devices=budget.devices)
+    if params and requested_bytes > fraction_only:
         preface += (
             "This config also sets "
             + " and ".join(
@@ -510,9 +548,18 @@ async def check_launch(
     projected_bytes = budget.occupied_bytes + requested_bytes
     projected = projected_bytes / budget.total_bytes if budget.total_bytes else 0.0
     headroom_after = budget.total_bytes - projected_bytes
+    # `free_util` is a fraction of the whole pool, and --gpu-memory-utilization
+    # is a fraction of one card charged once per card the ranks span. Those are
+    # the same number only when the ranks span every card — the usual case, and
+    # exactly 1.0 on a single-card or unified box, which is why this multiplier
+    # changes no answer that box has ever been given. A tensor-parallel-1 engine
+    # on a two-card machine may have twice the fraction its share of the pool
+    # suggests, and telling it otherwise halves the card for no reason.
+    spanned = vllm_spec.parallel_devices(params) if budget.devices > 1 else 1
+    headroom_util = budget.free_util * budget.devices / max(1, spanned)
     # Floor, never round: suggesting 0.06 when 0.057 is the ceiling hands the
     # user a value the very next check refuses.
-    safe_now = math.floor(max(0.0, budget.free_util) * 100) / 100
+    safe_now = math.floor(max(0.0, min(1.0, headroom_util)) * 100) / 100
     suggested = safe_now or None
 
     # `label` is built at construction and, for a tenant declaring a fraction,
@@ -520,6 +567,25 @@ async def check_launch(
     tenants = ", ".join(t.label for t in budget.tenants) if budget.tenants else "none"
 
     if projected_bytes > budget.total_bytes - budget.reserve_bytes:
+        if budget.refusals_are_advice:
+            # Discrete: this is video memory, and the sentence below about "the
+            # OS and torch.compile" would be describing a pool the OS is not in.
+            return Verdict(
+                ok=True,
+                level="warn",
+                message=(
+                    f"{preface}Over capacity: {util:g} on top of "
+                    f"{_gib(budget.occupied_bytes)} already in use ({tenants}) wants "
+                    f"{_gib(projected_bytes)} of {_gib(budget.total_bytes)} of video memory. "
+                    f"Nothing is refused — the OS does not live in a framebuffer, so being wrong "
+                    f"here costs this engine a CUDA out-of-memory and costs the rest of the box "
+                    f"nothing. {budget.free_util:.2f} is what currently fits."
+                ),
+                budget=payload,
+                requested_util=util,
+                requested_bytes=requested_bytes,
+                suggested_util=suggested,
+            )
         return Verdict(
             ok=False,
             level="block",
@@ -638,7 +704,8 @@ async def _check_launch_bytes(
     payload = budget.as_dict()
 
     resolved = await engine.resolve(params)
-    requested_bytes = engine.footprint_bytes(resolved, budget.total_bytes)
+    requested_bytes = engine.footprint_bytes(resolved, budget.total_bytes,
+                                             devices=budget.devices)
     unsized = str(resolved.get("_sizing") or "")
 
     projected_bytes = budget.occupied_bytes + requested_bytes
@@ -663,7 +730,17 @@ async def _check_launch_bytes(
             engine=engine.name,
         )
 
+    advisory = budget.refusals_are_advice
+
     if projected_bytes > budget.total_bytes - budget.reserve_bytes:
+        if advisory:
+            return verdict(True, "warn", (
+                f"Over capacity: this configuration needs {_gib(requested_bytes)} on top of "
+                f"{_gib(budget.occupied_bytes)} already in use ({tenants}), against "
+                f"{_gib(budget.total_bytes)} of video memory — about {_gib(free)} of it free. "
+                "Nothing is refused: overcommitting a framebuffer costs this engine a CUDA "
+                "out-of-memory while the machine carries on. To make it fit, lower "
+                "--n-gpu-layers, shorten --ctx-size, or quantise the cache with -ctk q8_0."))
         return verdict(False, "block", (
             f"Refusing to launch: this configuration needs {_gib(requested_bytes)} on top of "
             f"{_gib(budget.occupied_bytes)} already in use ({tenants}), which would leave only "
@@ -672,6 +749,16 @@ async def _check_launch_bytes(
             "lower --n-gpu-layers, shorten --ctx-size, or quantise the cache with -ctk q8_0."))
 
     if requested_bytes > live_available:
+        if advisory:
+            # The refusal below is a claim about a unified part, where the
+            # allocation llama-server does not check first is the machine's own
+            # memory. On a discrete card it is the card's, and the failure is a
+            # container that exits rather than a host that stops responding.
+            return verdict(True, "warn", (
+                f"Tight: this configuration needs {_gib(requested_bytes)} and only "
+                f"{_gib(live_available)} of video memory is free right now. llama-server does "
+                "not check before it allocates, so if this is wrong it will die partway through "
+                "loading — which costs the load and nothing else."))
         return verdict(False, "block", (
             f"Refusing to launch: this configuration needs {_gib(requested_bytes)} but only "
             f"{_gib(live_available)} is free right now. Unlike vLLM, llama-server does not "

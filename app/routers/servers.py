@@ -434,10 +434,25 @@ async def start(server_id: int, force: bool = False) -> dict:
     if not result["started"]:
         safety = result.get("safety") or {}
         if result.get("error"):
-            # docker refused the launch itself — a bound port, a missing image.
-            raise HTTPException(502, detail={"message": result["error"], **safety})
-        # 409: the request was well-formed, the host just cannot take it.
-        raise HTTPException(409, detail=safety)
+            # The environment refused the launch — a bound port, an image that
+            # was never built — rather than the host declining to spend the
+            # memory. This answered 502 for a while, which is the honest status
+            # and the wrong one: Cloudflare replaces an origin 502 with its own
+            # "bad gateway" page, so behind a tunnel the one thing this response
+            # exists to carry never reached the browser. 409 says the same thing
+            # — the request is well-formed, the current state refuses it — and
+            # no proxy rewrites a 4xx.
+            #
+            # `**safety` goes FIRST. The other way round, a docker failure that
+            # also carries a verdict came back captioned with the verdict's
+            # message ("Estimated at 2.1 GiB against 2.1 GiB free"), because the
+            # spread overwrote the error it was supposed to accompany.
+            raise HTTPException(409, detail={
+                **safety, "kind": "environment", "message": result["error"]})
+        # The request was well-formed, the host just cannot take it. `kind` is
+        # what tells this apart from the case above now that the status does
+        # not: only this one is worth offering a "start anyway" for.
+        raise HTTPException(409, detail={**safety, "kind": "memory"})
     return result
 
 

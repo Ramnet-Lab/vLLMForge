@@ -272,10 +272,20 @@ def discrete_pool(free_bytes: int, total_bytes: int = 48 * 1024 ** 3):
 
 
 @pytest.mark.asyncio
-async def test_a_full_framebuffer_kills_even_while_host_ram_is_plentiful(fake, monkeypatch):
-    """The failure this whole split exists for. Host MemAvailable reads 90 GiB
-    on a discrete box whose every card is full, so the old trigger never fired
-    and the watchdog watched the machine wedge."""
+async def test_a_full_framebuffer_is_reported_and_nothing_is_killed(fake, monkeypatch):
+    """A framebuffer running low is reported, and it is not an emergency.
+
+    This used to kill, on the reasoning that the device reading is about the
+    engines by construction — which is true, and beside the point. The watchdog
+    exists to get in front of a freeze: a pool the OS lives in, filled, with no
+    OOM killer fast enough to save an interactive machine. A discrete card is
+    not that pool, and near-full is its CORRECT steady state — an engine given
+    --gpu-memory-utilization 0.52 is under instructions to take half the card
+    and hold it. Killing on that signal took a server down five seconds after it
+    finished loading, for obeying its own configuration.
+
+    Host memory keeps its kill, on a unified box, where the freeze is real.
+    """
     stub = fake({
         "vllm-big": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.52"],
         "vllm-small": ["vllm", "serve", "m", "--gpu-memory-utilization", "0.16"],
@@ -289,14 +299,23 @@ async def test_a_full_framebuffer_kills_even_while_host_ram_is_plentiful(fake, m
         total_bytes=100 * 1024 ** 3, available_bytes=90 * 1024 ** 3))
     monkeypatch.setattr(memguard, "POLL_SECONDS", 0.01)
 
+    # The history is module-global, and this test waits on it rather than on a
+    # kill that must never come — so an earlier test's entry would satisfy the
+    # wait before this watchdog had looked at anything.
+    memguard._history.clear()
+
     task = asyncio.create_task(memguard.watch())
-    await until(lambda: bool(stub.killed))
+    await until(lambda: bool(memguard.history()))
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
-    assert stub.killed[:1] == ["vllm-big"]
-    assert "device free" in memguard.history()[-1]["reason"]
+    assert stub.killed == [], "a full framebuffer must not cost a serving engine"
+    entry = memguard.history()[-1]
+    assert entry["action"] == "warn"
+    assert "device free" in entry["reason"], "the measurement is still reported"
+    assert "would kill" in entry["reason"] and "nothing killed" in entry["reason"]
+    assert "vllm-big" in entry["reason"], "and it still names what it would have taken"
 
 
 @pytest.mark.asyncio

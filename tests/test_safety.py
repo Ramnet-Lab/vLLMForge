@@ -83,6 +83,62 @@ async def test_check_launch_blocks_an_overcommit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_on_a_discrete_card_the_same_overcommit_is_advice_not_a_veto(monkeypatch):
+    """Identical numbers, different pool, opposite answer.
+
+    The veto exists for a pool the OS is living in, where an overcommit freezes
+    the box. A framebuffer is not that pool: the engine that asked for too much
+    takes a CUDA out-of-memory and dies, and nothing else on the machine
+    notices. So the guard says what it measured and gets out of the way.
+    """
+    from app import accel
+
+    def discrete(**extra):
+        b = budget([("vllm-qwen", 0.52), ("vllm-embed", 0.16)], **extra)
+        b.pool = accel.Pool(kind=accel.DISCRETE, confidence="measured", can_size=True)
+        # A framebuffer holds nothing back; app/accel.py::reserves_for says why.
+        b.reserve_bytes = 0
+        b.warn_reserve_bytes = 0
+        return b
+
+    async def fake(exclude=None, node=None):
+        return discrete()
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+
+    # 0.68 already resident + 0.30 = 0.98 of the framebuffer. On the unified
+    # path this is refused outright, because 32 GiB of the pool belongs to the
+    # OS. Here the card holds all of itself and it simply fits.
+    fits = await safety.check_launch(0.30)
+    assert fits.ok and fits.level == "ok", fits.message
+
+    # Past 1.0 it really is over capacity — and that is still not a veto.
+    verdict = await safety.check_launch(0.50)
+    assert verdict.ok, "a discrete overcommit costs a container, not the machine"
+    assert verdict.level == "warn"
+    assert "Refusing" not in verdict.message
+    assert "out-of-memory" in verdict.message
+    # The measurement is still all there — this is advice, not silence.
+    assert "vllm-qwen" in verdict.message
+
+
+@pytest.mark.asyncio
+async def test_a_unified_pool_keeps_its_veto(monkeypatch):
+    """The counterpart, and the reason the branch is on the pool and not a flag.
+
+    accel fails unified on any doubt, so an unmeasured or ambiguous box lands
+    here — which is the safe direction, because this is the machine that stops
+    responding.
+    """
+    async def fake(exclude=None, node=None):
+        return budget([("vllm-qwen", 0.52), ("vllm-embed", 0.16)])
+
+    monkeypatch.setattr(safety, "current_budget", fake)
+    verdict = await safety.check_launch(0.30)
+    assert not verdict.ok and verdict.level == "block"
+
+
+@pytest.mark.asyncio
 async def test_an_unset_util_is_evaluated_as_vllm_s_default(monkeypatch):
     # Leaving the flag off is not "unspecified", it is 0.92 — 112 GiB here, which
     # cannot fit beside the OS reserve on an otherwise idle host.
@@ -332,13 +388,25 @@ async def test_a_restart_gets_its_own_memory_back(monkeypatch):
     async def processes():
         return []
 
+    host = telemetry.HostMemory(total_bytes=int(121.69 * GIB),
+                                available_bytes=int(100 * GIB), free_bytes=int(100 * GIB))
+
+    # Stubbed, not measured. This used to fall through to whatever nvidia-smi
+    # said on the machine running the tests, which made a test about *exclusion*
+    # quietly depend on how many cards the developer had: 0.60 of a one-card
+    # pool is 0.60 of the budget, and 0.60 of one card in a two-card box is
+    # 0.30. Both are right, and neither is what this test is asking about.
+    async def single_pool(node=None):
+        return accel.Pool(kind=accel.UNIFIED, confidence="measured", can_size=True,
+                          total_bytes=host.total_bytes, device_total_bytes=host.total_bytes,
+                          available_bytes=host.available_bytes, free_bytes=host.free_bytes,
+                          host=host)
+
     monkeypatch.setattr(safety.docker_ctl, "ps", one_engine)
     monkeypatch.setattr(safety.docker_ctl, "state", state)
     monkeypatch.setattr(telemetry, "read_gpu_processes", processes)
-    monkeypatch.setattr(telemetry, "read_meminfo", lambda: telemetry.HostMemory(
-        total_bytes=int(121.69 * GIB), available_bytes=int(100 * GIB),
-        free_bytes=int(100 * GIB)))
-    monkeypatch.setattr(accel, "ACCEL_QUERY", accel.ACCEL_QUERY)
+    monkeypatch.setattr(telemetry, "read_meminfo", lambda: host)
+    monkeypatch.setattr(safety.accel, "pool_for", single_pool)
 
     counted = await safety.current_budget()
     assert counted.committed_util == pytest.approx(0.60, abs=0.01)

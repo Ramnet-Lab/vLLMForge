@@ -196,6 +196,19 @@ class Settings:
         return self.state_dir / "uploads"
 
     @property
+    def compile_cache(self) -> Path:
+        """Where an engine's compiled kernels survive their container.
+
+        vLLM writes torch.compile output, Inductor's autotune results and
+        Triton's kernel cache into three directories inside the container. The
+        launcher removes the container before every start, so all three were
+        discarded every time and each launch recompiled from cold — minutes on
+        an ordinary model, and on a model whose sampling step is separately
+        compiled it is the difference between starting and appearing to hang.
+        """
+        return self.state_dir / "compile-cache"
+
+    @property
     def web_dir(self) -> Path:
         return REPO_ROOT / "web"
 
@@ -227,7 +240,8 @@ class Settings:
 
     def ensure_dirs(self) -> None:
         for path in (
-            self.state_dir, self.log_dir, self.upload_dir, self.output_dir, self.dataset_dir
+            self.state_dir, self.log_dir, self.upload_dir, self.output_dir, self.dataset_dir,
+            self.compile_cache,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

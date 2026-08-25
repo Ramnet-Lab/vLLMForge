@@ -172,6 +172,9 @@ class LlamaCppEngine:
     supports_pooling = False
     served_name_dest = "alias"
     interesting_metrics = INTERESTING_METRICS
+    dockerfile = "llamacpp.Dockerfile"
+    # ggml ships compiled kernels in the image and builds none at runtime.
+    compile_cache_paths = ()
 
     @property
     def default_image(self) -> str:
@@ -299,12 +302,16 @@ class LlamaCppEngine:
         params.pop("_sizing", None)
         return params
 
-    def footprint_bytes(self, params: dict[str, Any], total_bytes: int) -> int:
+    def footprint_bytes(self, params: dict[str, Any], total_bytes: int,
+                        *, devices: int = 1) -> int:
         """A floor on the accelerator memory these parameters will take.
 
-        `total_bytes` is unused: unlike vLLM, nothing here is a fraction of the
-        machine. It stays in the signature because it is the shared contract
-        every engine's pricer is called through.
+        `total_bytes` and `devices` are both unused: unlike vLLM, nothing here
+        is a fraction of anything — the weights and the KV cache are computed in
+        bytes from the file's own header, and llama.cpp splits that total across
+        whatever devices it was given rather than claiming a share of each. They
+        stay in the signature because it is the shared contract every engine's
+        pricer is called through.
         """
         header = (params or {}).get("_gguf")
         if not isinstance(header, gguf.Header):

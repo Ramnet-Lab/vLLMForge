@@ -173,9 +173,12 @@ def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
     client = TestClient(app)
     try:
         response = client.post(f"/api/servers/{row['id']}/start")
-        # Not 404, and not a bare 502: the machines cannot take it.
+        # Not 404, and not a bare 500: the machines cannot take it.
         assert response.status_code == 409, response.text
         detail = response.json()["detail"]
+        # `kind` is what the UI branches on: only this one is worth a "start
+        # anyway", because only this one might succeed the second time.
+        assert detail["kind"] == "memory"
         assert detail["level"] == "block"
         assert "would reserve more than is free" in detail["message"]
         assert detail["suggested_util"] == 0.73
@@ -187,8 +190,15 @@ def test_a_pooled_refusal_is_not_reported_as_a_missing_server(monkeypatch):
         servers.delete_server(int(row["id"]))
 
 
-def test_an_environment_failure_stays_a_502(monkeypatch):
-    """A missing image is not the host declining; it is something to go fix."""
+def test_an_environment_failure_says_so_in_a_status_no_proxy_rewrites(monkeypatch):
+    """A missing image is not the host declining; it is something to go fix.
+
+    It is answered as a 409 rather than the 502 it once was, and the reason is
+    not taxonomy: Cloudflare replaces an origin 502 with its own "bad gateway"
+    page, so behind a tunnel the docker message this response exists to carry
+    was thrown away before the browser saw it. `kind` keeps the distinction the
+    status no longer makes.
+    """
     from fastapi.testclient import TestClient
 
     from app import cluster
@@ -206,10 +216,100 @@ def test_an_environment_failure_stays_a_502(monkeypatch):
     client = TestClient(app)
     try:
         response = client.post(f"/api/servers/{row['id']}/start")
-        assert response.status_code == 502
-        assert "not built on" in response.json()["detail"]["message"]
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["kind"] == "environment"
+        assert "not built on" in detail["message"]
     finally:
         servers.delete_server(int(row["id"]))
+
+
+@pytest.mark.anyio
+async def test_an_unbuilt_image_is_refused_before_anything_is_torn_down(monkeypatch, a_server):
+    """`docker run` on a tag this repo builds does not say "you have not built it".
+
+    It says "pull access denied ... may require 'docker login'", because docker
+    cannot tell a tag nobody built from a private one, and that sends an operator
+    to log in to a registry which has never heard of llmd/llamacpp. So the check
+    happens here, where the answer is the build command.
+
+    Before the remove(), too: a launch that cannot possibly work must not first
+    delete the container it was going to replace.
+    """
+    from app import docker_ctl, safety, servers
+
+    removed: list[str] = []
+    ran: list[str] = []
+
+    async def image_exists(tag, host=None):
+        return False
+
+    async def remove(name, *, force=True, host=None):
+        removed.append(name)
+
+    async def run_detached(**kwargs):
+        ran.append(kwargs["image"])
+
+    async def check_launch(*a, **k):
+        return safety.Verdict(ok=True, level="ok", message="fits", budget={})
+
+    monkeypatch.setattr(servers.docker_ctl, "image_exists", image_exists)
+    monkeypatch.setattr(servers.docker_ctl, "remove", remove)
+    monkeypatch.setattr(servers.docker_ctl, "run_detached", run_detached)
+    monkeypatch.setattr(servers.safety, "check_launch", check_launch)
+    monkeypatch.setattr(servers.events.broker, "publish", _noop_publish)
+
+    servers.update_server(int(a_server["id"]),
+                          {"engine": "llamacpp", "image": "llmd/llamacpp:latest"})
+    result = await servers.start(int(a_server["id"]))
+
+    assert result["started"] is False
+    assert "llmd/llamacpp:latest" in result["error"]
+    assert "docker build -t llmd/llamacpp:latest -f docker/llamacpp.Dockerfile" in result["error"]
+    assert removed == [], "the old container survives a launch that never happened"
+    assert ran == []
+    assert docker_ctl  # the module under mock is the one servers.py calls
+
+
+@pytest.mark.anyio
+async def test_the_docker_error_is_not_captioned_with_the_memory_verdict(monkeypatch, a_server):
+    """Both go in the detail; the message is the one that says what went wrong.
+
+    `{"message": error, **safety}` spread the verdict over the error, so a
+    launch docker refused was reported to the operator as "Estimated at 2.1 GiB
+    against 2.1 GiB free" — a sentence about a launch that never happened.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import safety, servers
+    from app.main import app
+
+    async def check_launch(*a, **k):
+        return safety.Verdict(ok=True, level="ok", budget={},
+                              message="Estimated at 2.1 GiB, which fits")
+
+    async def image_exists(tag, host=None):
+        return True
+
+    async def remove(name, *, force=True, host=None):
+        return None
+
+    async def run_detached(**kwargs):
+        raise servers.docker_ctl.DockerError(["docker", "run"], 125, "port 8123 already in use")
+
+    monkeypatch.setattr(servers.safety, "check_launch", check_launch)
+    monkeypatch.setattr(servers.docker_ctl, "image_exists", image_exists)
+    monkeypatch.setattr(servers.docker_ctl, "remove", remove)
+    monkeypatch.setattr(servers.docker_ctl, "run_detached", run_detached)
+    monkeypatch.setattr(servers.events.broker, "publish", _noop_publish)
+
+    response = TestClient(app).post(f"/api/servers/{a_server['id']}/start")
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["kind"] == "environment"
+    assert detail["message"] == "port 8123 already in use"
+    # The verdict is still there for anything that wants it — under its own keys.
+    assert detail["level"] == "ok"
 
 
 @pytest.mark.anyio
@@ -418,3 +518,36 @@ def test_the_schema_endpoint_answers_per_engine():
         == settings.llamacpp_image
     names = [e["name"] for e in client.get("/api/servers/engines").json()["engines"]]
     assert names == ["vllm", "llamacpp"]
+
+
+def test_compiled_kernels_outlive_the_container_that_built_them(a_server):
+    """Every start removes the container first, so a cache inside it is a cache
+    that never gets a second use.
+
+    That cost is invisible on a small model and decisive on a large one: vLLM
+    re-runs Inductor's autotune, which benchmarks candidate kernels on the GPU,
+    and a model whose sampling step is separately compiled can spend longer in
+    that loop than anyone waits before calling it hung.
+    """
+    from app import engines, servers
+    from app.config import settings
+
+    vllm = servers._mounts(engines.get("vllm"))
+    targets = {m.target for m in vllm}
+    assert "/hf" in targets and "/outputs" in targets
+    for path in engines.get("vllm").compile_cache_paths:
+        assert path in targets, f"{path} is written by the engine and thrown away without this"
+
+    # Each container path gets its own directory on the host. Sharing one would
+    # let Triton's cache and Inductor's collide inside the container.
+    sources = [str(m.source) for m in vllm if m.target not in ("/hf", "/outputs")]
+    assert len(set(sources)) == len(sources)
+    assert all(str(settings.compile_cache) in src for src in sources)
+
+    # llama.cpp compiles nothing at runtime, so it gets neither the mounts nor
+    # a set of empty directories on the host.
+    llama = servers._mounts(engines.get("llamacpp"))
+    assert {m.target for m in llama} == {"/hf", "/outputs"}
+
+    # An unknown engine must not crash the launcher.
+    assert {m.target for m in servers._mounts(None)} == {"/hf", "/outputs"}

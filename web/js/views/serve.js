@@ -1212,7 +1212,11 @@ async function startServer(id, { force = false } = {}) {
       title: 'Starting',
     });
   } catch (error) {
-    if (error instanceof ApiError && error.status === 409 && error.detail?.message) {
+    // Both refusals answer 409 — a 502 for the environment one was rewritten by
+    // Cloudflare into its own error page — so `kind` is what tells them apart.
+    // Forcing past a missing image or a bound port would only fail again.
+    if (error instanceof ApiError && error.status === 409 && error.detail?.message
+        && error.detail?.kind !== 'environment') {
       const go = await confirmDialog('The memory guard refused this launch', error.detail.message,
         { confirmLabel: 'Start anyway' });
       if (go) await startServer(id, { force: true });
@@ -1247,10 +1251,20 @@ async function restartServer(id) {
   try {
     const result = await post(`/servers/${id}/restart`);
     if (result.started === false) {
-      const go = await confirmDialog('Stopped, but the relaunch does not fit',
-        result.safety?.message || 'The memory guard refused the relaunch.',
-        { confirmLabel: 'Start anyway' });
-      if (go) await startServer(id, { force: true });
+      // Restart answers 200 with what happened rather than raising, because the
+      // stop is real either way and the caller has to know it. But there are
+      // two ways the relaunch fails and only one is worth forcing: `error` is
+      // the environment refusing it — an unbuilt image, a bound port — which no
+      // amount of "start anyway" fixes, and which the memory verdict would
+      // otherwise caption with a sentence about a launch that never happened.
+      if (result.error) {
+        toast(result.error, { level: 'danger', title: 'Stopped, and it did not come back' });
+      } else {
+        const go = await confirmDialog('Stopped, but the relaunch does not fit',
+          result.safety?.message || 'The memory guard refused the relaunch.',
+          { confirmLabel: 'Start anyway' });
+        if (go) await startServer(id, { force: true });
+      }
     }
   } catch (error) {
     toast(error.message, { level: 'danger', title: 'Restart failed' });

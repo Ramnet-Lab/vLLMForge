@@ -65,6 +65,13 @@ class VLLMEngine:
     supports_pooling = True
     served_name_dest = "served_model_name"
     interesting_metrics = INTERESTING_METRICS
+    dockerfile = "vllm.Dockerfile"
+    # Three, because torch spreads them out: VLLM_CACHE_ROOT holds vLLM's own
+    # compiled graphs, Inductor writes its generated kernels and the autotune
+    # timings that pick between them under TMPDIR, and Triton caches the
+    # compiled binaries separately again. Losing the middle one is the
+    # expensive part — autotune re-benchmarks every candidate config on the GPU.
+    compile_cache_paths = ("/root/.cache/vllm", "/tmp/torchinductor_root", "/root/.triton")
 
     @property
     def default_image(self) -> str:
@@ -165,9 +172,11 @@ class VLLMEngine:
         """Nothing to look up: everything vLLM's footprint needs is in the argv."""
         return params
 
-    def footprint_bytes(self, params: dict[str, Any], total_bytes: int) -> int:
+    def footprint_bytes(self, params: dict[str, Any], total_bytes: int,
+                        *, devices: int = 1) -> int:
         return vllm_spec.footprint_bytes(params, total_bytes,
-                                         default_util=self.implicit_util())
+                                         default_util=self.implicit_util(),
+                                         devices=devices)
 
     def declared_util(self, params: dict[str, Any]) -> float | None:
         return vllm_spec.gpu_memory_utilization(params or {})

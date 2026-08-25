@@ -174,9 +174,14 @@ async def images() -> dict:
     # always been that, and llama.cpp is optional in the same way Heretic and
     # fine-tuning are — a box that never selects it never needs it, and a red
     # badge for an image nobody asked for is noise.
+    #
+    # The two engine rows take their file name from the engine rather than
+    # repeating it: servers.start names the same file when it refuses a launch
+    # for a tag that is not built, and the two telling an operator to build
+    # different files would be worse than either being wrong alone.
     wanted = {
-        "vllm": (settings.vllm_image, "vllm.Dockerfile", True),
-        "llamacpp": (settings.llamacpp_image, "llamacpp.Dockerfile", False),
+        "vllm": (settings.vllm_image, engines.get("vllm").dockerfile, True),
+        "llamacpp": (settings.llamacpp_image, engines.get("llamacpp").dockerfile, False),
         "heretic": (settings.heretic_image, "heretic.Dockerfile", False),
         "finetune": (settings.finetune_image, "finetune.Dockerfile", False),
     }

@@ -132,3 +132,52 @@ def test_a_parser_without_auto_tool_choice_warns_rather_than_blocks():
     assert warnings and "ignored unless" in warnings[0]
     assert vllm_spec.cross_flag_warnings(
         {"tool_call_parser": "hermes", "enable_auto_tool_choice": True}) == []
+
+
+# --- the fraction is per card, and a rank spends it once per card -----------
+
+def test_the_fraction_multiplies_one_card_not_the_whole_box():
+    """--gpu-memory-utilization 0.55 on two 45 GiB cards is 24.75 GiB per card.
+
+    Pricing it as 0.55 of the 90 GiB pool would charge a single-card engine for
+    memory on a card it never touches; pricing the pool at one card instead —
+    which is what this used to do — undercounted a rank that spans both.
+    """
+    GIB = 1024 ** 3
+    pool = 90 * GIB
+
+    one_card = vllm_spec.footprint_bytes(
+        {"gpu_memory_utilization": 0.55, "tensor_parallel_size": 1},
+        pool, default_util=0.92, devices=2)
+    assert one_card == int(0.55 * 45 * GIB)
+
+    both_cards = vllm_spec.footprint_bytes(
+        {"gpu_memory_utilization": 0.55, "tensor_parallel_size": 2},
+        pool, default_util=0.92, devices=2)
+    assert both_cards == 2 * one_card
+    assert both_cards == int(0.55 * pool)
+
+
+def test_pipeline_and_tensor_parallel_multiply():
+    """Ranks are laid out tensor-parallel within a stage and pipelined across
+    stages, so the cards spent are the product, not either one alone."""
+    assert vllm_spec.parallel_devices({"tensor_parallel_size": 2,
+                                       "pipeline_parallel_size": 2}) == 4
+    assert vllm_spec.parallel_devices({}) == 1
+    # Data parallelism replicates whole engines that vLLM starts itself; the
+    # budget counts those as they appear rather than predicting them here.
+    assert vllm_spec.parallel_devices({"data_parallel_size": 4}) == 1
+
+
+def test_a_single_pool_prices_exactly_as_it_always_did():
+    """The unified path must not move by a byte: devices=1 makes the per-device
+    total the whole pool and the spread exactly one."""
+    GIB = 1024 ** 3
+    pool = int(121.69 * GIB)
+    for util in (0.3, 0.55, 0.92):
+        assert vllm_spec.footprint_bytes({"gpu_memory_utilization": util}, pool,
+                                         default_util=0.92) == int(util * pool)
+    # Even with a tensor-parallel size set: one pool is one pool.
+    assert vllm_spec.footprint_bytes(
+        {"gpu_memory_utilization": 0.5, "tensor_parallel_size": 4}, pool,
+        default_util=0.92) == int(0.5 * pool)

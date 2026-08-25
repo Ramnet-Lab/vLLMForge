@@ -102,7 +102,8 @@ class Starvation:
     def starved(self) -> bool:
         return bool(self.available_bytes) and self.available_bytes < self.threshold_bytes
 
-    def reason(self, name: str, util: float | None, held_bytes: int = 0) -> str:
+    def reason(self, name: str, util: float | None, held_bytes: int = 0,
+               *, verb: str = "killing") -> str:
         label = "device free" if self.kind == "device" else "MemAvailable"
         # An engine that declares a fraction is named by it, exactly as before.
         # One that does not is named by what it is holding, because inventing a
@@ -111,7 +112,7 @@ class Starvation:
         held = f"util {util:g}" if util is not None else f"holding {held_bytes // MIB} MiB"
         return (
             f"{label} {self.available_bytes // MIB} MiB below "
-            f"{self.threshold_bytes // MIB} MiB — killing {name} ({held})"
+            f"{self.threshold_bytes // MIB} MiB — {verb} {name} ({held})"
         )
 
 
@@ -153,17 +154,30 @@ async def watch() -> None:
                 victims = await _candidates()
                 if victims:
                     name, util, held_bytes = victims[0]
-                    reason = starvation.reason(name, util, held_bytes)
-                    log.warning(reason)
                     # A container set to `unless-stopped` would come back and
                     # re-reserve the memory just freed, so the policy has to go
                     # — but it is the operator's setting, not ours, so record
                     # what it was for whoever restarts the container.
                     if starvation.kind == "device":
-                        # The framebuffer is exactly what these engines spend, so
-                        # this reading is about them by construction and there is
-                        # no host-side OOM killer that will ever see it.
-                        action = "kill"
+                        # A framebuffer running low is not an emergency, and this
+                        # used to kill for it. The watchdog exists to get in
+                        # front of a FREEZE — a pool the OS is living in, filled,
+                        # with no OOM killer fast enough to save an interactive
+                        # machine. A discrete card is not that pool: the desktop,
+                        # the ssh session and every other process are in host
+                        # RAM, and the worst an exhausted framebuffer does is
+                        # fail the allocation of whichever process asked next.
+                        #
+                        # Worse, near-full is the CORRECT steady state here. An
+                        # engine handed --gpu-memory-utilization 0.68 is under
+                        # instructions to take 68% of the card and hold it; a
+                        # KV cache that fills what it was given is the design.
+                        # Killing on that signal took down a server five seconds
+                        # after it finished loading, for doing exactly what it
+                        # was configured to do.
+                        #
+                        # So it is recorded and published, and nothing dies.
+                        action = "warn"
                     else:
                         action = settings.memguard_host_action.strip().lower()
                         if action not in ("kill", "warn"):
@@ -174,12 +188,28 @@ async def watch() -> None:
                             # a serving engine on that signal is a self-inflicted
                             # outage.
                             action = "warn" if starvation.pool_kind == accel.DISCRETE else "kill"
+
+                    # Phrased after the decision, not before it: the sentence
+                    # names what is about to happen, and it used to say "killing"
+                    # in an entry that ended "nothing killed".
+                    reason = starvation.reason(
+                        name, util, held_bytes,
+                        verb="would kill" if action == "warn" else "killing")
+                    log.warning(reason)
+
                     if action == "warn":
+                        # Why nothing was killed, in the words of whichever
+                        # signal fired — the two are unrelated readings and a
+                        # single sentence for both explained neither.
+                        note = ("the framebuffer is not the pool the OS lives in, and an "
+                                "engine filling the share it was given is not a fault"
+                                if starvation.kind == "device" else
+                                f"host memory, not {starvation.pool_kind} device memory")
                         entry = {
                             "ts": time.time(), "container": name, "util": util,
                             "bytes_committed": held_bytes,
-                            "action": "warn", "reason": reason + " (host memory, not "
-                            f"{starvation.pool_kind} device memory — nothing killed)",
+                            "action": "warn",
+                            "reason": f"{reason} ({note} — nothing killed)",
                         }
                         _history.append(entry)
                         del _history[:-50]
