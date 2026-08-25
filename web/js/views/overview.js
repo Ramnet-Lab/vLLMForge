@@ -241,6 +241,27 @@ function seriesOf(hist) {
   return (hist.nodes || []).map((name) => ({ id: name, node: name, device: null, label: name }));
 }
 
+/** What one panel draws a line for.
+ *
+ *  Most metrics are the device's: a hot card must not be averaged into a cool
+ *  one. Host memory is not — it belongs to the machine, and reading it off a
+ *  device series found nothing at all (`devices['0'].memory_pct` does not
+ *  exist), which is how a Spark ended up with an empty memory chart. A
+ *  node-scoped metric therefore collapses each node's device series back into
+ *  one line, keeping the colour of that node's first card so a machine stays
+ *  the same colour on every panel. */
+function seriesFor(metric, hist) {
+  const all = seriesOf(hist).map((series, index) => ({ ...series, colour: seriesColour(index) }));
+  if (metric.scope !== 'node') return all;
+  const byNode = [];
+  all.forEach((series) => {
+    if (byNode.some((seen) => seen.node === series.node)) return;
+    byNode.push({ id: series.node, node: series.node, device: null,
+                  label: series.node, colour: series.colour });
+  });
+  return byNode;
+}
+
 /** A series reads from its own device when it has one. Falling back to the
  *  node-level figure would quietly draw the same line twice on a two-card box. */
 function seriesValue(sample, series, key) {
@@ -252,7 +273,7 @@ function seriesValue(sample, series, key) {
 }
 
 function metricPanel(metric, hist) {
-  const nodes = seriesOf(hist);
+  const nodes = seriesFor(metric, hist);
   const samples = hist.samples || [];
   if (samples.length < 2) {
     return h('div', { class: 'ov-plot' },
@@ -288,7 +309,7 @@ function metricPanel(metric, hist) {
   const dots = [];
   const values = [];
   nodes.forEach((node, index) => {
-    const colour = seriesColour(index);
+    const colour = node.colour || seriesColour(index);
     const points = samples
       .filter((sample) => Number.isFinite(at(sample, node)))
       .map((sample) => `${x(sample.ts).toFixed(1)},${y(at(sample, node)).toFixed(1)}`);
@@ -305,7 +326,7 @@ function metricPanel(metric, hist) {
   });
 
   const keys = nodes.map((series, index) => h('span', { class: 'ov-key' },
-    h('i', { style: { background: seriesColour(index) } }),
+    h('i', { style: { background: series.colour || seriesColour(index) } }),
     h('span', null, series.label), values[index]));
 
   const cursor = svg('line', { y1: PLOT.padT, y2: PLOT.h - PLOT.padB, class: 'ov-cursor',

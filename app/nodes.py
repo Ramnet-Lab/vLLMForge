@@ -216,11 +216,17 @@ async def remote_telemetry(node: Node) -> dict:
     what it is holding matters before anything is pooled onto it, and most of
     the time nothing is.
     """
-    from app import telemetry
+    from app import accel, telemetry
 
+    # Every placeholder the script declares gets a value. Leaving {accel} and
+    # {addr} unfilled raised KeyError('accel') here, and status() reports a
+    # raised exception as the node's error — so a peer that was up, answering
+    # ssh and running docker was drawn as "unreachable: 'accel'".
     command = TELEMETRY_SCRIPT.format(
         gpu=" ".join(telemetry.GPU_QUERY),
         apps=" ".join(telemetry.APPS_QUERY),
+        accel=" ".join(accel.ACCEL_QUERY),
+        addr=" ".join(accel.ADDR_QUERY),
         cache=settings.hf_cache,
     )
     code, out = await _ssh(node.name or node.address, command)
@@ -248,6 +254,9 @@ async def remote_telemetry(node: Node) -> dict:
         "load": load,
         "cpu_count": cpus,
         "disk": disk,
+        # The same round trip already carried the accelerator rows, so the
+        # caller gets the pool from it rather than paying for a second ssh.
+        "pool": _pool_from_sections(out),
     }
 
 
@@ -276,6 +285,17 @@ async def remote_pool(node: Node):
         return accel.Pool(kind=accel.UNKNOWN, confidence="measured", can_size=False,
                           has_accelerator=False,
                           evidence=(f"{node.name} did not answer over ssh",))
+    return _pool_from_sections(out)
+
+
+def _pool_from_sections(out: str):
+    """The pool a peer's script measured, from whichever script carried it.
+
+    Shared by remote_pool and the telemetry sweep so both read the sections the
+    same way — the two used to be one ssh apart and could disagree.
+    """
+    from app import accel
+
     accel_section = _section(out, "ACCEL")
     # The rc line the script appends: an nvidia-smi that ran and said nothing is
     # not the same as one that was never there.
@@ -329,8 +349,11 @@ async def status(node: Node) -> NodeStatus:
     else:
         remote = await remote_telemetry(node)
         if remote.get("ok"):
+            # Popped before the dict becomes the node's telemetry: a Pool is not
+            # JSON, and this one was measured on the peer in the same round trip.
+            pool = remote.pop("pool", None)
             result.telemetry = remote
-            _apply_pool(result, await remote_pool(node))
+            _apply_pool(result, pool if pool is not None else await remote_pool(node))
         else:
             result.error = remote.get("error", "")
 
@@ -668,18 +691,31 @@ _history: deque[dict] = deque(maxlen=int(HISTORY_SECONDS / HISTORY_INTERVAL))
 
 # What the chart plots. Each is its own panel because they are different units,
 # and putting two units on one axis makes a chart that cannot be read.
-# The first three are per device wherever a device can be told apart. The
-# fourth is the one that changes meaning with the hardware: on a unified part
-# host memory IS the GPU's memory and charting it is charting the GPU, while on
-# a discrete box it is a different pool that can sit at 12% while every card is
-# full — so there the chart follows the framebuffer instead. _metrics() picks.
+# The first three are per device wherever a device can be told apart.
+#
+# Memory is the one that changes meaning with the hardware, so it is not one
+# panel that changes label. Host memory is always charted: on a unified part —
+# a Spark, a Jetson — it IS the GPU's memory, and on a discrete box it is still
+# what --cpu-offload-gb and a loading process spend. The framebuffer panel is
+# added on top, and only for a machine detected as having one, because on a
+# unified part there is no framebuffer to plot and the panel drew an empty
+# chart while displacing the only memory reading the box actually has.
+# `scope` says which reading a line comes from: "device" wherever the driver
+# breaks the cards out, "node" for a figure that belongs to the machine and has
+# no per-device version — host memory is the whole box's, and asking a device
+# row for it finds nothing.
 BASE_METRICS = [
-    {"key": "gpu_util", "label": "GPU utilisation", "unit": "%", "max": 100},
-    {"key": "temperature", "label": "GPU temperature", "unit": "°C", "max": None},
-    {"key": "power", "label": "Board power", "unit": "W", "max": None},
+    {"key": "gpu_util", "label": "GPU utilisation", "unit": "%", "max": 100,
+     "scope": "device"},
+    {"key": "temperature", "label": "GPU temperature", "unit": "°C", "max": None,
+     "scope": "device"},
+    {"key": "power", "label": "Board power", "unit": "W", "max": None,
+     "scope": "device"},
 ]
-HOST_MEMORY_METRIC = {"key": "memory_pct", "label": "Host memory used", "unit": "%", "max": 100}
-VRAM_METRIC = {"key": "vram_pct", "label": "GPU memory used", "unit": "%", "max": 100}
+HOST_MEMORY_METRIC = {"key": "memory_pct", "label": "Host memory used", "unit": "%",
+                      "max": 100, "scope": "node"}
+VRAM_METRIC = {"key": "vram_pct", "label": "GPU memory used", "unit": "%", "max": 100,
+               "scope": "device"}
 METRICS = [*BASE_METRICS, HOST_MEMORY_METRIC]
 
 
@@ -707,7 +743,7 @@ def _device_readings(telemetry: dict) -> dict:
     return out
 
 
-def _reading(telemetry: dict) -> dict:
+def _reading(telemetry: dict, pool_kind: str = "") -> dict:
     gpu = telemetry.get("gpu") or {}
     memory = telemetry.get("memory") or {}
     vram = telemetry.get("vram") or {}
@@ -715,6 +751,9 @@ def _reading(telemetry: dict) -> dict:
     used = vram.get("used_bytes")
     total = vram.get("total_bytes")
     return {
+        # Which memory this node's engines actually spend, as the probe on that
+        # machine measured it — not as this one assumed.
+        "pool_kind": pool_kind,
         "gpu_util": gpu.get("utilization_gpu"),
         "temperature": gpu.get("temperature_gpu"),
         "power": gpu.get("power_draw"),
@@ -736,7 +775,8 @@ async def record_sample() -> dict:
     for status in statuses:
         if not status.get("reachable"):
             continue
-        sample["nodes"][status["name"]] = _reading(status.get("telemetry") or {})
+        sample["nodes"][status["name"]] = _reading(
+            status.get("telemetry") or {}, status.get("pool_kind") or "")
     _history.append(sample)
     return sample
 
@@ -766,13 +806,33 @@ def _series(samples: list[dict], seen: list[str]) -> list[dict]:
     return series
 
 
+def _has_framebuffer(node: dict) -> bool:
+    """Whether this node has GPU memory of its own to chart.
+
+    Two things have to hold, and the old test held neither. A per-device row
+    existing is not one of them: a GB10 answers `--query-gpu=index,name` for its
+    one device like any other part and reports [N/A] for every memory field, so
+    "it listed a device" made every Spark chart a framebuffer that does not
+    exist. What is required is a real percentage — the driver only produces one
+    where there is a separate pool to measure — from a node the accelerator
+    probe did not call unified, which vetoes a driver that reports host memory
+    back as a device total.
+    """
+    from app import accel
+
+    if node.get("pool_kind") == accel.UNIFIED:
+        return False
+    if node.get("vram_pct") is not None:
+        return True
+    return any(dev.get("vram_pct") is not None for dev in (node.get("devices") or {}).values())
+
+
 def _metrics(samples: list[dict]) -> list[dict]:
-    """Host memory, or the framebuffer, depending on what this cluster has."""
+    """Host memory always; the framebuffer too, on a cluster that has one."""
     charts_vram = any(
-        node.get("vram_pct") is not None or (node.get("devices") or {})
-        for sample in samples for node in sample["nodes"].values()
+        _has_framebuffer(node) for sample in samples for node in sample["nodes"].values()
     )
-    return [*BASE_METRICS, VRAM_METRIC if charts_vram else HOST_MEMORY_METRIC]
+    return [*BASE_METRICS, HOST_MEMORY_METRIC, *([VRAM_METRIC] if charts_vram else [])]
 
 
 def history(minutes: float = 30.0) -> dict:

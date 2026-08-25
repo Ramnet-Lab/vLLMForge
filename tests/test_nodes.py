@@ -631,3 +631,80 @@ def test_the_cluster_interface_is_detected_from_a_peers_address(monkeypatch):
     monkeypatch.setattr(node_registry, "settings",
                         dataclasses.replace(node_registry.settings, roce_interface="ib0"))
     assert node_registry.cluster_interface() == "ib0"
+
+
+# --- the overview chart ---------------------------------------------------
+
+def _sample(pool_kind: str, *, telemetry: dict) -> dict:
+    return {"ts": 0.0, "nodes": {"n": nodes._reading(telemetry, pool_kind)}}
+
+
+SPARK = {
+    "memory": {"used_fraction": 0.05},
+    "gpu": {"utilization_gpu": 5.0, "temperature_gpu": 40.0},
+    # A GB10 lists its device like any other part and answers [N/A] for every
+    # memory field, so the row exists and carries no framebuffer figure.
+    "gpus": [{"index": 0, "name": "NVIDIA GB10", "utilization_gpu": 5.0,
+              "temperature_gpu": 40.0}],
+}
+DISCRETE = {
+    "memory": {"used_fraction": 0.12},
+    "vram": {"used_bytes": 10 * GIB, "total_bytes": 24 * GIB},
+    "gpus": [{"index": 0, "name": "RTX 6000", "memory_used_pct": 41.7,
+              "memory_used_bytes": 10 * GIB, "memory_total_bytes": 24 * GIB}],
+}
+
+
+def test_a_unified_box_charts_its_system_memory_not_a_framebuffer():
+    """A Spark has no framebuffer. Charting one drew an empty panel and, worse,
+    displaced the host-memory panel — the only memory reading the box has."""
+    labels = [m["key"] for m in nodes._metrics([_sample("unified", telemetry=SPARK)])]
+    assert "memory_pct" in labels
+    assert "vram_pct" not in labels
+
+
+def test_a_discrete_box_charts_both_pools():
+    labels = [m["key"] for m in nodes._metrics([_sample("discrete", telemetry=DISCRETE)])]
+    assert labels[-2:] == ["memory_pct", "vram_pct"]
+
+
+def test_a_mixed_cluster_keeps_the_panel_every_node_can_fill():
+    labels = [m["key"] for m in nodes._metrics(
+        [_sample("unified", telemetry=SPARK), _sample("discrete", telemetry=DISCRETE)])]
+    assert "memory_pct" in labels and "vram_pct" in labels
+
+
+def test_the_unified_verdict_vetoes_a_driver_reporting_host_ram_as_vram():
+    # A part that shares host memory and reports it back as a device total must
+    # not be charted as though the two were separate pools.
+    sample = _sample("unified", telemetry=DISCRETE)
+    assert "vram_pct" not in [m["key"] for m in nodes._metrics([sample])]
+
+
+def test_host_memory_is_a_node_reading_not_a_device_one():
+    """The chart looks a node-scoped metric up on the node. Marking it per
+    device sent the browser to devices['0'].memory_pct, which does not exist."""
+    by_key = {m["key"]: m for m in nodes.METRICS}
+    assert by_key["memory_pct"]["scope"] == "node"
+    assert by_key["gpu_util"]["scope"] == "device"
+
+
+@pytest.mark.asyncio
+async def test_a_peers_telemetry_script_fills_every_placeholder(monkeypatch):
+    """The script declares {accel} and {addr}; leaving them out raised
+    KeyError('accel') and drew a peer that was up as unreachable."""
+    seen = {}
+
+    async def fake_ssh(target, command, timeout=None):
+        seen["command"] = command
+        return 0, "@@MEM@@\nMemTotal: 1024 kB\n@@ACCEL@@\nrc=0\n@@ADDR@@\n"
+
+    monkeypatch.setattr(nodes, "_ssh", fake_ssh)
+    peer = nodes.Node(name="peer", address="10.0.0.9", docker_host="ssh://peer")
+    result = await nodes.remote_telemetry(peer)
+
+    assert result["ok"]
+    assert "{" not in seen["command"]
+    assert "addressing_mode" in seen["command"]
+    # The pool rides back on the same round trip rather than costing a second ssh.
+    assert result["pool"].host.total_bytes == 1024 * 1024
