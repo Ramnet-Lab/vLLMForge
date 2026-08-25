@@ -1,5 +1,5 @@
 {
- "image": "nvcr.io/nvidia/vllm:26.07-py3",
+ "image": "llmd/vllm:latest",
  "vllm_version": "0.24.0+092c4842.dev",
  "sections": {
   "positional arguments": "model_tag The model tag to serve (optional if specified in config) (default: None)",
